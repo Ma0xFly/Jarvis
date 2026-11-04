@@ -179,7 +179,7 @@ export default function Board(): React.ReactElement {
           今日完成 <b>{doneToday}</b>
         </span>
         <span>
-          待拍板 <b>{blockedCount}</b>
+          {colLabel("blocked")} <b>{blockedCount}</b>
         </span>
         <span>
           待启动 <b>{startCount}</b>

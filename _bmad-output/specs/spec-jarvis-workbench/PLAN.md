@@ -282,16 +282,20 @@ webhook ─┼→  调度器  →  routing.json  →  researcher ─→ web/exa 
 
 ### 6.1 矩阵
 
-| 任务类型 | worker | 模型路径 | 理由 |
-|---|---|---|---|
-| 长编码/重构/多文件工程 | **dsh headless** | magpie strong-lane | harness 强在长任务上下文 |
-| 搜集资料/调研 | **researcher**（Hermes profile） | magpie group | 有 browser/web_search/Exa 全套 |
-| 做表格/Excel/PPT | **housekeeper** 或 researcher | 同上 | 有 xlsx/officecli/ppt-master skills，dsh 没有 |
-| 运维巡检/服务器检查 | **housekeeper** | cheap-lane | terminal + 排障档案 skills |
-| 剧烈重构前的独立 review | **coder**（只读模式） | 强模型 | 跨模型审查 |
-| 信息过滤/打标签/摘要 | **housekeeper** | cheap-lane | v2 换本地 Qwen |
+**worker（profile）负责想和判断，执行器负责动手。** 两者解耦，见 §6.4。
 
-分派落法：`kanban create --assignee <profile名>`。dsh 的入队方式 = coder profile 代领后 `dsh --profile headless --json` 执行，结果回写。
+| 任务类型 | worker（profile） | 执行器 | 模型来源 | 理由 |
+|---|---|---|---|---|
+| 长编码/重构/多文件工程 | coder | **claude_code**（主力）/ dsh（备用） | 执行器自带 | 长任务的上下文与工具面由执行器管 |
+| 搜集资料/调研 | researcher | `hermes`（内置工具） | magpie group | 有 browser/web_search/Exa 全套 |
+| 做表格/Excel/PPT | housekeeper | `hermes` | magpie group | xlsx/officecli/ppt-master skills 在 profile 里 |
+| 运维巡检/服务器检查 | housekeeper | `hermes` | cheap-lane | terminal + 排障档案 skills |
+| 剧烈重构前的独立 review | coder | claude_code（`--mode readonly`） | 执行器自带 | 跨模型审查 |
+| 信息过滤/打标签/摘要 | housekeeper | `hermes` | cheap-lane | v2 换本地 Qwen |
+
+分派落法：`kanban create --assignee <profile名>`；执行器由 `routing.json` 的 `executor` 字段决定，worker 用 `bin/executor-run` 调它。
+
+**成本口径要记住**：`claude_code` / `dsh` / `codex` 用的是它们自己的账号和计费，**不走 magpie**。所以 magpie 的 `usage.jsonl` 只覆盖 `hermes` 执行器的调用，执行器的花费必须由适配器自己上报（§6.4）。
 
 magpie intent routing 上线后，快问快答自动落 cheap-lane，不走建卡流程。
 
@@ -319,7 +323,65 @@ magpie intent routing 上线后，快问快答自动落 cheap-lane，不走建�
 - 同时承载 §4.1 的预算包与 §4.4 的固化物登记。
 - 「定了的事 / 定了不做的事」写进 `~/Projects/Jarvis/`，由 `decisions` skill 指向。
 
-### 6.3 分类器：三层漏斗，jev 只配做第二层
+
+### 6.3 执行器层：契约 + 适配器（不是插件）
+
+**结论：不做成 Hermes 插件，做成一个 CLI 契约加若干适配器。**
+
+三条理由：
+
+1. **执行器要能被任何调用方用**——Hermes worker、dsh、Claude Code 自己、你手敲。插件只能被 Hermes 用，接口一旦绑进宿主就再也不好拿出来了。
+2. **插件跑在 gateway 进程里**。一次 30 分钟的编码塞进工具调用，等于让 gateway 管子进程、超时、僵尸、流式输出——这些恰恰是 Claude Code / dsh 自己做得最好的部分。
+3. **契约可以小到 30 行**：stdin 进任务书，stdout 出 JSON + 退出码。插件 API 会随 Hermes 版本变，这个不会。
+
+**唯一入口**（`bin/executor-run`）：
+
+```
+executor-run --executor claude_code --cwd <dir> --mode write              --budget-minutes 30 --max-usd 2 [--resume <session-id>] < task.md
+```
+
+输入：任务书走 stdin（Markdown，含输入/验收/禁区）。
+输出：stdout **最后一行**是 JSON。
+
+```json
+{
+  "ok": true,
+  "executor": "claude_code",
+  "session_id": "01J...",
+  "summary": "改完了 3 个文件，测试通过",
+  "files_changed": ["workbench-ui/src/board/Board.tsx"],
+  "cost": {"usd": 0.42, "tokens": 18234},
+  "log_path": ".runs/2026-11-04T16-20-11.ndjson",
+  "exit_code": 0
+}
+```
+
+退出码语义（调用方只认这五个）：
+
+| 码 | 含义 | 调用方该做什么 |
+|---|---|---|
+| 0 | 成功 | 继续验收流程 |
+| 2 | 需要人（权限、缺信息） | 卡转 `blocked`，写 ask 评论 |
+| 3 | 超预算中断 | 卡记 `metadata.cost`，转 `blocked` |
+| 4 | 执行器不可用 | 换备用执行器或转 `blocked` |
+| 1 | 其它错误 | 转 `blocked`，贴 `log_path` |
+
+**适配器清单**（现在装了什么就用什么）：
+
+| 名字 | 底层命令 | 续跑参数 | 状态 |
+|---|---|---|---|
+| `hermes` | worker 自己用内置工具（不走子进程） | — | ✅ 可用 |
+| `claude_code` | `claude -p --output-format json` | `--resume <id>` | ✅ 2.1.318 已装，**主力** |
+| `dsh` | `dsh --profile headless --json` | `--session-id` | ✅ 0.2.1-rc.5 |
+| `codex` | `codex exec` | 待核 | ✅ 已装，暂不接 |
+
+**适配器只做翻译**：统一参数 → 各家 CLI；各家输出 → 统一 JSON。不放业务逻辑，不读 `kanban.db`。
+
+**新增一个执行器 = 三步**：写一个 ~60 行的适配器 → 在 `executors.json` 注册 → `routing.json` 里可以开始用它。别的代码一行不动。
+
+**什么时候才该再包一层插件**：当你想在 dashboard 里给执行器做管理页（开关、并发数、当前在跑什么），或者想让模型通过 tool schema 自动发现「有哪些执行器可用」。那时写个薄插件去调这个 CLI 就行。**顺序是先 CLI 后插件，反过来会把自己焊死。**
+
+### 6.4 分类器：三层漏斗，jev 只配做第二层
 
 | 层 | 谁决定 | 成本 | 覆盖 |
 |---|---|---|---|
@@ -356,9 +418,11 @@ magpie intent routing 上线后，快问快答自动落 cheap-lane，不走建�
 |---|---|---|---|
 | **P1 界面骨架** | M5 看板对齐原生 → M1 卡契约+闸门 → M2 待办三区+拖拽+回执 | 2.5 天 | 能真派活，界面不再自建看板 |
 | **P2 闭环** | M3 验收全屏模式 → M4 通知 P0（桌面+手机）→ 2d-8 会话追溯入口 | 2 天 | 派出去、跑完、推给你、你验收，闭环成立 |
-| **P3 变强** | S1 自述三行 → S3 完成即固化 → 2d-3 定时唤醒 | 2.5 天 | 系统开始自己变强 |
+| **P3 变强** | S1 自述三行 → S3 完成即固化 → 2d-3 定时唤醒 → **执行器契约（CAP-14）** | 3 天 | 系统开始自己变强，且换执行器不改流程 |
 | **P4 触发层** | 2d-4 ingest/事件接入 → 2d-5 四配方 → 2d-6 熔断+成本 | 3 天 | 不靠你手建卡也能进活 |
 | **P5 持续** | 2d-2 回执协议、S2 运行画布、S4 验收槽精细化、抽样验收、热力图 | 按需 | 效率与可观测性 |
+
+执行器切换（CAP-14）放在 P3 末尾：先落 `bin/executor-run` 与 `executors.json`，再把 coder 从 dsh 切到 `claude_code`。P1/P2 不依赖它。
 
 依赖关系：
 
@@ -381,7 +445,7 @@ M2 ──→ S2        画布读同一份状态
 | M2 | 待办三区 | 从今日拖一张到流水线 → 3 秒内出现"第 N 位 · 预计 HH:MM"；刷新后位置不丢 |
 | M3 | 验收模式 | 点「待你处理 N」进全屏；按 A 后进已完成；按 R 不填理由不能提交；清空自动退出 |
 | M4 | 通知 | 构造一张 P0（有子卡被堵）→ 10 秒内收到系统通知；非 P0 不打扰 |
-| 2d-8 | 会话追溯 | 任取一张已完成卡 → 验收页点"打开执行会话"→ 读到该轮完整对话；dsh 任务的 `metadata.dsh_session_id` 存在且可续 |
+| 2d-8 | 会话追溯 | 任取一张已完成卡 → 验收页点"打开执行会话"→ 读到该轮完整对话；执行器任务的 `metadata.executor_session_id` 存在且可续 |
 | S1 | 自述三行 | 任一张卡验收页能看到交付/依据/没底三行，且"没底"不为空 |
 | S3 | 完成即固化 | 一张卡完成后，`routing.json` 或 skill 目录出现一条新条目并标记"未验证"；下次引用后转"已验证" |
 | 2d-3 | 定时唤醒 | schedule 5 分钟后到点自动回队；UI 显示"将于 HH:MM 唤醒" |
@@ -441,7 +505,7 @@ dispatcher tick(60s) → 扫 ready（priority DESC, created_at ASC）
 | # | 断点 | 修法 |
 |---|---|---|
 | 1 | 验收页无会话入口 | 读 `task.metadata.worker_session_id`（数据已在 `GET /tasks/{id}` 返回体里），前端加入口 |
-| 2 | dsh session id 未回写 | `dsh-delegation` 验收条款加硬要求：`kanban_complete` 的 metadata 必须带 `dsh_session_id`（NDJSON 首行即 `{"type":"session","sessionId":"session-<uuid>"}`） |
+| 2 | 执行器 session id 未回写 | `executor-delegation` 验收条款加硬要求：`kanban_request_review` 的 metadata 必须带 `executor_session_id`（NDJSON 首行即 `{"type":"session","sessionId":"session-<uuid>"}`） |
 | 3 | NDJSON 落 `/tmp` | 改到 `$HERMES_KANBAN_WORKSPACE/.dsh-runs/<ts>.ndjson`；`cd <repo>` 再跑，dsh 会话按 cwd 分组 |
 
 ### 10.4 metadata 约定
@@ -451,7 +515,8 @@ dispatcher tick(60s) → 扫 ready（priority DESC, created_at ASC）
 | `bucket` | 建卡入口 | `today` / `long`，区分两个仓库 |
 | `contract_defaults` | 进 ready 时 | 预算/禁区生效值快照 |
 | `worker_session_id` | Hermes 自动 | 跳转执行会话 |
-| `dsh_session_id` | coder worker | 续 dsh 会话 |
+| `executor` | worker | `hermes` / `claude_code` / `dsh` / `codex` |
+| `executor_session_id` | worker | 续跑执行器会话 |
 | `hops` | 建子卡时 | 熔断计数（超 8 层拒绝建卡，只随完成清零，不随 unblock 清零） |
 | `solidified` | 验收时 | `{type, path, status: pending\|verified}` |
 | `cost` | 聚合任务 | `{minutes, tokens, usd, by_rule}`，来源 `task_runs` + magpie `usage.jsonl` |

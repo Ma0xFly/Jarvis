@@ -72,9 +72,14 @@ sources:
   - **intent:** 用户起疑时能一屏看清拓扑、当前流动与花费，而不必翻日志。
   - **success:** 画布显示触发→管家→规则→worker→产出整条链，运行中的任务以管道内位置表达进度（已用时长/预算），节点带队列深度与今日花费。
 
+- **CAP-14 执行器可插拔**
+  - **intent:** 同一个任务可以交给不同执行器（Claude Code / dsh / 内置工具 / 将来别的），换执行器不改业务流程。
+  - **success:** 存在统一契约 `bin/executor-run`（stdin 任务书 → stdout JSON + 五个退出码）；新增执行器只需加一个适配器并在 `executors.json` 注册；任一执行器跑完都回写 `metadata.executor_session_id`。
+
 ## Constraints
 
 - **唯一状态源是 `kanban.db`**：仓库/流水线/验收全部映射到原生状态（`triage` / `ready` / `running` / `review` / `done`），不新建库、不双写。
+- **执行器不耦合 Hermes 插件体系**：统一走 CLI 契约，任何调用方（worker / dsh / Claude Code / 人）都能用；插件只能当薄壳调用，不得成为唯一入口。
 - **前端必须能装进经典脚本宿主**：插件用 `<script>`（无 `type=module`）加载，产物须为 IIFE；前端源码统一在 `workbench-ui/`，两个宿主目录只放构建产物。
 - **看板不得发明自己的状态模型**：自有前端可渲染，但列名、列序、`status` 字符串必须与 Hermes 原生 8 列逐项对齐，且全库只允许一处列定义常量。
 - **上游内核零改动**：只用插件 / CLI / REST；已知"答后续原会话"需改 `gateway/session_kanban.py`，明确不做。

@@ -21,6 +21,7 @@ export default defineConfig(({ mode }) => {
   const isPlugin = mode === "plugin";
 
   return {
+    define: { "process.env.NODE_ENV": JSON.stringify("production") },
     // 不用 @vitejs/plugin-react：它默认走 automatic JSX runtime，会把 react/jsx-runtime 打进插件包
     esbuild: {
       jsx: "transform",

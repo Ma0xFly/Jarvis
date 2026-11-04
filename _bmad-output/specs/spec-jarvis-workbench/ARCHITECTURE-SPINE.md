@@ -115,7 +115,8 @@ export const api = sdk ? sdk.fetchJSON : plainFetch
 | `solidified` | 验收 | `{type: "routing"\|"skill"\|"script", path, status: "pending"\|"verified"}` |
 | `cost` | 聚合任务 | `{minutes, tokens, usd, by_rule}` |
 | `hops` | 建子卡 | `int`，> 8 拒绝 |
-| `dsh_session_id` | coder worker | `"session-<uuid>"` |
+| `executor` | worker | `"hermes"\|"claude_code"\|"dsh"\|"codex"` |
+| `executor_session_id` | worker | 执行器回写的会话 id（dsh 为 `session-<uuid>`，claude 为其 session id） |
 | `classification` | 建卡/分类器 | `{by: "human"\|"rule"\|"model", model?, label, confidence, cost?}` |
 
 `bucket` 用 `metadata` 而不是新状态：**不占用 `todo`**，仓库卡统一 `triage`。
@@ -132,6 +133,7 @@ export const api = sdk ? sdk.fetchJSON : plainFetch
 2. **前端新视图**放在插件 `index.js` 里新增渲染函数；独立版通过 `sync-ui.sh` 取到。
 
 3. **规则与固化物**落 `~/Projects/Jarvis/routing.json`（单一文件，仓库内）。
+4. **执行器适配器**：`bin/executor-run` + `executors.json`。适配器只做翻译（统一参数 → 各家 CLI，各家输出 → 统一 JSON），不放业务逻辑、不读 `kanban.db`（见 PLAN §6.3）。
 
 ## 7. 三条不改的边界
 
