@@ -24,7 +24,7 @@ spec: SPEC.md
 │        │                                     │                          │
 │        └─ coder → dsh headless              浏览器 / Chrome --app 窗口    │
 │                                                                         │
-│  Hermes dashboard 127.0.0.1:9119 ── 原生 kanban 页（看板 tab 的 iframe）  │
+│  Hermes dashboard 127.0.0.1:9119 ── 原生看板（对齐基准，仅作参考）        │
 │  magpie gateway 127.0.0.1:3425 ── 模型路由（worker 的模型来源）           │
 └─────────────────────────────────────────────────────────────────────────┘
 
@@ -116,7 +116,7 @@ workbench-app/web/app.js                          ← 副本（下次 sync 会�
 
 - **上游零改动**：`hermes-agent/` 下任何文件不动。需要的字段若 REST 不返回，从前端二次请求补，不改后端。
 - **数据库只读**：`kanban.db` / `state.db` 只允许通过 REST、CLI 或 `sqlite3 -readonly` 查询。
-- **看板不重画**：看板 tab = iframe `http://127.0.0.1:9119/kanban` + 外链兜底；不自建列渲染。
+- **看板不发明状态模型**：看板 tab 由自有前端渲染（不 iframe、不嵌 dashboard），但列名 / 列序 / `status` 必须与原生 8 列逐项对齐，列定义只允许一处常量（见 PLAN §5.3）。
 
 ## 8. 本地开发与验证
 

@@ -26,7 +26,7 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 | FR-4 | 验收为空的卡不允许派发，前后端都拦 | CAP-2 |
 | FR-5 | 派发瞬间把预算/禁区生效值快照进 `metadata.contract_defaults` | CAP-2 |
 | FR-6 | 派发后 3 秒内显示排队位次与预计开始时间 | CAP-1 |
-| FR-7 | 看板 tab 呈现 Hermes 原生 8 列，不自建列渲染 | CAP-5 |
+| FR-7 | 看板 tab 以自有前端渲染，但 8 列名/序/status 与原生逐项对齐，列定义单点 | CAP-5 |
 | FR-8 | 今日/长期用 `metadata.bucket` 区分，不占用 `todo` 状态 | CAP-2 |
 | FR-9 | 派发遇到未完成 parent 返回 409，前端提示"已转 todo" | CAP-2 |
 
@@ -71,38 +71,56 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 
 让「想法 → 仓库 → 拖进流水线 → 排队等 worker」这条最小链路在真实数据上跑通，同时把看板 tab 交还给 Hermes 原生实现。
 
-### Story 1.1: 看板 tab 回归 Hermes 原生
+### Story 1.1: 看板 tab 对齐 Hermes 原生 8 列
 
 As a 工作台用户，
-I want 看板 tab 显示 Hermes 原生看板（而不是工作台自己画的一套），
-So that 状态操作只有一种口径，我不必担心两套看板对不上。
+I want 工作台自己的看板用 Hermes 那 8 列的名称和顺序，
+So that 我不用记两套列名，也不会在拖拽时把状态搞错。
 
-**背景**：现有 `app.js` 有一份自建的 8 列渲染。`ARCHITECTURE-SPINE.md §7` 规定禁止重画。
+**背景**：现有 `app.js` 自建了 5 列（队列 / 运行中 / 待收 / 今日仓库 / 已完成），与原生 8 列对不上。
+目标**不是嵌入 dashboard**，而是用自己的前端渲染原生那 8 列。
 
-**先做 30 分钟 spike**：在 iframe 里加载 `http://127.0.0.1:9119/kanban`，确认是否被 `X-Frame-Options` / CSP 拦住。
-- 能加载 → 用 iframe。
-- 被拦 → 该 tab 换成一个居中卡片：「看板在原生页面里打开」+ 主按钮 `window.open('http://127.0.0.1:9119/kanban')`，并在旁边列出 8 列当前计数（只读数字，不渲染卡片）。
+**列定义（唯一常量，照抄）**：
+
+| key | label |
+|---|---|
+| `triage` | 待整理 |
+| `todo` | 待执行 |
+| `scheduled` | 已排期 |
+| `ready` | 就绪 |
+| `running` | 运行中 |
+| `blocked` | 待拍板 |
+| `review` | 待验收 |
+| `done` | 已完成 |
 
 **改动文件**：
-- `~/.hermes/plugins/workbench/dashboard/index.js`（删自建看板渲染、加 iframe/兜底视图）
-- `~/.hermes/plugins/workbench/dashboard/style.css`
+- `~/.hermes/plugins/workbench/dashboard/index.js`（抽出 `COLUMNS` 常量、按它渲染、删掉 5 列旧映射）
+- `~/.hermes/plugins/workbench/dashboard/style.css`（8 列横排 + 横向滚动）
 - 同步：`workbench-app/sync-ui.sh`
 
 **Acceptance Criteria:**
 
-**Given** 服务已重启且 dashboard 在 9119 运行
-**When** 打开工作台并点「看板」tab
-**Then** 看到的是原生看板（iframe 内）或兜底卡片，两者都不出现工作台自绘的列
+**Given** 服务已重启
+**When** 打开「看板」tab
+**Then** 呈现 8 列，列名与顺序与上表完全一致，无第 9 列、无"队列/待收"这类旧列
+
+**Given** 一张卡在「就绪」列
+**When** 拖到「运行中」
+**Then** 请求被拒（`running` 不可手动设），卡片回原位并提示原因
+
+**Given** 一张卡在「待验收」列
+**When** 拖到「已完成」
+**Then** PATCH `status=done` 成功，刷新后仍在「已完成」列，`/board` 返回的 status 为 `done`
 
 **Given** 代码库
-**When** 在 `dashboard/index.js` 与 `web/app.js` 中检索自建看板渲染函数（原 `renderBoard` / 8 列列定义数组）
-**Then** 无残留调用点（允许保留只读计数的辅助函数）
+**When** 检索 `待整理` / `待执行` / `已排期` 等列名
+**Then** 命中只出现在 `COLUMNS` 定义处（一处），不存在第二份 8 列数组
 
-**Given** 改动完成
-**When** 执行 `./sync-ui.sh && systemctl --user restart jarvis-workbench && curl -s http://127.0.0.1:8787/healthz`
-**Then** 返回 `{"ok":true}`，浏览器控制台无报错
+**Given** 任意一张卡
+**When** 观察卡片内容
+**Then** 只显示标题、assignee、priority、block_kind、latest_summary 中存在的字段，无自造的状态徽章
 
-**不做**：不修改上游 `plugin_api.py`；不新增后端端点；不改其他 tab。
+**不做**：不嵌入 iframe、不打开 dashboard 页面、不改后端、不动待办三区。
 
 ---
 
