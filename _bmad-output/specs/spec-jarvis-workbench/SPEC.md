@@ -66,7 +66,7 @@ sources:
 
 - **CAP-12 会话追溯**
   - **intent:** 每张卡都能跳回它的执行会话，dsh 那层也能续上。
-  - **success:** 已完成卡点「打开执行会话」能读到该轮完整对话；dsh 任务的 `metadata.dsh_session_id` 存在且 `dsh --session-id` 能续。
+  - **success:** 已完成卡点「打开执行会话」能读到该轮完整对话；执行器任务的 `metadata.executor_session_id` 存在，且能用该执行器的续跑参数接上。
 
 - **CAP-13 运行画布（排障页）**
   - **intent:** 用户起疑时能一屏看清拓扑、当前流动与花费，而不必翻日志。
