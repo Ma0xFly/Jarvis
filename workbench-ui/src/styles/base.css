@@ -1,0 +1,88 @@
+/* 工作台基础层：主题 token + 外壳。
+   插件宿主复用 dashboard 的 shadcn token，独立版复用 theme.css 的同名变量；
+   两处都取不到时退回这里的兜底色值。 */
+
+.wb-root {
+  --wb-border: var(--color-border, var(--border, rgba(127, 127, 127, 0.22)));
+  --wb-card: var(--color-card, var(--card, rgba(127, 127, 127, 0.06)));
+  --wb-fg: var(--color-card-foreground, var(--color-popover-foreground, currentColor));
+  --wb-muted: var(--color-muted-foreground, var(--muted-foreground, rgba(127, 127, 127, 0.9)));
+  --wb-accent: var(--color-primary, var(--primary, #5e6ad2));
+  --wb-accent-fg: var(--color-primary-foreground, var(--primary-foreground, #041c1c));
+  --wb-hover: var(--color-accent, var(--accent, rgba(127, 127, 127, 0.1)));
+  --wb-danger: var(--color-destructive, var(--destructive, #ef4444));
+  --wb-ok: var(--color-success, #22c55e);
+  --wb-warn: var(--color-warning, #d9a520);
+
+  padding: 18px 22px 40px;
+  color: var(--wb-fg);
+  font-size: 13px;
+  line-height: 1.5;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.wb-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 14px;
+}
+.wb-tabs {
+  display: flex;
+  gap: 4px;
+}
+.wb-tab {
+  border: 0;
+  background: transparent;
+  color: var(--wb-muted);
+  font: inherit;
+  cursor: pointer;
+  padding: 8px 12px;
+  border-radius: 7px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.wb-tab:hover {
+  background: var(--wb-hover);
+}
+.wb-tab.on {
+  background: var(--wb-hover);
+  color: var(--wb-fg);
+}
+
+.wb-btn {
+  border: 1px solid var(--wb-border);
+  background: var(--wb-card);
+  color: var(--wb-fg);
+  font: inherit;
+  padding: 5px 11px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.wb-btn:hover {
+  background: var(--wb-hover);
+}
+
+.wb-empty {
+  padding: 28px 8px;
+  color: var(--wb-muted);
+  font-size: 13px;
+}
+
+.wb-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  transform: translateX(-50%);
+  background: var(--wb-card);
+  border: 1px solid var(--wb-border);
+  color: var(--wb-fg);
+  padding: 9px 16px;
+  border-radius: 9px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  z-index: 50;
+}

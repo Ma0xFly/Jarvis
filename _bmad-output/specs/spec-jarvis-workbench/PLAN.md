@@ -137,6 +137,7 @@
 - **`R` 必填理由**（不填不能提交）——那句理由是唯一天然会变成规则/skill patch 的输入。
 - 清空即退出，给一行"本次收 7、退 1"。
 - 兜底：`review` 挂满 48h 无人处理 → 按规则静默通过并记一条"未验收"，否则队列会自己堵死。
+- **worker 侧约定（关键）**：完成时调 `kanban_request_review`，**不要调 `kanban_complete`**——后者直接把卡打到 `done`，会整段绕过验收。验收通过由工作台 `PATCH status=done` + 写 `metadata.solidified` 完成。三个 profile 的 skill 都要改。
 
 **三档分流**（P5 再上，先用"每张都验"）：
 

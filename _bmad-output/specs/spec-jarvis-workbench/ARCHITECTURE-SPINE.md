@@ -103,6 +103,7 @@ export const api = sdk ? sdk.fetchJSON : plainFetch
 2. 从 `blocked` 恢复必须落 `ready`（走 `unblock_task`）；落 `todo` 是裸写，会丢事件。
 3. 有未完成 parent 时 `→ready` 可能返回 **409**，前端要处理成"已转 todo"。
 4. `PATCH` 里 `None` = 不修改；要清空用显式 `clear_*` 字段。
+5. **worker 收尾必须用 `kanban_request_review`**；`kanban_complete` 会直接进 `done`，绕过整个验收环节。
 
 ## 5. 数据契约（metadata）
 
