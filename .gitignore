@@ -1,0 +1,17 @@
+# 杂项 / 参考资料（不参与开发）
+.杂项/
+
+# 第三方参考实现（agent-autoloop 源码）
+vendor/
+
+# Python
+__pycache__/
+*.pyc
+
+# 运行期产物
+*.log
+.dsh-runs/
+
+# 本地覆盖
+.env
+.env.*

@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis 工作台 · 007 流水线派发 + 验收模式</title>
+<style>
+  :root{
+    --canvas:#ececea; --app:#fbfbfa; --side:#f7f7f5; --card:#ffffff;
+    --text:#1b1b19; --text2:#4a4a45; --muted:#8c8c84; --faint:#b0b0a8;
+    --border:#e5e5df; --hair:#efefea; --hover:#f5f5f1; --col:#f4f4f0;
+    --accent:#5e6ad2; --accent-2:#4f5ac0; --accent-weak:#ececf9; --accent-border:#d8d8f2; --accent-ink:#ffffff;
+    --chip:#f2f2ee; --chip-border:#e4e4df;
+    --run:#22c55e; --wait:#d9a520; --block:#ef4444; --rev:#8b5cf6;
+    --shadow:0 12px 40px rgba(0,0,0,.08);
+    --overlay:rgba(20,20,18,.32);
+  }
+  [data-theme="dark"]{
+    --canvas:#070809; --app:#0b0d10; --side:#0d1014; --card:#101318;
+    --text:#d7dade; --text2:#aab1b8; --muted:#7b838c; --faint:#5b6570;
+    --border:#1d2229; --hair:#1a1e24; --hover:#12161c; --col:#0f1216;
+    --accent:#8b93f0; --accent-2:#a5abf5; --accent-weak:#181c30; --accent-border:#2a3260; --accent-ink:#0b0d10;
+    --chip:#161a20; --chip-border:#232a33;
+    --run:#34d399; --wait:#fbbf24; --block:#f87171; --rev:#a78bfa;
+    --shadow:0 20px 60px rgba(0,0,0,.6);
+    --overlay:rgba(0,0,0,.55);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--canvas)}
+  body{
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif;
+    -webkit-font-smoothing:antialiased;color:var(--text);line-height:1.5;
+    display:flex;padding:24px;transition:background .25s;
+  }
+  .app{
+    width:1320px;height:780px;display:flex;overflow:hidden;position:relative;
+    background:var(--app);border:1px solid var(--border);border-radius:12px;
+    box-shadow:var(--shadow);transition:background .25s,border-color .25s;
+  }
+  /* ---------- sidebar ---------- */
+  .sidebar{width:224px;flex:0 0 224px;border-right:1px solid var(--hair);background:var(--side);
+    padding:18px 12px;display:flex;flex-direction:column;gap:2px;transition:background .25s}
+  .brand{font-size:14px;font-weight:650;letter-spacing:.2px;padding:2px 10px 14px;display:flex;align-items:center;gap:8px}
+  .brand .dot{width:14px;height:14px;border-radius:4px;background:linear-gradient(135deg,var(--accent),var(--rev))}
+  .newbtn{display:flex;align-items:center;justify-content:space-between;width:100%;padding:9px 11px;
+    margin-bottom:12px;border-radius:8px;cursor:pointer;background:var(--accent);color:var(--accent-ink);
+    border:1px solid var(--accent);font-size:12.5px;font-family:inherit;font-weight:600;
+    box-shadow:0 2px 8px color-mix(in srgb,var(--accent) 30%,transparent)}
+  .newbtn:hover{background:var(--accent-2)}
+  .newbtn kbd{color:color-mix(in srgb,var(--accent-ink) 70%,transparent);
+    background:color-mix(in srgb,var(--accent-ink) 14%,transparent);border:0}
+  kbd{font-family:inherit;font-size:10.5px;color:var(--muted);background:var(--chip);
+    border:1px solid var(--chip-border);border-radius:4px;padding:0 5px}
+  .nav a{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;border-radius:6px;
+    font-size:13px;color:var(--text2);text-decoration:none;cursor:pointer}
+  .nav a:hover{background:var(--hover)}
+  .nav a.active{background:var(--accent-weak);color:var(--accent);font-weight:550}
+  .nav .count{font-size:11.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .sect{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);padding:16px 10px 6px}
+  .proj a{display:flex;align-items:center;gap:8px;padding:5px 10px;border-radius:6px;font-size:12.5px;
+    color:var(--text2);text-decoration:none}
+  .proj a:hover{background:var(--hover)}
+  .sq{width:7px;height:7px;border-radius:2px;flex:0 0 7px}
+  .foot{margin-top:auto;display:flex;align-items:center;gap:7px;font-size:11px;color:var(--faint);padding:8px 10px}
+  .pulse{width:6px;height:6px;border-radius:50%;background:var(--run);box-shadow:0 0 0 0 color-mix(in srgb,var(--run) 60%,transparent);
+    animation:pulse 2.4s infinite}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--run) 45%,transparent)}
+    70%{box-shadow:0 0 0 6px transparent}100%{box-shadow:0 0 0 0 transparent}}
+
+  /* ---------- main ---------- */
+  .main{flex:1;min-width:0;display:flex;flex-direction:column}
+  .topbar{height:50px;flex:0 0 50px;border-bottom:1px solid var(--hair);display:flex;align-items:center;
+    padding:0 14px;gap:10px}
+  .tabs{display:flex;gap:2px}
+  .tab{border:0;background:transparent;font-family:inherit;font-size:13px;color:var(--muted);cursor:pointer;
+    padding:7px 11px;border-radius:7px;display:flex;align-items:center;gap:6px}
+  .tab:hover{background:var(--hover);color:var(--text2)}
+  .tab.on{background:var(--accent-weak);color:var(--accent);font-weight:600}
+  .tab .n{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .tab.on .n{color:var(--accent);opacity:.75}
+  .actions{margin-left:auto;display:flex;align-items:center;gap:8px}
+  .inboxbtn{display:flex;align-items:center;gap:7px;padding:6px 11px;border-radius:8px;cursor:pointer;
+    background:var(--accent-weak);border:1px solid var(--accent-border);color:var(--accent);
+    font-family:inherit;font-size:12.5px;font-weight:600}
+  .inboxbtn:hover{background:color-mix(in srgb,var(--accent) 14%,var(--accent-weak))}
+  .inboxbtn b{font-variant-numeric:tabular-nums}
+  .inboxbtn .ring{width:7px;height:7px;border-radius:50%;background:var(--block);
+    box-shadow:0 0 0 3px color-mix(in srgb,var(--block) 18%,transparent)}
+  .iconbtn{width:30px;height:30px;border-radius:7px;border:1px solid var(--border);background:var(--card);
+    color:var(--text2);cursor:pointer;font-size:14px;font-family:inherit}
+  .iconbtn:hover{border-color:var(--accent-border);color:var(--accent)}
+
+  .views{flex:1;min-height:0;overflow:hidden}
+  .view{height:100%}
+  .plan{display:grid;grid-template-columns:302px 1fr 1fr;gap:12px;height:100%;padding:14px}
+
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:11px;display:flex;
+    flex-direction:column;min-height:0;overflow:hidden;transition:background .25s,border-color .2s}
+  .panel.machine{background:var(--col)}
+  .phead{padding:11px 13px 9px;border-bottom:1px solid var(--hair);flex:0 0 auto}
+  .prow1{display:flex;align-items:baseline;gap:8px}
+  .ptitle{font-size:12.5px;font-weight:650;letter-spacing:.01em}
+  .ptitle .n{font-weight:500;color:var(--faint);font-variant-numeric:tabular-nums;margin-left:2px}
+  .phint{font-size:10.5px;color:var(--faint);margin-left:auto}
+  .plist{flex:1;min-height:0;overflow:auto;padding:8px 9px 12px;display:flex;flex-direction:column;gap:2px}
+
+  /* warehouse cards: deliberately light — no status dot, no border, no progress */
+  .card{padding:8px 9px;border-radius:7px;cursor:grab;position:relative;transition:background .12s}
+  .card:hover{background:var(--hover)}
+  .card:active{cursor:grabbing}
+  .card.shake{animation:shake .3s}
+  @keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-4px)}75%{transform:translateX(4px)}}
+  .ct{font-size:12.5px;color:var(--text);line-height:1.45}
+  .cc{font-size:11px;color:var(--muted);margin-top:3px;line-height:1.45}
+  .cc .lab{color:var(--faint)}
+  .cc.warn{color:var(--wait)}
+  .src{font-size:10px;color:var(--faint);border:1px solid var(--hair);border-radius:4px;padding:0 4px;
+    margin-left:6px;white-space:nowrap}
+  .cbtn{position:absolute;right:8px;top:50%;transform:translateY(-50%);opacity:0;transition:opacity .12s;
+    font-family:inherit;font-size:11px;padding:3px 7px;border-radius:5px;cursor:pointer;
+    background:var(--card);border:1px solid var(--border);color:var(--text2)}
+  .card:hover .cbtn{opacity:1}
+  .cbtn:hover{border-color:var(--accent);color:var(--accent)}
+  .empty{font-size:11.5px;color:var(--faint);text-align:center;padding:22px 10px;line-height:1.7}
+
+  /* pipeline: machine own visual weight */
+  .pipe-body{flex:1;min-height:0;overflow:auto;padding:6px 9px 8px;display:flex;flex-direction:column;gap:10px}
+  .seg{}
+  .seg-h{display:flex;align-items:center;gap:7px;padding:6px 3px 5px;font-size:10.5px;color:var(--muted);
+    letter-spacing:.04em}
+  .seg-h .k{flex:1;height:1px;background:var(--hair)}
+  .seg-h b{font-variant-numeric:tabular-nums;color:var(--text2);font-weight:600}
+  .pcard{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:8px 9px;margin-bottom:5px}
+  .pcard .mt{font-size:10.5px;color:var(--faint);margin-top:4px;display:flex;gap:6px;align-items:center}
+  .pcard .wk{color:var(--text2)}
+  .pipe{height:4px;border-radius:2px;background:var(--hair);position:relative;margin-top:8px}
+  .pipe .fill{position:absolute;inset:0 auto 0 0;border-radius:2px;background:var(--accent);opacity:.28}
+  .pipe .dot{position:absolute;top:50%;width:7px;height:7px;border-radius:50%;background:var(--accent);
+    transform:translate(-50%,-50%);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 16%,transparent)}
+  .revrow{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:7px;cursor:pointer;
+    background:var(--card);border:1px solid var(--border);margin-bottom:5px}
+  .revrow:hover{border-color:var(--accent-border);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 8%,transparent)}
+  .thumb{width:30px;height:22px;border-radius:4px;flex:0 0 30px;display:grid;place-items:center;
+    font-size:8.5px;font-weight:700;letter-spacing:.02em;background:var(--chip);border:1px solid var(--chip-border);
+    color:var(--muted)}
+  .revrow .rt{flex:1;min-width:0;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .revrow .rc{font-size:10px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .dropzone{border:1px dashed var(--border);border-radius:8px;padding:10px;text-align:center;
+    font-size:10.5px;color:var(--faint);margin-top:auto}
+  .machine.drop-hover{border-color:var(--accent);box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 12%,transparent)}
+  .machine.drop-hover .dropzone{border-color:var(--accent);color:var(--accent);
+    background:color-mix(in srgb,var(--accent) 6%,transparent)}
+
+  .capture{flex:0 0 auto;border-top:1px solid var(--hair);padding:9px 14px;display:flex;align-items:center;gap:9px}
+  .capture .ic{font-size:13px;color:var(--faint)}
+  .capture input{flex:1;border:0;outline:0;background:transparent;color:var(--text);font-family:inherit;font-size:13px}
+  .capture .hint{font-size:10.5px;color:var(--faint);white-space:nowrap}
+
+  /* ---------- review mode ---------- */
+  .overlay{position:absolute;inset:0;z-index:40;background:var(--app);display:none;
+    flex-direction:column;transition:background .25s}
+  .overlay.on{display:flex;animation:rvslide .12s ease-out}
+  @keyframes rvslide{from{transform:translateY(5px)}to{transform:translateY(0)}}
+  .rv-top{height:48px;flex:0 0 48px;display:flex;align-items:center;gap:12px;padding:0 18px;
+    border-bottom:1px solid var(--hair)}
+  .rv-top .t{font-size:12.5px;font-weight:650}
+  .rv-prog{font-size:11px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .rv-bar{flex:1;height:3px;background:var(--hair);border-radius:2px;overflow:hidden;max-width:280px}
+  .rv-bar i{display:block;height:100%;background:var(--accent);border-radius:2px;transition:width .2s}
+  .rv-exit{margin-left:auto;border:1px solid var(--border);background:var(--card);color:var(--text2);
+    font-family:inherit;font-size:11.5px;padding:5px 10px;border-radius:6px;cursor:pointer}
+  .rv-exit:hover{border-color:var(--accent-border);color:var(--accent)}
+  .rv-main{flex:1;min-height:0;display:grid;grid-template-columns:1fr 396px}
+  .rv-stage{background:var(--col);display:grid;place-items:center;padding:26px;overflow:auto;position:relative}
+  .rv-stage .pg{position:absolute;left:14px;bottom:10px;font-size:10px;color:var(--faint)}
+  .rv-side{border-left:1px solid var(--hair);padding:18px 18px 14px;overflow:auto;display:flex;flex-direction:column;gap:16px}
+  .blk .lb{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);margin-bottom:6px}
+  .blk .tx{font-size:12.5px;line-height:1.7;color:var(--text)}
+  .crit{border-left:2px solid var(--accent);padding:2px 0 2px 11px;font-size:12.5px;line-height:1.65}
+  .self{border:1px solid var(--border);border-radius:9px;overflow:hidden}
+  .self .row{display:flex;gap:9px;padding:8px 11px;border-top:1px solid var(--hair);font-size:11.5px;line-height:1.55}
+  .self .row:first-child{border-top:0}
+  .self .row .k{color:var(--faint);flex:0 0 26px;font-size:10.5px;padding-top:1px}
+  .self .row .v{color:var(--text2);flex:1}
+  .self .row .v b{color:var(--text);font-weight:600}
+  .self .row.doubt .v{color:var(--wait)}
+  .meta{display:flex;gap:14px;font-size:10.5px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .rv-actions{flex:0 0 auto;border-top:1px solid var(--hair);padding:12px 18px;display:flex;align-items:center;gap:9px}
+  .rv-actions .sp{flex:1}
+  .abtn{font-family:inherit;font-size:12.5px;padding:8px 16px;border-radius:8px;cursor:pointer;
+    border:1px solid var(--border);background:var(--card);color:var(--text2);display:flex;align-items:center;gap:7px}
+  .abtn:hover{border-color:var(--accent-border);color:var(--accent)}
+  .abtn.ok{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+  .abtn.ok:hover{background:var(--accent-2);color:var(--accent-ink)}
+  .abtn.bad:hover{border-color:var(--block);color:var(--block)}
+  .rv-why{display:none;gap:8px;align-items:center;flex:1}
+  .rv-why.on{display:flex}
+  .rv-why input{flex:1;border:1px solid var(--block);background:var(--card);color:var(--text);
+    border-radius:7px;padding:7px 10px;font-size:12px;font-family:inherit;outline:0}
+  .rv-why .go{border:1px solid var(--block);background:transparent;color:var(--block);font-family:inherit;
+    font-size:12px;padding:7px 12px;border-radius:7px;cursor:pointer}
+  .rv-why .go:disabled{opacity:.4;cursor:not-allowed}
+  .rv-done{display:grid;place-items:center;height:100%;gap:8px;text-align:center}
+  .rv-done .big{font-size:15px;font-weight:600}
+  .rv-done .sm{font-size:12px;color:var(--muted)}
+
+  /* artifact mocks */
+  .slide{width:460px;background:#fff;color:#1b1b19;border-radius:6px;padding:26px 30px 20px;
+    box-shadow:0 14px 40px rgba(0,0,0,.16);position:relative;aspect-ratio:16/9;display:flex;flex-direction:column}
+  .slide .st{font-size:9.5px;letter-spacing:.1em;text-transform:uppercase;color:#8c8c84}
+  .slide h4{font-size:19px;line-height:1.35;margin:8px 0 12px;font-weight:650;letter-spacing:-.01em}
+  .slide ul{list-style:none;display:flex;flex-direction:column;gap:7px}
+  .slide li{font-size:11.5px;color:#4a4a45;padding-left:12px;position:relative;line-height:1.5}
+  .slide li::before{content:"";position:absolute;left:0;top:6px;width:4px;height:4px;border-radius:1px;background:#5e6ad2}
+  .slide .sn{position:absolute;right:16px;bottom:10px;font-size:9.5px;color:#b0b0a8}
+  .paper{width:440px;background:var(--card);border:1px solid var(--border);border-radius:5px;padding:24px 26px;
+    box-shadow:0 14px 40px rgba(0,0,0,.1);font-size:11.5px;line-height:1.85;color:var(--text2)}
+  .paper h4{font-size:14px;color:var(--text);margin-bottom:10px;font-weight:650}
+  .paper .ln{height:7px;border-radius:2px;background:var(--hair);margin:7px 0}
+  .paper .ln.s{width:62%}
+  .paper .mark{background:color-mix(in srgb,var(--wait) 22%,transparent);border-radius:2px;padding:0 2px;color:var(--text)}
+  .tbl{width:460px;background:var(--card);border:1px solid var(--border);border-radius:6px;overflow:hidden;
+    box-shadow:0 14px 40px rgba(0,0,0,.1);font-size:11px}
+  .tbl .tr{display:grid;grid-template-columns:1.4fr 1fr 1fr;border-top:1px solid var(--hair)}
+  .tbl .tr:first-child{border-top:0;background:var(--chip);font-weight:600;color:var(--text2)}
+  .tbl .td{padding:7px 10px;color:var(--text2)}
+  .tbl .td.n{font-variant-numeric:tabular-nums}
+
+  /* toast */
+  .toast{position:absolute;left:50%;bottom:64px;transform:translate(-50%,10px);z-index:60;
+    background:var(--text);color:var(--app);font-size:12px;padding:8px 14px;border-radius:8px;
+    opacity:0;pointer-events:none;transition:all .18s;box-shadow:0 8px 24px rgba(0,0,0,.22);max-width:70%}
+  .toast.on{opacity:1;transform:translate(-50%,0)}
+  .toast.err{background:var(--block);color:#fff}
+
+  /* board / done placeholder views */
+  .boardwrap{padding:14px;height:100%;display:flex;flex-direction:column;gap:10px}
+  .cols{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;flex:1;min-height:0}
+  .col{background:var(--col);border:1px solid var(--hair);border-radius:10px;padding:8px;overflow:auto}
+  .col h5{font-size:11px;color:var(--muted);font-weight:600;margin-bottom:8px;display:flex;justify-content:space-between}
+  .col .mini{background:var(--card);border:1px solid var(--border);border-radius:6px;padding:7px 8px;
+    font-size:11.5px;margin-bottom:5px;line-height:1.4}
+  .donewrap{padding:14px;height:100%}
+  .donerow{display:flex;align-items:center;gap:10px;padding:9px 11px;border-bottom:1px solid var(--hair);font-size:12.5px}
+  .donerow .ok{color:var(--run);font-size:11px}
+  .donerow .mt{margin-left:auto;font-size:10.5px;color:var(--faint)}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+
+  <aside class="sidebar">
+    <div class="brand"><span class="dot"></span> Jarvis 工作台</div>
+    <button class="newbtn" onclick="focusCapture()">＋ 新建待办 <kbd>N</kbd></button>
+    <div class="nav">
+      <a class="active" onclick="showTab('plan')">待办 <span class="count" id="navPlan">0</span></a>
+      <a onclick="showTab('flow')">看板 <span class="count" id="navFlow">0</span></a>
+      <a onclick="showTab('done')">已完成 <span class="count" id="navDone">0</span></a>
+      <a onclick="return false">活动</a>
+      <a onclick="return false">统计</a>
+    </div>
+    <div class="sect">项目</div>
+    <div class="proj">
+      <a onclick="return false"><span class="sq" style="background:var(--accent)"></span>SentinelDrive</a>
+      <a onclick="return false"><span class="sq" style="background:var(--run)"></span>VehRobVek</a>
+      <a onclick="return false"><span class="sq" style="background:var(--wait)"></span>自动简历</a>
+    </div>
+    <div class="foot"><span class="pulse"></span> Hermes 运行中 · gateway</div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div class="tabs">
+        <button class="tab on" id="tabPlan" onclick="showTab('plan')">待办 <span class="n" id="tabCntPlan">0</span></button>
+        <button class="tab" id="tabFlow" onclick="showTab('flow')">看板 <span class="n" id="tabCntFlow">0</span></button>
+        <button class="tab" id="tabDone" onclick="showTab('done')">已完成 <span class="n" id="tabCntDone">0</span></button>
+      </div>
+      <div class="actions">
+        <button class="inboxbtn" onclick="openReview()"><span class="ring"></span>待你处理 <b id="inboxN">0</b></button>
+        <button class="iconbtn" id="themeBtn" onclick="toggleTheme()" title="切换明暗">☾</button>
+      </div>
+    </div>
+
+    <div class="views">
+      <!-- ============ 待办：流水线 | 今日 | 长期 ============ -->
+      <div class="view" id="viewPlan">
+        <div class="plan">
+
+          <section class="panel machine" id="panelPipe"
+                   ondragover="pipeOver(event)" ondragleave="pipeLeave(event)" ondrop="pipeDrop(event)">
+            <div class="phead">
+              <div class="prow1">
+                <div class="ptitle">流水线 <span class="n" id="pipeCnt">0</span></div>
+                <div class="phint">拖进来才算派发</div>
+              </div>
+            </div>
+            <div class="pipe-body" id="pipeBody"></div>
+            <div class="dropzone">拖卡片到这里 = 派发</div>
+          </section>
+
+          <section class="panel">
+            <div class="phead">
+              <div class="prow1">
+                <div class="ptitle">今日待办 <span class="n" id="todayCnt">0</span></div>
+                <div class="phint">只存信息 · 无状态</div>
+              </div>
+            </div>
+            <div class="plist" id="todayList"></div>
+          </section>
+
+          <section class="panel">
+            <div class="phead">
+              <div class="prow1">
+                <div class="ptitle">长期待办 <span class="n" id="longCnt">0</span></div>
+                <div class="phint">冷存储 · 想不起就别做</div>
+              </div>
+            </div>
+            <div class="plist" id="longList"></div>
+          </section>
+
+        </div>
+      </div>
+
+      <!-- ============ 看板（同一份数据的流程视图） ============ -->
+      <div class="view" id="viewFlow" style="display:none">
+        <div class="boardwrap">
+          <div class="cols" id="boardCols"></div>
+        </div>
+      </div>
+
+      <!-- ============ 已完成 ============ -->
+      <div class="view" id="viewDone" style="display:none">
+        <div class="donewrap" id="doneList"></div>
+      </div>
+    </div>
+
+    <div class="capture">
+      <span class="ic">✎</span>
+      <input id="cap" placeholder="一句话建卡，回车落今日仓库（也可从邮件/私信自动抽取）"
+             onkeydown="if(event.key==='Enter')quickAdd()">
+      <span class="hint">默认落今日 <kbd>↵</kbd></span>
+    </div>
+  </div>
+
+  <!-- ============ 验收模式（不是 tab，是全屏模式） ============ -->
+  <div class="overlay" id="overlay">
+    <div class="rv-top">
+      <span class="t">验收</span>
+      <span class="rv-prog" id="rvProg">0 / 0</span>
+      <div class="rv-bar"><i id="rvBar" style="width:0%"></i></div>
+      <span class="rv-prog" style="margin-left:auto">收完才进「已完成」</span>
+      <button class="rv-exit" onclick="closeReview()">退出 <kbd>Esc</kbd></button>
+    </div>
+    <div class="rv-main" id="rvMain"></div>
+    <div class="rv-actions" id="rvActions"></div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div>
+
+<script>
+/* ---------------- state ---------------- */
+let uid = 0;
+const nid = () => 'c' + (++uid);
+
+const S = {
+  today: [
+    {id:nid(), title:'调研 Tailscale vs ZeroTier，出对比表', check:'不超过三家 · 含价格 · 有 NAT 穿透实测'},
+    {id:nid(), title:'把 Jarvis 主题改成跟随日出日落', check:'日出日落各切一次，无闪烁'},
+    {id:nid(), title:'跑一遍 M3 审计闸门', check:'审计报告落盘，三处断链都有结论'},
+    {id:nid(), title:'整理 11 月投递看板', check:'投递状态与 JD 库一致', src:'邮件'},
+    {id:nid(), title:'给工作台加详情抽屉', check:''}
+  ],
+  long: [
+    {id:nid(), title:'学 Excalidraw 手绘风', check:'能独立画一张架构图'},
+    {id:nid(), title:'整理旧照片', check:'按年份分目录，重复项合并'},
+    {id:nid(), title:'读 DDIA 第 5 章（复制）', check:'写一页笔记，含三个反例'},
+    {id:nid(), title:'SentinelDrive 加 IOC 批量导入', check:'CSV 导入 100 条不重不漏'},
+    {id:nid(), title:'搭本地 Qwen 分流器', check:'快问快答走本地，命中率 > 60%'},
+    {id:nid(), title:'重做博客首页', check:'Lighthouse 性能 > 90'}
+  ],
+  queue: [
+    {id:nid(), title:'盘一下 Jarvis 根目录，给归档建议', check:'8 项以上 · 含体积 · 3 条建议', worker:'housekeeper'},
+    {id:nid(), title:'生成 fizzbuzz.py 并跑通', check:'100 行内 · 单测通过', worker:'coder'}
+  ],
+  run: [
+    {id:nid(), title:'调研车联网威胁情报信源', check:'≥10 源 · 附官方链接', worker:'researcher',
+     elapsed:41, budget:180}
+  ],
+  review: [
+    {id:nid(), title:'竞品分析 PPT v2', check:'不超过三家 · 含价格 · 有 NAT 穿透实测',
+     worker:'coder', took:'41m', cost:'¥1.80', kind:'ppt'},
+    {id:nid(), title:'Tailscale 对比表', check:'不超过三家 · 含价格 · 有 NAT 穿透实测',
+     worker:'researcher', took:'12m', cost:'¥0.60', kind:'table'},
+    {id:nid(), title:'目录盘点报告', check:'8 项以上 · 含体积 · 3 条建议',
+     worker:'housekeeper', took:'3m', cost:'¥0.20', kind:'report'}
+  ],
+  done: []
+};
+
+/* ---------------- helpers ---------------- */
+const $ = id => document.getElementById(id);
+function toast(msg, err){
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = 'toast on' + (err ? ' err' : '');
+  clearTimeout(t._tm);
+  t._tm = setTimeout(() => t.className = 'toast', 2200);
+}
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+/* ---------------- render ---------------- */
+function cardHTML(c, from){
+  const noCheck = !c.check;
+  return `<div class="card" draggable="true" data-id="${c.id}" data-from="${from}">
+    <div class="ct">${esc(c.title)}${c.src ? `<span class="src">${esc(c.src)}</span>` : ''}</div>
+    <div class="cc ${noCheck?'warn':''}">${noCheck ? '验收未写 · 派发会被拦下'
+      : `<span class="lab">验收 · </span>${esc(c.check)}`}</div>
+    <button class="cbtn" onclick="event.stopPropagation();dispatch('${from}','${c.id}')">派发</button>
+  </div>`;
+}
+
+function renderWarehouses(){
+  $('todayList').innerHTML = S.today.length
+    ? S.today.map(c => cardHTML(c, 'today')).join('')
+    : `<div class="empty">今日空着。<br>下面那行输入框可以直接建卡。</div>`;
+  $('longList').innerHTML = S.long.length
+    ? S.long.map(c => cardHTML(c, 'long')).join('')
+    : `<div class="empty">长期仓库空着。</div>`;
+  $('todayCnt').textContent = S.today.length;
+  $('longCnt').textContent = S.long.length;
+  bindDrag();
+}
+
+function eta(i){
+  const base = 14 * 60 + 5 + i * 7;
+  return String(Math.floor(base / 60)) + ':' + String(base % 60).padStart(2, '0');
+}
+
+function renderPipe(){
+  const q = S.queue.map((c, i) => `<div class="pcard">
+      <div class="ct">${esc(c.title)}</div>
+      <div class="mt"><span class="wk">${esc(c.worker)}</span> ·
+        排队第 ${i + 1} 位 · 预计 ${eta(i)} 开始</div>
+    </div>`).join('') || `<div class="empty">队列空</div>`;
+
+  const r = S.run.map(c => {
+    const pct = Math.min(100, Math.round(c.elapsed / c.budget * 100));
+    return `<div class="pcard">
+      <div class="ct">${esc(c.title)}</div>
+      <div class="mt"><span class="wk">${esc(c.worker)}</span> ·
+        ${c.elapsed}m / ${c.budget}m · 预算剩余 ${100 - pct}%</div>
+      <div class="pipe"><span class="fill" style="width:${pct}%"></span>
+        <span class="dot" style="left:${pct}%"></span></div>
+    </div>`;
+  }).join('') || `<div class="empty">没有在跑的</div>`;
+
+  const v = S.review.map(c => `<div class="revrow" onclick="openReview('${c.id}')">
+      <span class="thumb">${c.kind === 'ppt' ? 'PPT' : c.kind === 'table' ? 'TBL' : 'MD'}</span>
+      <span class="rt">${esc(c.title)}</span>
+      <span class="rc">${esc(c.cost)}</span>
+    </div>`).join('') || `<div class="empty">没有待收的</div>`;
+
+  $('pipeBody').innerHTML = `
+    <div class="seg"><div class="seg-h">队列 <span class="k"></span><b>${S.queue.length}</b></div>${q}</div>
+    <div class="seg"><div class="seg-h">运行中 <span class="k"></span><b>${S.run.length}</b></div>${r}</div>
+    <div class="seg"><div class="seg-h">待收 · 等你判断 <span class="k"></span><b>${S.review.length}</b></div>${v}</div>`;
+
+  const total = S.queue.length + S.run.length + S.review.length;
+  $('pipeCnt').textContent = total;
+  $('inboxN').textContent = S.review.length;
+}
+
+function renderCounts(){
+  $('navPlan').textContent = S.today.length + S.long.length;
+  $('tabCntPlan').textContent = S.today.length + S.long.length;
+  $('navFlow').textContent = S.run.length + ' 运行';
+  $('tabCntFlow').textContent = S.run.length + ' 运行';
+  $('navDone').textContent = S.done.length;
+  $('tabCntDone').textContent = S.done.length;
+}
+
+function renderBoard(){
+  const cols = [
+    ['队列', S.queue], ['运行中', S.run], ['待验收', S.review],
+    ['今日仓库', S.today], ['已完成', S.done]
+  ];
+  $('boardCols').innerHTML = cols.map(([name, arr]) => `<div class="col">
+      <h5><span>${name}</span><span>${arr.length}</span></h5>
+      ${arr.map(c => `<div class="mini">${esc(c.title)}</div>`).join('') || `<div class="empty" style="padding:10px">—</div>`}
+    </div>`).join('');
+}
+
+function renderDone(){
+  $('doneList').innerHTML = S.done.length
+    ? S.done.map(c => `<div class="donerow"><span class="ok">✓ 已收</span>
+        <span>${esc(c.title)}</span><span class="mt">${esc(c.worker || '')} · ${esc(c.took || '')}</span></div>`).join('')
+    : `<div class="empty">还没有验收通过的卡。<br>它们会在你按下「A 收」之后出现在这里。</div>`;
+}
+
+function render(){
+  renderWarehouses(); renderPipe(); renderCounts(); renderBoard(); renderDone();
+}
+
+/* ---------------- drag & drop ---------------- */
+function bindDrag(){
+  document.querySelectorAll('.card[draggable]').forEach(el => {
+    el.addEventListener('dragstart', e => {
+      el.style.opacity = '.45';
+      e.dataTransfer.setData('text/plain', JSON.stringify({id: el.dataset.id, from: el.dataset.from}));
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    el.addEventListener('dragend', () => { el.style.opacity = '1'; });
+  });
+}
+function pipeOver(e){
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  $('panelPipe').classList.add('drop-hover');
+}
+function pipeLeave(e){
+  if (!e.currentTarget.contains(e.relatedTarget)) $('panelPipe').classList.remove('drop-hover');
+}
+function pipeDrop(e){
+  e.preventDefault();
+  $('panelPipe').classList.remove('drop-hover');
+  let d; try { d = JSON.parse(e.dataTransfer.getData('text/plain')); } catch(_) { return; }
+  if (!d || !d.id) return;
+  dispatch(d.from, d.id);
+}
+
+function dispatch(from, id){
+  const arr = S[from] || [];
+  const i = arr.findIndex(c => c.id === id);
+  if (i < 0) return;
+  const c = arr[i];
+  if (!c.check){
+    const node = document.querySelector(`.card[data-id="${id}"]`);
+    if (node){ node.classList.add('shake'); setTimeout(() => node.classList.remove('shake'), 320); }
+    toast('拦下了：这张卡没写验收，先补一句「怎样算做完」', true);
+    return;
+  }
+  arr.splice(i, 1);
+  S.queue.push({...c, worker: c.worker || (c.title.includes('调研') ? 'researcher' : 'housekeeper')});
+  render();
+  toast(`已入队 · 第 ${S.queue.length} 位 · 预计 ${eta(S.queue.length - 1)} 开始`);
+}
+
+/* ---------------- capture ---------------- */
+function quickAdd(){
+  const el = $('cap');
+  const v = el.value.trim();
+  if (!v) return;
+  S.today.unshift({id: nid(), title: v, check: ''});
+  el.value = '';
+  render();
+  toast('已落今日仓库 · 验收栏还是空的，记得补');
+}
+function focusCapture(){ $('cap').focus(); }
+
+/* ---------------- theme / tabs ---------------- */
+function toggleTheme(){
+  const cur = document.documentElement.getAttribute('data-theme');
+  const next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  $('themeBtn').textContent = next === 'dark' ? '☀' : '☾';
+}
+function showTab(t){
+  ['plan', 'flow', 'done'].forEach(k => {
+    $('view' + k[0].toUpperCase() + k.slice(1)).style.display = k === t ? '' : 'none';
+  });
+  ['Plan', 'Flow', 'Done'].forEach(k => $('tab' + k).classList.toggle('on', k.toLowerCase() === t));
+}
+
+/* ---------------- review mode ---------------- */
+let rv = {settled: 0, total: 0, cur: null, why: false};
+
+function openReview(focusId){
+  if (!S.review.length){ toast('没有待收的卡'); return; }
+  rv.total = S.review.length;
+  rv.settled = 0;
+  if (focusId){
+    const i = S.review.findIndex(c => c.id === focusId);
+    if (i > 0) S.review.unshift(S.review.splice(i, 1)[0]);
+  }
+  $('overlay').classList.add('on');
+  renderReview();
+}
+
+function closeReview(){
+  $('overlay').classList.remove('on');
+  rv.why = false;
+  render();
+}
+
+function stageHTML(c){
+  if (c.kind === 'ppt') return `<div class="slide">
+      <div class="st">竞品分析 v2 · 车联网威胁情报</div>
+      <h4>三家厂商的能力边界，<br>与它们都不做的事</h4>
+      <ul>
+        <li>覆盖：CrowdStrike / Claroty / Upstream，均含官方文档出处</li>
+        <li>价格：仅两家公开报价，Upstream 按询价估算（已标注）</li>
+        <li>NAT 穿透：只有 Upstream 有第三方实测，其余为厂商自述</li>
+      </ul>
+      <div class="sn">4 / 14</div>
+    </div>`;
+  if (c.kind === 'table') return `<div class="tbl">
+      <div class="tr"><div class="td">方案</div><div class="td">月价</div><div class="td">NAT 穿透</div></div>
+      <div class="tr"><div class="td">Tailscale</div><div class="td n">$6 / 人</div><div class="td">DERP 中继，实测通过</div></div>
+      <div class="tr"><div class="td">ZeroTier</div><div class="td">免费 ≤ 25 节点</div><div class="td">需自建 moon</div></div>
+      <div class="tr"><div class="td">Netbird</div><div class="td n">$5 / 人</div><div class="td">未实测</div></div>
+    </div>`;
+  return `<div class="paper">
+      <h4>Jarvis 根目录盘点</h4>
+      <div>共 8 项，合计 12.4 MB。其中 <span class="mark">4 项为一次性产物</span>，可归档。</div>
+      <div class="ln"></div><div class="ln"></div><div class="ln s"></div>
+      <div style="margin-top:10px">建议：① 归档 4 个旧 sketch ② 合并 3 份联调报告 ③ 清理 vendor 缓存</div>
+    </div>`;
+}
+
+function selfHTML(c){
+  return `<div class="self">
+      <div class="row"><span class="k">交付</span><span class="v"><b>${esc(c.title)}</b> · 14 页 · 已导出</span></div>
+      <div class="row"><span class="k">依据</span><span class="v">官方文档 3 篇 · 第三方实测 1 篇 · 你的旧笔记 2 条</span></div>
+      <div class="row doubt"><span class="k">没底</span><span class="v">第 4 页市占率是二手引用，未核原始出处；英文竞品只查了两家</span></div>
+    </div>`;
+}
+
+function renderReview(){
+  if (!S.review.length){
+    $('rvProg').textContent = `${rv.settled} / ${rv.total}`;
+    $('rvBar').style.width = '100%';
+    $('rvMain').innerHTML = `<div class="rv-done">
+        <div class="big">本批已清空</div>
+        <div class="sm">共处理 ${rv.settled} 张 · 收 ${S.done.length} 张 · 其余已退回今日</div>
+      </div>`;
+    $('rvActions').innerHTML = `<span class="sp"></span>
+      <button class="abtn ok" onclick="closeReview()">回到工作台</button>`;
+    return;
+  }
+  const c = S.review[0];
+  $('rvProg').textContent = `${Math.min(rv.settled + 1, rv.total)} / ${rv.total}`;
+  $('rvBar').style.width = Math.max(6, Math.round(rv.settled / rv.total * 100)) + '%';
+
+  $('rvMain').innerHTML = `
+    <div class="rv-stage">${stageHTML(c)}<span class="pg">样张 · 可翻页</span></div>
+    <div class="rv-side">
+      <div class="blk"><div class="lb">验收标准 · 你当初写的</div>
+        <div class="crit">${esc(c.check)}</div></div>
+      <div class="blk"><div class="lb">AI 自述</div>${selfHTML(c)}</div>
+      <div class="blk"><div class="lb">本次运行</div>
+        <div class="meta"><span>${esc(c.worker)}</span><span>${esc(c.took)}</span>
+          <span>${esc(c.cost)}</span><span>session 可追溯</span></div></div>
+    </div>`;
+
+  if (rv.why){
+    $('rvActions').innerHTML = `
+      <span style="font-size:12px;color:var(--block);white-space:nowrap">不收的理由</span>
+      <div class="rv-why on">
+        <input id="whyIn" placeholder="写一句为什么 —— 这句会变成规则/skill patch 的候选"
+               oninput="document.getElementById('whyGo').disabled=!this.value.trim()"
+               onkeydown="if(event.key==='Enter')confirmReject()">
+        <button class="go" id="whyGo" disabled onclick="confirmReject()">确认不收</button>
+      </div>
+      <button class="abtn" onclick="rv.why=false;renderReview()">取消</button>`;
+    setTimeout(() => $('whyIn') && $('whyIn').focus(), 30);
+  } else {
+    $('rvActions').innerHTML = `
+      <button class="abtn ok" onclick="accept()">A 收</button>
+      <button class="abtn bad" onclick="rv.why=true;renderReview()">R 不收</button>
+      <button class="abtn" onclick="skip()">S 跳过</button>
+      <span class="sp"></span>
+      <span style="font-size:10.5px;color:var(--faint)">收完这张，下一张自动顶上</span>`;
+  }
+}
+
+function accept(){
+  const c = S.review.shift();
+  S.done.unshift(c);
+  rv.settled++;
+  renderReview();
+  if (!S.review.length) { render(); toast('这批清空了'); } else render();
+}
+function skip(){
+  const c = S.review.shift();
+  S.review.push(c);
+  renderReview();
+}
+function confirmReject(){
+  const el = $('whyIn');
+  if (!el || !el.value.trim()) return;
+  const c = S.review.shift();
+  c.check = c.check;
+  c.rejected = el.value.trim();
+  S.today.unshift({id: nid(), title: c.title, check: c.check, src: '退回'});
+  rv.settled++;
+  rv.why = false;
+  renderReview();
+  render();
+  toast('已退回今日仓库 · 理由已记录，会进规则候选');
+}
+
+document.addEventListener('keydown', e => {
+  if (!$('overlay').classList.contains('on')) {
+    if (e.key === 'n' || e.key === 'N') { if (document.activeElement !== $('cap')) focusCapture(); }
+    return;
+  }
+  if (e.key === 'Escape') { closeReview(); return; }
+  if (rv.why) return;
+  const k = e.key.toLowerCase();
+  if (k === 'a') accept();
+  else if (k === 'r') { rv.why = true; renderReview(); }
+  else if (k === 's') skip();
+});
+
+/* ---------------- boot ---------------- */
+(function init(){
+  const p = new URLSearchParams(location.search);
+  if (p.get('theme') === 'dark'){
+    document.documentElement.setAttribute('data-theme', 'dark');
+    $('themeBtn').textContent = '☀';
+  }
+  const tab = p.get('tab');
+  if (tab) showTab(tab);
+  render();
+  if (p.get('review') === '1'){
+    openReview();
+    if (p.get('why') === '1'){ rv.why = true; renderReview(); }
+  }
+})();
+</script>
+</body>
+</html>

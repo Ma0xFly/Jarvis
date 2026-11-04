@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工作台 · Warm Capture</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #efeae2; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    -webkit-font-smoothing: antialiased; color: #2c2a26; line-height: 1.55;
+    display: flex; padding: 24px;
+  }
+  .app {
+    width: 760px; min-height: 780px; margin: 0;
+    background: #faf7f2; border: 1px solid #e7e0d5; border-radius: 18px;
+    box-shadow: 0 16px 50px rgba(90,70,40,.10); overflow: hidden;
+    display: flex; flex-direction: column;
+  }
+  .wrap { padding: 26px 34px 40px; }
+  /* greeting */
+  .hello { display: flex; align-items: flex-end; justify-content: space-between; margin-bottom: 20px; }
+  .hello h1 { font-size: 20px; font-weight: 640; letter-spacing: -.2px; }
+  .hello .sub { font-size: 12px; color: #a39a8a; margin-top: 3px; }
+  .date { font-size: 11.5px; color: #a39a8a; }
+  /* capture card */
+  .capture {
+    background: #fffdf9; border: 1px solid #e9e2d6; border-radius: 14px;
+    padding: 16px 18px 12px; box-shadow: 0 3px 14px rgba(120,95,60,.06);
+    transition: box-shadow .2s, border-color .2s;
+  }
+  .capture:focus-within { border-color: #e8c9a8; box-shadow: 0 6px 22px rgba(120,95,60,.10); }
+  textarea {
+    width: 100%; border: 0; outline: 0; resize: none; background: transparent;
+    font-size: 16px; line-height: 1.5; font-family: inherit; color: #2c2a26; height: 48px;
+  }
+  textarea::placeholder { color: #b8ae9d; }
+  .crow { display: flex; align-items: center; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .ch {
+    font-size: 11.5px; padding: 3px 10px; border-radius: 999px;
+    background: #f4eee4; color: #867a66; cursor: pointer; border: 1px solid transparent;
+  }
+  .ch.on { background: #fdeee0; color: #b45309; border-color: #f3d3b6; }
+  .ch:hover { border-color: #e3d8c6; }
+  .crow .sp { flex: 1; }
+  .go {
+    background: #d9652b; color: #fff; border: 0; border-radius: 9px;
+    padding: 8px 16px; font-size: 12.5px; font-family: inherit; cursor: pointer; font-weight: 550;
+    box-shadow: 0 2px 8px rgba(217,101,43,.25);
+  }
+  .go:hover { background: #c4571f; }
+  .go.ghost { background: transparent; color: #9c8f7b; box-shadow: none; border: 1px solid #e5dccd; }
+  .go.ghost:hover { color: #6b6153; border-color: #d8cbb8; }
+  /* ai brief */
+  .brief {
+    margin-top: 16px; display: flex; gap: 12px; align-items: flex-start;
+    background: #f3efe4; border: 1px solid #e8e0cf; border-radius: 12px; padding: 12px 15px;
+  }
+  .brief .ic { font-size: 15px; margin-top: 1px; }
+  .brief .tx { font-size: 12.5px; color: #6d6455; }
+  .brief b { color: #3f3a30; font-weight: 600; }
+  .brief a { color: #b45309; text-decoration: none; border-bottom: 1px dashed #d9a06a; }
+  /* tabs */
+  .tabs { display: flex; gap: 18px; margin: 24px 2px 10px; border-bottom: 1px solid #eae3d7; }
+  .tabs button {
+    border: 0; background: none; font-family: inherit; font-size: 12.5px; color: #a39a8a;
+    padding: 0 0 9px; cursor: pointer; position: relative;
+  }
+  .tabs button.on { color: #2c2a26; font-weight: 600; }
+  .tabs button.on::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+    background: #d9652b; border-radius: 2px;
+  }
+  .tabs .n { font-size: 10.5px; color: #b8ae9d; margin-left: 3px; }
+  /* task cards */
+  .list { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+  .task {
+    display: flex; align-items: flex-start; gap: 11px; padding: 12px 13px;
+    background: #fffdf9; border: 1px solid #ebe4d8; border-radius: 12px; cursor: pointer;
+    border-left: 3px solid transparent; transition: box-shadow .15s, transform .05s;
+  }
+  .task:hover { box-shadow: 0 3px 12px rgba(120,95,60,.08); }
+  .task:active { transform: scale(.995); }
+  .task.p1 { border-left-color: #d9652b; }
+  .task.p2 { border-left-color: #4f8a6d; }
+  .task.p3 { border-left-color: #7c6bb0; }
+  .box {
+    width: 18px; height: 18px; flex: 0 0 18px; border: 1.5px solid #d3c8b7; border-radius: 50%;
+    margin-top: 1px; display: flex; align-items: center; justify-content: center;
+    font-size: 10px; color: transparent; transition: all .15s;
+  }
+  .task:hover .box { border-color: #c1b39d; }
+  .task.done .box { background: #4f8a6d; border-color: #4f8a6d; color: #fff; }
+  .task.done .tt { color: #b0a695; text-decoration: line-through; }
+  .tmain { flex: 1; min-width: 0; }
+  .tt { font-size: 13.5px; line-height: 1.45; }
+  .tm { display: flex; align-items: center; gap: 7px; margin-top: 6px; font-size: 11px; color: #a39a8a; }
+  .tag { font-size: 10.5px; padding: 1px 8px; border-radius: 999px; }
+  .tag.code { background: #efeafc; color: #6d5bb3; }
+  .tag.data { background: #e7f4ee; color: #3f7458; }
+  .tag.sheet { background: #fdf1dd; color: #a06a15; }
+  .tag.odd { background: #f6e9ef; color: #9a5273; }
+  .right { text-align: right; font-size: 10.5px; color: #b0a695; white-space: nowrap; }
+  .right .st { display: inline-flex; align-items: center; gap: 5px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .dot.run { background: #34a06a; box-shadow: 0 0 0 0 rgba(52,160,106,.4); animation: pp 2s infinite; }
+  @keyframes pp { 70% { box-shadow: 0 0 0 5px rgba(52,160,106,0); } }
+  .dot.wait { background: #d9a520; }
+  .dot.block { background: #d05c4a; }
+  .dot.rev { background: #7c6bb0; }
+  .sect { font-size: 11px; color: #b0a695; margin: 18px 3px 8px; letter-spacing: .6px; }
+  /* board tab */
+  .board { display: none; gap: 10px; margin-top: 12px; }
+  .bcol { flex: 1; background: #f4efe6; border-radius: 12px; padding: 9px; min-height: 320px; }
+  .bhead { font-size: 11px; color: #8b7f6c; font-weight: 600; display: flex; justify-content: space-between; padding: 1px 2px 8px; }
+  .bcard {
+    background: #fffdf9; border: 1px solid #e9e1d3; border-radius: 9px; padding: 9px 10px;
+    font-size: 11.5px; margin-bottom: 7px; cursor: pointer; color: #3d3a33;
+  }
+  .bcard:hover { border-color: #ddcfba; }
+  .bcard .bm { font-size: 10px; color: #a39a8a; margin-top: 5px; display: flex; gap: 5px; align-items: center; }
+  /* toast */
+  .toast {
+    position: fixed; left: 50%; bottom: 30px; transform: translateX(-50%) translateY(16px);
+    background: #2c2a26; color: #faf7f2; font-size: 12.5px; padding: 10px 18px; border-radius: 10px;
+    opacity: 0; transition: all .25s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="wrap">
+    <div class="hello">
+      <div>
+        <h1>早上好，宇翔</h1>
+        <div class="sub">今天 3 件事 · 1 个等你拍板 · 昨晚 4 个 cron 正常跑完</div>
+      </div>
+      <div class="date">11 月 3 日 · 周一</div>
+    </div>
+
+    <div class="capture">
+      <textarea id="cap" placeholder="今天想做什么？一句话就行，AI 帮你拆。" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();add()}"></textarea>
+      <div class="crow">
+        <span class="ch on">编码</span>
+        <span class="ch">资料</span>
+        <span class="ch">表格</span>
+        <span class="ch">杂务</span>
+        <span class="ch">开会</span>
+        <span class="sp"></span>
+        <button class="go ghost" onclick="toast('已记录，稍后整理')">仅记录</button>
+        <button class="go" onclick="add()">AI 拆解并加入</button>
+      </div>
+    </div>
+
+    <div class="brief">
+      <div class="ic">☀️</div>
+      <div class="tx">
+        <b>昨晚：3 个任务自动完成，1 个需要你拍板。</b>
+        LumenBrief 日报 09:00 正常推送；GitHub 巡检新增 2 个 issue，已自动处理；
+        <a href="#" onclick="choose(1);return false;">「删除 3 条过期信源配置」</a> 等你确认。
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button class="on" id="tabToday" onclick="show('today')">今天<span class="n">3</span></button>
+      <button id="tabBoard" onclick="show('board')">看板<span class="n">6</span></button>
+      <button id="tabAll" onclick="show('all')">全部<span class="n">12</span></button>
+    </div>
+
+    <div id="viewToday">
+      <div class="list" id="todayList">
+        <div class="task p1" onclick="pick(this)">
+          <span class="box">✓</span>
+          <div class="tmain">
+            <div class="tt">把 SentinelDrive 的 CVE 评分脚本接入每日巡检</div>
+            <div class="tm"><span class="tag code">编码</span><span>SentinelDrive · dsh · 跑了 6 分钟</span></div>
+          </div>
+          <div class="right"><span class="st"><span class="dot run"></span>运行中</span><br>14:20 开始</div>
+        </div>
+        <div class="task p2" onclick="pick(this)">
+          <span class="box">✓</span>
+          <div class="tmain">
+            <div class="tt">整理 11 月 IoT 安全情报周报</div>
+            <div class="tm"><span class="tag data">资料</span><span>VehRobVek · researcher · 待执行</span></div>
+          </div>
+          <div class="right"><span class="st"><span class="dot wait"></span>就绪</span></div>
+        </div>
+        <div class="task p3" onclick="pick(this)">
+          <span class="box">✓</span>
+          <div class="tmain">
+            <div class="tt">面试知识库：补 AES 面试题 3 道</div>
+            <div class="tm"><span class="tag odd">杂务</span><span>面试 · 你 · 未排期</span></div>
+          </div>
+          <div class="right"><span class="st"><span class="dot wait"></span>稍后</span></div>
+        </div>
+      </div>
+
+      <div class="sect">需要你拍板</div>
+      <div class="list">
+        <div class="task p2" onclick="pick(this)">
+          <span class="box">✓</span>
+          <div class="tmain">
+            <div class="tt">删除 3 条过期信源配置？</div>
+            <div class="tm"><span class="tag odd">需授权</span><span>VehRobVek · 删数据 · 高风险操作</span></div>
+          </div>
+          <div class="right"><span class="st"><span class="dot block"></span>等你</span><br>2 小时前</div>
+        </div>
+        <div class="task p1" onclick="pick(this)">
+          <span class="box">✓</span>
+          <div class="tmain">
+            <div class="tt">验收：LumenBrief 09:00 日报推送正常</div>
+            <div class="tm"><span class="tag data">验收</span><span>LumenBrief · 交付物：截图 + 日志</span></div>
+          </div>
+          <div class="right"><span class="st"><span class="dot rev"></span>待验收</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="viewBoard" class="board">
+      <div class="bcol">
+        <div class="bhead">待整理 <span>2</span></div>
+        <div class="bcard">检查 magpie intent routing<div class="bm"><span class="tag code">编码</span></div></div>
+        <div class="bcard">把「定了的事」文件建起来<div class="bm"><span class="tag odd">杂务</span></div></div>
+      </div>
+      <div class="bcol">
+        <div class="bhead">就绪 <span>3</span></div>
+        <div class="bcard">整理 IoT 安全情报周报<div class="bm"><span class="tag data">资料</span> researcher</div></div>
+        <div class="bcard">导出信源命中率表格<div class="bm"><span class="tag sheet">表格</span> housekeeper</div></div>
+        <div class="bcard">补 AES 面试题 3 道<div class="bm"><span class="tag odd">杂务</span> 你</div></div>
+      </div>
+      <div class="bcol">
+        <div class="bhead">运行中 <span>1</span></div>
+        <div class="bcard">CVE 脚本接入巡检<div class="bm"><span class="dot run"></span> dsh · 6m</div></div>
+      </div>
+      <div class="bcol">
+        <div class="bhead">待验收 <span>2</span></div>
+        <div class="bcard">删除过期信源？<div class="bm"><span class="dot block"></span> 等你</div></div>
+        <div class="bcard">LumenBrief 日报<div class="bm"><span class="dot rev"></span> 等你</div></div>
+      </div>
+    </div>
+
+    <div id="viewAll" style="display:none">
+      <div class="sect">全部任务（示例 6 / 共 12）</div>
+      <div class="list">
+        <div class="task p1 done"><span class="box">✓</span><div class="tmain"><div class="tt">修复 VehRobVek 信源 403 超时</div><div class="tm"><span class="tag code">编码</span><span>worker-dsh · 昨天完成</span></div></div><div class="right">✓</div></div>
+        <div class="task p2 done"><span class="box">✓</span><div class="tmain"><div class="tt">LumenBrief 09:00 日报推送</div><div class="tm"><span class="tag data">资料</span><span>cron · 今天 09:00</span></div></div><div class="right">✓</div></div>
+        <div class="task p3" onclick="pick(this)"><span class="box">✓</span><div class="tmain"><div class="tt">面试知识库：补 AES 面试题 3 道</div><div class="tm"><span class="tag odd">杂务</span></div></div><div class="right">稍后</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast">已加入收件箱</div>
+
+<script>
+  function show(v) {
+    ['Today','Board','All'].forEach(k => {
+      document.getElementById('view' + k).style.display = (k.toLowerCase() === v) ? (k === 'Board' ? 'flex' : 'block') : 'none';
+      document.getElementById('tab' + k).classList.toggle('on', k.toLowerCase() === v);
+    });
+  }
+
+  function add() {
+    const cap = document.getElementById('cap');
+    const v = cap.value.trim();
+    if (!v) { cap.focus(); return; }
+    const list = document.getElementById('todayList');
+    const task = document.createElement('div');
+    task.className = 'task p1';
+    task.onclick = () => pick(task);
+    const main = document.createElement('div');
+    main.className = 'tmain';
+    const tt = document.createElement('div'); tt.className = 'tt'; tt.textContent = v;
+    const tm = document.createElement('div'); tm.className = 'tm';
+    tm.innerHTML = '<span class="tag odd">新</span><span>AI 正在补全任务书…</span>';
+    main.appendChild(tt); main.appendChild(tm);
+    const box = document.createElement('span'); box.className = 'box'; box.textContent = '✓';
+    task.appendChild(box); task.appendChild(main);
+    list.insertBefore(task, list.firstChild);
+    cap.value = '';
+    toast('已入队，AI 会补全背景和验收标准');
+  }
+
+  function pick(el) {
+    el.classList.toggle('done');
+    if (el.classList.contains('done')) toast('完成');
+  }
+
+  function choose(n) { toast('已打开决策卡片'); }
+
+  let tt;
+  function toast(m) {
+    const el = document.getElementById('toast');
+    el.textContent = m; el.classList.add('show');
+    clearTimeout(tt); tt = setTimeout(() => el.classList.remove('show'), 2000);
+  }
+</script>
+</body>
+</html>

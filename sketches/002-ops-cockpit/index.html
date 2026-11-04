@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工作台 · Ops Cockpit</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #070809; }
+  body {
+    font-family: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, "PingFang SC", monospace;
+    -webkit-font-smoothing: antialiased;
+    color: #d7dade; line-height: 1.5; display: flex; padding: 20px;
+  }
+  .app {
+    width: 1340px; height: 780px; display: flex; flex-direction: column;
+    background: #0b0d10; border: 1px solid #1c2026; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 20px 60px rgba(0,0,0,.6);
+  }
+  /* topbar */
+  .top {
+    height: 50px; flex: 0 0 50px; display: flex; align-items: center; gap: 18px;
+    padding: 0 16px; border-bottom: 1px solid #1a1e24; background: #0d1014;
+  }
+  .logo { font-size: 12px; font-weight: 700; letter-spacing: 1.5px; color: #e8eaee; display:flex; align-items:center; gap:8px;}
+  .logo .d { width: 9px; height: 9px; background: #f0b429; box-shadow: 0 0 8px rgba(240,180,41,.7); border-radius: 2px; }
+  .stats { display: flex; gap: 14px; margin-left: 8px; font-size: 11px; }
+  .stat { display: flex; align-items: center; gap: 5px; color: #7d858e; }
+  .stat b { color: #dfe3e8; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .run { color: #34d399; }
+  .stat .bad { color: #f87171; }
+  .right { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 11px; color: #61686f; }
+  .live { color: #34d399; display:flex; align-items:center; gap:5px; }
+  .live i { width:6px;height:6px;border-radius:50%;background:#34d399;animation:blink 1.6s infinite;}
+  @keyframes blink { 50% { opacity: .25; } }
+  /* body */
+  .body { flex: 1; display: flex; min-height: 0; }
+  .board { flex: 1; display: flex; gap: 10px; padding: 14px; overflow-x: auto; min-width: 0; }
+  .col { flex: 0 0 160px; display: flex; flex-direction: column; gap: 7px; }
+  .chead {
+    display:flex; align-items:center; justify-content:space-between;
+    font-size: 10px; letter-spacing: 1.2px; color: #6b737b; padding: 4px 2px 8px;
+    border-bottom: 1px solid #1a1e24; text-transform: uppercase;
+  }
+  .chead .cnt { color:#c9ced4; font-weight:600; }
+  .col.c-run .chead { color:#34d399; border-color:#123527; }
+  .col.c-block .chead { color:#f87171; border-color:#3a1a1a; }
+  .col.c-rev .chead { color:#a78bfa; border-color:#251d3a; }
+  .card {
+    background: #101318; border: 1px solid #1d2229; border-radius: 7px; padding: 9px 10px;
+    font-size: 11.5px; color: #c6cbd1; cursor: pointer; position: relative;
+    transition: border-color .15s, background .15s;
+  }
+  .card:hover { border-color: #2b323b; background: #12161c; }
+  .card .t { line-height: 1.45; margin-bottom: 7px; }
+  .card .m { display: flex; align-items: center; gap: 6px; font-size: 10px; color: #6f777f; white-space: nowrap; }
+  .id { color: #4d565f; font-size: 9.5px; white-space: nowrap; }
+  .pill { font-size: 9.5px; padding: 1px 6px; border-radius: 3px; border: 1px solid #262c34; color: #8b939b; white-space: nowrap; flex: 0 0 auto; }
+  .pill.code { color:#8ea2ff; border-color:#2a3260; background:#141a30; }
+  .pill.data { color:#5eead4; border-color:#134e45; background:#0e1f1c; }
+  .pill.sheet { color:#fbbf24; border-color:#4a3410; background:#221a0a; }
+  .pill.odd { color:#c084fc; border-color:#3b2352; background:#1c1226; }
+  .worker { margin-left: auto; display:flex; align-items:center; gap:4px; }
+  .worker .dot { width:5px;height:5px;border-radius:50%; }
+  .card.running { border-color:#1d4a37; }
+  .card.running::after {
+    content:""; position:absolute; left:0; top:0; bottom:0; width:2px; background:#34d399;
+    box-shadow: 0 0 10px rgba(52,211,153,.6);
+  }
+  .card.running .t { color:#e3f6ec; }
+  .bar { height:2px; background:#0a2a1e; border-radius:2px; margin-top:7px; overflow:hidden; }
+  .bar i { display:block; height:100%; width:62%; background:linear-gradient(90deg,#10b981,#34d399); animation: grow 3s ease-in-out infinite alternate; }
+  @keyframes grow { from { width: 34%; } to { width: 78%; } }
+  /* feed */
+  .feed { width: 288px; flex: 0 0 288px; border-left: 1px solid #1a1e24; display:flex; flex-direction:column; }
+  .fhead { height: 38px; display:flex; align-items:center; justify-content:space-between; padding: 0 14px; font-size:10px; letter-spacing:1.2px; color:#6b737b; border-bottom:1px solid #1a1e24; text-transform:uppercase;}
+  .fbody { flex: 1; overflow: hidden; padding: 10px 14px; display:flex; flex-direction:column; gap: 11px; font-size: 10.5px; }
+  .ev { display: grid; grid-template-columns: 44px 1fr; gap: 8px; color:#8a929a; line-height: 1.5; }
+  .ev time { color:#4d565f; font-variant-numeric: tabular-nums; }
+  .ev b { color:#c9ced4; font-weight:500; }
+  .ev .ok { color:#34d399; }
+  .ev .warn { color:#fbbf24; }
+  .ev .err { color:#f87171; }
+  /* capture bar */
+  .capbar {
+    height: 46px; flex: 0 0 46px; border-top: 1px solid #1a1e24; background:#0d1014;
+    display:flex; align-items:center; gap:10px; padding: 0 16px;
+  }
+  .slash { color:#f0b429; font-size: 13px; }
+  .capbar input {
+    flex:1; background: transparent; border: 0; outline: 0; color:#d7dade; font-size: 12.5px;
+    font-family: inherit;
+  }
+  .capbar input::placeholder { color:#4d565f; }
+  .capbar .hintk { font-size: 10px; color:#4d565f; border:1px solid #232830; padding:1px 6px; border-radius:3px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div class="logo"><span class="d"></span>JARVIS / OPS</div>
+    <div class="stats">
+      <div class="stat"><span class="run">●</span>运行中 <b>2</b></div>
+      <div class="stat">今日完成 <b>12</b></div>
+      <div class="stat"><span class="bad">●</span>阻断 <b>1</b></div>
+      <div class="stat">队列 <b>5</b></div>
+      <div class="stat">Token <b>128.4k</b></div>
+    </div>
+    <div class="right">
+      <span class="live"><i></i>LIVE</span>
+      <span>gateway · 60s tick</span>
+      <span id="clock">14:32</span>
+    </div>
+  </div>
+
+  <div class="body">
+    <div class="board">
+      <div class="col">
+        <div class="chead">TRIAGE <span class="cnt">2</span></div>
+        <div class="card" onclick="sel(this)"><div class="t">检查 magpie intent routing 是否生效</div><div class="m"><span class="id">T-108</span><span class="pill code">编码</span></div></div>
+        <div class="card" onclick="sel(this)"><div class="t">把「定了的事」文件建起来</div><div class="m"><span class="id">T-107</span><span class="pill odd">杂务</span></div></div>
+      </div>
+      <div class="col">
+        <div class="chead">TODO <span class="cnt">3</span></div>
+        <div class="card" onclick="sel(this)"><div class="t">整理 11 月 IoT 安全情报周报</div><div class="m"><span class="id">T-101</span><span class="pill data">资料</span><span class="worker"><span class="dot" style="background:#10b981"></span>researcher</span></div></div>
+        <div class="card" onclick="sel(this)"><div class="t">导出 VehRobVek 信源命中率表格</div><div class="m"><span class="id">T-102</span><span class="pill sheet">表格</span><span class="worker"><span class="dot" style="background:#f59e0b"></span>housekeeper</span></div></div>
+        <div class="card" onclick="sel(this)"><div class="t">面试知识库：补 AES 面试题 3 道</div><div class="m"><span class="id">T-106</span><span class="pill odd">杂务</span><span class="worker"><span class="dot" style="background:#9ca3af"></span>你</span></div></div>
+      </div>
+      <div class="col">
+        <div class="chead">READY <span class="cnt">1</span></div>
+        <div class="card" onclick="sel(this)"><div class="t">LumenBrief 日报卡片样式微调</div><div class="m"><span class="id">T-109</span><span class="pill code">编码</span><span class="worker"><span class="dot" style="background:#0ea5e9"></span>dsh</span></div></div>
+      </div>
+      <div class="col c-run">
+        <div class="chead">RUNNING <span class="cnt">2</span></div>
+        <div class="card running" onclick="sel(this)">
+          <div class="t">把 CVE 脚本接入每日巡检</div>
+          <div class="m"><span class="id">T-104</span><span class="pill code">编码</span><span class="worker">dsh · 7m12s</span></div>
+          <div class="bar"><i></i></div>
+        </div>
+        <div class="card running" onclick="sel(this)">
+          <div class="t">Re-index Obsidian 新增笔记</div>
+          <div class="m"><span class="id">T-105</span><span class="pill data">资料</span><span class="worker">hermes · 2m</span></div>
+          <div class="bar"><i style="width:38%"></i></div>
+        </div>
+      </div>
+      <div class="col c-block">
+        <div class="chead">BLOCKED <span class="cnt">1</span></div>
+        <div class="card" onclick="sel(this)"><div class="t">删除 3 条过期信源配置？</div><div class="m"><span class="id">T-103</span><span class="pill odd">需授权</span><span class="worker">等你 · 26m</span></div></div>
+      </div>
+      <div class="col c-rev">
+        <div class="chead">REVIEW <span class="cnt">1</span></div>
+        <div class="card" onclick="sel(this)"><div class="t">LumenBrief 日报推送正常</div><div class="m"><span class="id">T-099</span><span class="pill data">验收</span><span class="worker">等你 · 1h</span></div></div>
+      </div>
+    </div>
+
+    <aside class="feed">
+      <div class="fhead">活动流 <span class="live" style="font-size:9px"><i></i>LIVE</span></div>
+      <div class="fbody" id="feed">
+        <div class="ev"><time></time><div><b>hermes</b> 领取 <b>T-105</b> · 重索引 Obsidian 新增笔记</div></div>
+        <div class="ev"><time></time><div><b>dsh</b> 领取 <b>T-104</b> · 工作目录 SentinelDrive</div></div>
+        <div class="ev"><time></time><div><b>hermes</b> specify T-104 — 补全 3 条验收标准</div></div>
+        <div class="ev"><time></time><div><span class="ok">✓</span> <b>T-098</b> 完成 · 12 个测试全过 · 4m20s</div></div>
+        <div class="ev"><time></time><div><span class="warn">▲</span> <b>T-105</b> 重试一次 · 上次超时 300s</div></div>
+        <div class="ev"><time></time><div>cron <b>github-scan</b> 触发 · 新增 2 条事件</div></div>
+        <div class="ev"><time></time><div><b>你</b> 从工作台创建 T-104</div></div>
+        <div class="ev"><time></time><div><span class="err">✗</span> <b>T-103</b> 被阻断 · 删除数据需你授权</div></div>
+        <div class="ev"><time></time><div><span class="ok">✓</span> <b>T-095</b> 完成 · 周报已归档到 Obsidian</div></div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="capbar">
+    <span class="slash">/</span>
+    <input id="cap" placeholder="输入任务。例：查一下 GLM-5.3 的定价 &nbsp;·&nbsp; Tab 选类型 · Enter 入队" onkeydown="if(event.key==='Enter')addTask()">
+    <span class="hintk">⌘K 命令</span>
+    <span class="hintk">⌘⏎ 入队</span>
+  </div>
+</div>
+
+<script>
+  // fill relative event times
+  const offsets = [2, 7, 8, 11, 14, 18, 19, 26, 33];
+  const now0 = new Date();
+  document.querySelectorAll('.ev time').forEach((el, i) => {
+    const t = new Date(now0.getTime() - offsets[i] * 60000);
+    el.textContent = String(t.getHours()).padStart(2,'0') + ':' + String(t.getMinutes()).padStart(2,'0');
+  });
+  // clock
+  function tick() {
+    const d = new Date();
+    document.getElementById('clock').textContent =
+      String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+  }
+  tick(); setInterval(tick, 10000);
+
+  function addTask() {
+    const inp = document.getElementById('cap');
+    const v = inp.value.trim();
+    if (!v) return;
+    const col = document.querySelector('.col .chead').parentElement;
+    const c = document.createElement('div');
+    c.className = 'card';
+    c.onclick = () => sel(c);
+    c.innerHTML = '<div class="t"></div><div class="m"><span class="id">T-' +
+      String(110 + Math.floor(Math.random()*80)) + '</span><span class="pill">AI 分类中</span></div>';
+    c.querySelector('.t').textContent = v;
+    col.appendChild(c);
+    inp.value = '';
+    // feed event
+    const feed = document.getElementById('feed');
+    const ev = document.createElement('div');
+    ev.className = 'ev';
+    const now = new Date();
+    const t = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+    ev.innerHTML = '<time>' + t + '</time><div><b>你</b> 从工作台创建新任务</div>';
+    feed.insertBefore(ev, feed.firstChild);
+  }
+
+  function sel(el) {
+    document.querySelectorAll('.card').forEach(c => c.style.outline = 'none');
+    el.style.outline = '1px solid #3b4654';
+    el.style.outlineOffset = '-1px';
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,98 @@
+/* Standalone shell + theme tokens for the workbench.
+   The plugin CSS consumes these tokens; everything else is page chrome. */
+
+:root,
+:root[data-theme="dark"] {
+  --bg: #0b1110;
+  --bg-image: radial-gradient(1100px 520px at 18% -12%, #17231f 0%, #0b1110 62%);
+  --color-card: #121a17;
+  --color-card-foreground: #f0e6d6;
+  --color-popover-foreground: #f0e6d6;
+  --color-muted-foreground: #94a29c;
+  --color-border: rgba(240, 230, 214, 0.13);
+  --color-primary: #eadfc9;
+  --color-primary-foreground: #0b1110;
+  --color-accent: rgba(240, 230, 214, 0.07);
+  --color-destructive: #e0716f;
+  --color-success: #74c69d;
+  --color-warning: #d9a441;
+  --bar-bg: rgba(11, 17, 16, 0.82);
+  --shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f3ed;
+  --bg-image: radial-gradient(1100px 520px at 18% -12%, #ffffff 0%, #f5f3ed 62%);
+  --color-card: #ffffff;
+  --color-card-foreground: #1b2320;
+  --color-popover-foreground: #1b2320;
+  --color-muted-foreground: #6b7772;
+  --color-border: rgba(27, 35, 32, 0.13);
+  --color-primary: #1f6f5f;
+  --color-primary-foreground: #ffffff;
+  --color-accent: rgba(31, 111, 95, 0.08);
+  --color-destructive: #c0392b;
+  --color-success: #2e7d5b;
+  --color-warning: #a97412;
+  --bar-bg: rgba(245, 243, 237, 0.86);
+  --shadow: 0 8px 30px rgba(27, 35, 32, 0.10);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg-image), var(--bg);
+  color: var(--color-card-foreground);
+  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+#shell { height: 100%; display: flex; flex-direction: column; }
+
+#appbar {
+  flex: 0 0 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--bar-bg);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  user-select: none;
+}
+#appbar .logo {
+  width: 18px; height: 18px; border-radius: 5px;
+  background: var(--color-primary);
+  display: grid; place-items: center;
+  color: var(--color-primary-foreground);
+  font-size: 11px; font-weight: 800;
+}
+#appbar .brand { font-size: 12.5px; font-weight: 650; letter-spacing: .2px; }
+#appbar .sub { font-size: 10.5px; color: var(--color-muted-foreground); margin-left: 2px; }
+#appbar .spacer { flex: 1; }
+#appbar .conn {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 10.5px; color: var(--color-muted-foreground);
+  padding: 4px 9px; border: 1px solid var(--color-border); border-radius: 999px;
+}
+#appbar .conn .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-warning); }
+#appbar .conn.on .dot { background: var(--color-success); }
+#appbar .conn.off .dot { background: var(--color-destructive); }
+#appbar button {
+  border: 1px solid var(--color-border);
+  background: transparent; color: var(--color-card-foreground);
+  width: 30px; height: 28px; border-radius: 7px; cursor: pointer;
+  font-size: 13px; line-height: 1;
+}
+#appbar button:hover { background: var(--color-accent); }
+
+#app { flex: 1 1 auto; min-height: 0; }
+#app > .wb-root { height: 100%; }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-muted-foreground); }
+::-webkit-scrollbar-track { background: transparent; }

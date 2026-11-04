@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>工作台 · Calm Linear</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: #ececea; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    color: #1b1b19;
+    line-height: 1.5;
+    display: flex; justify-content: flex-start; padding: 24px;
+  }
+  .app {
+    width: 1180px; height: 760px; display: flex; overflow: hidden;
+    background: #fbfbfa; border: 1px solid #e4e4df; border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0,0,0,.08);
+  }
+  /* sidebar */
+  .sidebar {
+    width: 224px; flex: 0 0 224px; border-right: 1px solid #ececE7;
+    background: #f7f7f5; padding: 18px 12px; display: flex; flex-direction: column; gap: 2px;
+  }
+  .brand { font-size: 14px; font-weight: 650; letter-spacing: .2px; padding: 2px 10px 14px; display:flex; align-items:center; gap:8px;}
+  .brand .dot { width: 14px; height: 14px; border-radius: 4px; background: linear-gradient(135deg,#5e6ad2,#8b5cf6); }
+  .newbtn {
+    display: flex; align-items: center; justify-content: space-between;
+    width: 100%; padding: 8px 10px; margin-bottom: 12px;
+    background: #fff; border: 1px solid #e3e3de; border-radius: 8px;
+    font-size: 12.5px; color: #3c3c38; cursor: pointer; box-shadow: 0 1px 1px rgba(0,0,0,.03);
+  }
+  .newbtn:hover { border-color: #cfcfc8; }
+  kbd {
+    font-family: inherit; font-size: 10.5px; color: #8f8f88;
+    background: #f1f1ee; border: 1px solid #e4e4df; border-radius: 4px; padding: 0 5px;
+  }
+  .nav a {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 6px 10px; border-radius: 6px; font-size: 13px; color: #4a4a45; text-decoration: none;
+  }
+  .nav a:hover { background: #eeeeea; }
+  .nav a.active { background: #e9e9f5; color: #4646a0; font-weight: 550; }
+  .nav .count { font-size: 11.5px; color: #9a9a92; }
+  .nav a.active .count { color: #6f6fbe; }
+  .sect { font-size: 11px; color: #9a9a92; padding: 18px 10px 6px; letter-spacing: .4px; }
+  .proj a { display:flex; align-items:center; gap:8px; padding: 5px 10px; border-radius:6px; font-size:12.5px; color:#4a4a45; text-decoration:none;}
+  .proj a:hover { background:#eeeeea; }
+  .proj .sq { width:8px; height:8px; border-radius:2px; }
+  .foot { margin-top:auto; padding: 10px; font-size: 11.5px; color: #9a9a92; display:flex; align-items:center; gap:6px;}
+  .pulse { width:7px;height:7px;border-radius:50%;background:#22c55e; box-shadow:0 0 0 0 rgba(34,197,94,.5); animation: p 2.4s infinite; }
+  @keyframes p { 0%{box-shadow:0 0 0 0 rgba(34,197,94,.4)} 70%{box-shadow:0 0 0 6px rgba(34,197,94,0)} 100%{box-shadow:0 0 0 0 rgba(34,197,94,0)} }
+  /* main */
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .topbar {
+    height: 52px; flex: 0 0 52px; display: flex; align-items: center; justify-content: space-between;
+    padding: 0 26px; border-bottom: 1px solid #efefea;
+  }
+  .topbar h1 { font-size: 15px; font-weight: 620; letter-spacing: .1px; }
+  .topbar h1 span { color: #a0a098; font-weight: 450; margin-left: 6px; font-size: 13px; }
+  .seg { display: flex; background: #f1f1ee; border-radius: 7px; padding: 2px; }
+  .seg button {
+    border: 0; background: transparent; padding: 4px 12px; font-size: 12px; color: #77776f;
+    border-radius: 5px; cursor: pointer; font-family: inherit;
+  }
+  .seg button.on { background: #fff; color: #262622; box-shadow: 0 1px 2px rgba(0,0,0,.08); font-weight: 550; }
+  .scroll { flex: 1; overflow-y: auto; }
+  .topbar-inner { max-width: 760px; margin: 0 auto; width: 100%; display: flex; align-items: center; justify-content: space-between; padding: 0 26px; }
+  .content { max-width: 760px; margin: 0 auto; padding: 26px 26px 60px; }
+  /* capture */
+  .capture {
+    border: 1px solid #e5e5df; background: #fff; border-radius: 10px;
+    padding: 12px 14px 10px; box-shadow: 0 1px 2px rgba(0,0,0,.03);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .capture:focus-within { border-color: #c9c9f0; box-shadow: 0 0 0 3px rgba(94,106,210,.10); }
+  .capture input {
+    width: 100%; border: 0; outline: 0; font-size: 14px; font-family: inherit; color: #22221f;
+    background: transparent;
+  }
+  .capture input::placeholder { color: #a6a69e; }
+  .capture .row2 { display: flex; align-items: center; gap: 6px; margin-top: 9px; }
+  .chip {
+    font-size: 11px; padding: 2.5px 8px; border-radius: 999px; background: #f2f2ee;
+    color: #6c6c64; border: 1px solid transparent; cursor: pointer; user-select: none;
+  }
+  .chip:hover { border-color: #dcdcd4; }
+  .chip.on { background: #ececf9; color: #5555a8; border-color: #d8d8f2; }
+  .hint { margin-left: auto; font-size: 11px; color: #b0b0a8; }
+  /* groups */
+  .group { margin-top: 26px; }
+  .ghead { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #8c8c84; font-weight: 550; padding: 0 4px 8px; }
+  .ghead .n { color: #b3b3ab; font-weight: 450; }
+  .task {
+    display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 7px;
+    border-bottom: 1px solid #f0f0eb; cursor: pointer;
+  }
+  .task:hover { background: #f5f5f1; }
+  .box {
+    width: 15px; height: 15px; flex: 0 0 15px; border: 1.5px solid #c9c9c1; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center; font-size: 9px; color: transparent;
+  }
+  .task.done .box { background: #5e6ad2; border-color: #5e6ad2; color: #fff; }
+  .task.done .title { color: #a3a39b; text-decoration: line-through; }
+  .title { flex: 1; font-size: 13.5px; color: #2a2a26; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tag { font-size: 10.5px; color: #7d7d75; background: #f4f4f0; padding: 1.5px 7px; border-radius: 5px; }
+  .tag.code { color:#4d5bd1; background:#eef0fb; }
+  .tag.data { color:#0e7a5f; background:#e9f7f1; }
+  .tag.sheet { color:#a15c00; background:#fbf3e4; }
+  .tag.odd  { color:#8a5a9a; background:#f7eef9; }
+  .who { font-size: 11px; color: #9b9b93; display:flex; align-items:center; gap:5px; }
+  .ava { width:16px;height:16px;border-radius:50%;font-size:8.5px;color:#fff;display:flex;align-items:center;justify-content:center; }
+  .st { width: 7px; height: 7px; border-radius: 50%; flex: 0 0 7px; }
+  .st.run { background:#22c55e; }
+  .st.wait { background:#eab308; }
+  .st.block { background:#ef4444; }
+  .st.rev { background:#8b5cf6; }
+  /* board */
+  .board { display: none; gap: 12px; padding: 22px 20px 40px; overflow-x: auto; height: 100%; }
+  .col { flex: 0 0 196px; display: flex; flex-direction: column; gap: 8px; }
+  .chead { display:flex; align-items:center; justify-content:space-between; font-size:11.5px; color:#8c8c84; font-weight:600; padding: 0 2px 2px; letter-spacing:.3px;}
+  .chead .n { color:#b3b3ab; font-weight:450; }
+  .card {
+    background:#fff; border:1px solid #e7e7e1; border-radius:8px; padding:9px 10px;
+    font-size:12px; color:#33332e; cursor:pointer; box-shadow:0 1px 1px rgba(0,0,0,.02);
+  }
+  .card:hover { border-color:#d5d5cd; }
+  .card .ct { line-height:1.4; margin-bottom:6px; }
+  .card .cm { display:flex; align-items:center; gap:6px; color:#9b9b93; font-size:10.5px; }
+  /* drawer */
+  .drawer {
+    position: absolute; top: 0; right: 0; width: 380px; height: 100%;
+    background: #fff; border-left: 1px solid #e8e8e2; box-shadow: -18px 0 40px rgba(0,0,0,.06);
+    transform: translateX(102%); transition: transform .22s ease; display:flex; flex-direction:column;
+  }
+  .drawer.open { transform: translateX(0); }
+  .dhead { padding: 18px 20px 12px; border-bottom: 1px solid #f1f1ec; }
+  .dhead .dt { font-size: 15px; font-weight: 620; line-height: 1.45; }
+  .dmeta { display:flex; gap:6px; margin-top:10px; }
+  .dbody { padding: 16px 20px; font-size: 12.5px; color:#55554e; overflow-y:auto; }
+  .dbody h4 { font-size: 11px; color:#9a9a92; letter-spacing:.5px; margin: 16px 0 8px; font-weight:600;}
+  .dbody h4:first-child { margin-top: 0; }
+  .dbody ul { padding-left: 16px; display:flex; flex-direction:column; gap:5px; }
+  .dbody li::marker { color:#c2c2ba; }
+  .dact { margin-top:auto; padding: 14px 20px; border-top:1px solid #f1f1ec; display:flex; gap:8px; }
+  .btn { font-size:12px; padding:7px 13px; border-radius:7px; border:1px solid #e2e2dc; background:#fff; color:#3c3c38; cursor:pointer; font-family:inherit;}
+  .btn:hover { border-color:#cfcfc8; }
+  .btn.primary { background:#5e6ad2; border-color:#5e6ad2; color:#fff; }
+  .btn.primary:hover { background:#4f5ac0; }
+  .toast {
+    position:absolute; bottom:18px; left:50%; transform:translateX(-50%) translateY(20px);
+    background:#262622; color:#f5f5f1; font-size:12px; padding:8px 14px;
+    border-radius:8px; opacity:0; transition: all .25s; pointer-events:none; white-space:nowrap;
+  }
+  .toast.show { opacity:1; transform:translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="sidebar">
+    <div class="brand"><span class="dot"></span> Jarvis 工作台</div>
+    <button class="newbtn" onclick="focusCapture()">＋ 新任务 <kbd>N</kbd></button>
+    <div class="nav">
+      <a href="#" class="active">收件箱 <span class="count">6</span></a>
+      <a href="#">今天 <span class="count">3</span></a>
+      <a href="#" onclick="toggleView('board');return false;">看板</a>
+      <a href="#">活动 <span class="count">28</span></a>
+      <a href="#">统计</a>
+    </div>
+    <div class="sect">项目</div>
+    <div class="proj">
+      <a href="#"><span class="sq" style="background:#5e6ad2"></span>SentinelDrive</a>
+      <a href="#"><span class="sq" style="background:#0e7a5f"></span>VehRobVek</a>
+      <a href="#"><span class="sq" style="background:#d97706"></span>自动简历</a>
+    </div>
+    <div class="foot"><span class="pulse"></span> Hermes 运行中 · gateway</div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div class="topbar-inner">
+        <h1>收件箱 <span>6 条待处理</span></h1>
+        <div class="seg">
+          <button class="on" id="segList" onclick="toggleView('list')">列表</button>
+          <button id="segBoard" onclick="toggleView('board')">看板</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="scroll" id="scrollList">
+      <div class="content">
+        <div class="capture">
+          <input id="cap" placeholder="记录一个想法或任务，回车即入队…" onkeydown="if(event.key==='Enter')addTask()">
+          <div class="row2">
+            <span class="chip on">全部</span>
+            <span class="chip">编码</span>
+            <span class="chip">资料</span>
+            <span class="chip">表格</span>
+            <span class="chip">杂务</span>
+            <span class="hint">AI 会自动补全任务书与验收标准</span>
+          </div>
+        </div>
+
+        <div class="group" id="todayGroup">
+          <div class="ghead">今天 <span class="n">3</span></div>
+          <div class="task" onclick="openDrawer('把 SentinelDrive 的 CVE 评分脚本接入每日巡检','code','worker-dsh','14:20 开始','running')">
+            <span class="box"></span><span class="st run"></span>
+            <span class="title">把 SentinelDrive 的 CVE 评分脚本接入每日巡检</span>
+            <span class="tag code">编码</span>
+            <span class="who"><span class="ava" style="background:#0ea5e9">ds</span>dsh · 14:20</span>
+          </div>
+          <div class="task" onclick="openDrawer('整理 11 月 IoT 安全情报周报','data','researcher','待执行','todo')">
+            <span class="box"></span><span class="st wait"></span>
+            <span class="title">整理 11 月 IoT 安全情报周报</span>
+            <span class="tag data">资料</span>
+            <span class="who"><span class="ava" style="background:#10b981">re</span>researcher · 待执行</span>
+          </div>
+          <div class="task" onclick="openDrawer('导出 VehRobVek 本周信源命中率表格','sheet','housekeeper','待执行','todo')">
+            <span class="box"></span><span class="st wait"></span>
+            <span class="title">导出 VehRobVek 本周信源命中率表格</span>
+            <span class="tag sheet">表格</span>
+            <span class="who"><span class="ava" style="background:#f59e0b">ho</span>housekeeper · 待执行</span>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="ghead">等待你拍板 <span class="n">2</span></div>
+          <div class="task" onclick="openDrawer('是否允许删除 3 条过期信源配置','odd','你','需要确认','block')">
+            <span class="box"></span><span class="st block"></span>
+            <span class="title">是否允许删除 3 条过期信源配置</span>
+            <span class="tag odd">需授权</span>
+            <span class="who">等你确认 · 2h</span>
+          </div>
+          <div class="task" onclick="openDrawer('验收：LumenBrief 09:00 日报推送正常','data','你','待验收','rev')">
+            <span class="box"></span><span class="st rev"></span>
+            <span class="title">验收：LumenBrief 09:00 日报推送正常</span>
+            <span class="tag data">验收</span>
+            <span class="who">等你验收 · 1h</span>
+          </div>
+        </div>
+
+        <div class="group">
+          <div class="ghead">稍后 <span class="n">1</span></div>
+          <div class="task" onclick="openDrawer('面试知识库：补 AES 面试题 3 道','odd','你','未排期','todo')">
+            <span class="box"></span><span class="st wait"></span>
+            <span class="title">面试知识库：补 AES 面试题 3 道</span>
+            <span class="tag odd">杂务</span>
+            <span class="who">未排期</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="board" id="boardView">
+      <div class="col">
+        <div class="chead">待整理 <span class="n">2</span></div>
+        <div class="card"><div class="ct">检查 magpie 的 intent routing 是否生效</div><div class="cm"><span class="tag code">编码</span>未指派</div></div>
+        <div class="card"><div class="ct">把「定了的事」文件建起来</div><div class="cm"><span class="tag odd">杂务</span>你</div></div>
+      </div>
+      <div class="col">
+        <div class="chead">待执行 <span class="n">3</span></div>
+        <div class="card"><div class="ct">整理 11 月 IoT 安全情报周报</div><div class="cm"><span class="tag data">资料</span>researcher</div></div>
+        <div class="card"><div class="ct">导出 VehRobVek 信源命中率表格</div><div class="cm"><span class="tag sheet">表格</span>housekeeper</div></div>
+        <div class="card"><div class="ct">面试知识库：补 AES 面试题 3 道</div><div class="cm"><span class="tag odd">杂务</span>你</div></div>
+      </div>
+      <div class="col">
+        <div class="chead">就绪 <span class="n">1</span></div>
+        <div class="card"><div class="ct">SentinelDrive: CVE 评分脚本接入巡检</div><div class="cm"><span class="tag code">编码</span>worker-dsh</div></div>
+      </div>
+      <div class="col">
+        <div class="chead">运行中 <span class="n">1</span></div>
+        <div class="card" style="border-color:#bfe8cf"><div class="ct">把 CVE 脚本接入每日巡检</div><div class="cm"><span class="st run"></span>dsh · 6m12s</div></div>
+      </div>
+      <div class="col">
+        <div class="chead">待拍板 <span class="n">1</span></div>
+        <div class="card" style="border-color:#f3c9c9"><div class="ct">删除 3 条过期信源配置？</div><div class="cm"><span class="st block"></span>等你 · 2h</div></div>
+      </div>
+      <div class="col">
+        <div class="chead">待验收 <span class="n">1</span></div>
+        <div class="card" style="border-color:#ddd0f7"><div class="ct">LumenBrief 日报推送正常</div><div class="cm"><span class="st rev"></span>等你 · 1h</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="drawer" id="drawer">
+    <div class="dhead">
+      <div class="dt" id="dTitle">任务标题</div>
+      <div class="dmeta">
+        <span class="tag code" id="dTag">编码</span>
+        <span class="who" id="dWho">worker</span>
+      </div>
+    </div>
+    <div class="dbody">
+      <h4>AI 任务书</h4>
+      <div>目标：把 CVE 评分逻辑从手动脚本改为每日 06:00 自动跑，结果写入 SentinelDrive 数据库并推送摘要。</div>
+      <h4>验收标准</h4>
+      <ul>
+        <li>cron 06:00 触发成功，连续 2 天无失败</li>
+        <li>评分结果与手动跑的结果一致（同一批 CVE）</li>
+        <li>异常时通过 webhook 推一条卡片，不静默失败</li>
+      </ul>
+      <h4>活动</h4>
+      <ul>
+        <li>14:32 dsh 领取任务，工作目录 ~/Projects/SentinelDrive</li>
+        <li>14:31 Hermes 补全任务书（specify）</li>
+        <li>14:20 你从工作台创建</li>
+      </ul>
+    </div>
+    <div class="dact">
+      <button class="btn primary" onclick="toast('已批准，worker 继续执行')">批准继续</button>
+      <button class="btn" onclick="toast('已转人工处理')">转人工</button>
+      <button class="btn" onclick="closeDrawer()">关闭</button>
+    </div>
+  </div>
+
+  <div class="toast" id="toast">已记录</div>
+</div>
+
+<script>
+  const app = document.getElementById('app');
+  const boardView = document.getElementById('boardView');
+  const scrollList = document.getElementById('scrollList');
+  const segList = document.getElementById('segList');
+  const segBoard = document.getElementById('segBoard');
+
+  function toggleView(v) {
+    const isBoard = v === 'board';
+    boardView.style.display = isBoard ? 'flex' : 'none';
+    scrollList.style.display = isBoard ? 'none' : 'block';
+    segBoard.classList.toggle('on', isBoard);
+    segList.classList.toggle('on', !isBoard);
+    if (isBoard) { boardView.style.height = 'calc(100% - 0px)'; }
+  }
+
+  function focusCapture() {
+    toggleView('list');
+    document.getElementById('cap').focus();
+  }
+
+  function addTask() {
+    const inp = document.getElementById('cap');
+    const v = inp.value.trim();
+    if (!v) return;
+    const g = document.getElementById('todayGroup');
+    const row = document.createElement('div');
+    row.className = 'task';
+    row.onclick = () => openDrawer(v, 'odd', '你', '刚刚创建', 'todo');
+    row.innerHTML = '<span class="box"></span><span class="st wait"></span>' +
+      '<span class="title">' + v.replace(/</g,'&lt;') + '</span>' +
+      '<span class="tag odd">新</span><span class="who">AI 补全中…</span>';
+    g.insertBefore(row, g.children[1]);
+    inp.value = '';
+    toast('已入队，AI 正在补全任务书');
+  }
+
+  function openDrawer(title, tag, who, meta, kind) {
+    document.getElementById('dTitle').textContent = title;
+    const t = document.getElementById('dTag');
+    t.textContent = tag === 'code' ? '编码' : tag === 'data' ? '资料' : tag === 'sheet' ? '表格' : '杂务';
+    t.className = 'tag ' + (tag === 'code' ? 'code' : tag === 'data' ? 'data' : tag === 'sheet' ? 'sheet' : 'odd');
+    document.getElementById('dWho').textContent = who + ' · ' + meta;
+    document.getElementById('drawer').classList.add('open');
+  }
+  function closeDrawer() { document.getElementById('drawer').classList.remove('open'); }
+
+  let toastTimer;
+  function toast(msg) {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2200);
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,45 @@
+{
+  "exit_code": 1,
+  "feature_list": [
+    "acp",
+    "all",
+    "anthropic",
+    "audio-io",
+    "bedrock",
+    "computer-use",
+    "discord",
+    "doc-extract",
+    "edge-tts",
+    "fal",
+    "firecrawl",
+    "google",
+    "matrix",
+    "slack",
+    "stt-whisper",
+    "teams",
+    "trace-upload",
+    "vertex",
+    "vision",
+    "web",
+    "wecom",
+    "youtube"
+  ],
+  "finished_at": "2026-11-04T03:28:49.756938+00:00",
+  "kind": "sync",
+  "outcome": "failed",
+  "platform": null,
+  "refusal": null,
+  "schema": 1,
+  "started_at": "2026-11-04T03:27:55.294806+00:00",
+  "steps": [
+    {
+      "at": "2026-11-04T03:28:49.756849+00:00",
+      "detail": "InstallError: venv: uv sync exited 1: ng botocore (15.3MiB)\nDownloading asyncpg (3.6MiB)\nerror: Failed to download `pycryptodome==3.24.1`\n  cause: Failed to extract archive: pycryptodome-3.24.1-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl\n  cause: I/O operation failed during extraction\n  cause: failed to open file `/home/myx/Projects/Jarvis/workbench-app/testenv/sandbox-home/cache/uv/.tmp4AMhD7/Crypto/Hash/_SHA384.abi3.so`: No such file or directory (os error 2)\n\nhint: `pycryptodome` (v3.24.1) was included because `hermes-agent[matrix]` (v0.0.0) depends on `mautrix[encryption]` (v0.21.1) which depends on `pycryptodome` \u2014 retry, or run `hermes pm doctor`",
+      "name": "dependency-sync",
+      "ok": false
+    }
+  ],
+  "update_id": null,
+  "venv_rebuild": null,
+  "warnings": []
+}
