@@ -1,0 +1,10 @@
+{
+  "budget": {
+    "max_minutes": 120,
+    "max_cost": 5,
+    "deny_paths": [".git", "~/.ssh", "~/.hermes", "node_modules", ".env"]
+  },
+  "queue": {
+    "minutes_per_task": 7
+  }
+}

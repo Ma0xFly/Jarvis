@@ -37,12 +37,12 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 | NFR-1 | 不改 `~/.hermes/hermes-agent/` 下任何文件（上游零改动） |
 | NFR-2 | 不直接写 `kanban.db`，全部经 REST |
 | NFR-3 | 首屏 ≤ 1s，轮询 5s（不引入 WebSocket） |
-| NFR-4 | 改动可从 git 以外的方式回滚：只改 `workbench-app/` 与插件 `dashboard/` 两份 |
+| NFR-4 | 改动可从 git 以外的方式回滚：源码只改 `workbench-ui/` 与 `workbench-app/`，插件 `dashboard/` 与 `web/` 是构建产物 |
 | NFR-5 | 服务重启后 `/healthz` 仍 200，不破坏正在跑的任务 |
 
 ### Additional Requirements
 
-- 前端源在 `~/.hermes/plugins/workbench/dashboard/`，改完必须 `./sync-ui.sh`；直接改 `workbench-app/web/app.js` 会在下次同步被覆盖。
+- 前端唯一源码在 `workbench-ui/src/`；改完 `npm run build` 分发到插件 dashboard 与 `workbench-app/web/`。旧 `sync-ui.sh` 与 `web/app.js` 流程已作废。
 - 自定义后端端点只允许加在 `workbench-app/server.py` 的 `/api/workbench/*`。
 
 ### UX Design Requirements
@@ -168,7 +168,7 @@ So that 我不用记两套列名，也不会在拖拽时把状态搞错。
 
 **Given** 任意一张卡
 **When** 观察卡片内容
-**Then** 只显示标题、assignee、priority、block_kind、latest_summary 中存在的字段，无自造的状态徽章
+**Then** 只显示 id、标题、assignee、priority、block_kind、latest_summary、created_at/completed_at 中存在的字段，无自造的状态徽章
 
 **不做**：不嵌入 iframe、不打开 dashboard 页面、不改后端、不动待办三区。
 
@@ -181,9 +181,17 @@ I want 没有写验收的卡无法被派发，且派发时自动记录这次适�
 So that 每张进流水线的卡都有人说得清"怎样算对"，事后也能追溯它按什么规则跑的。
 
 **改动文件**：
-- `workbench-app/server.py`（新增 `POST /api/workbench/dispatch/{task_id}`）
-- `workbench-ui/src/api/workbench.ts`（新增端点调用 + 错误映射）
-- `workbench-ui/src/todo/DragLayer.tsx`（拖拽前校验 + 409 提示）
+- `workbench-app/server.py`（`POST /api/workbench/dispatch/{task_id}`、`GET /api/workbench/metadata`、ready 中间件闸门：PATCH ready / 非 triage 建卡 / bulk ready / reclaim）
+- `workbench-app/defaults.json`（全局预算 + 7 分钟/张，唯一默认源）
+- `workbench-app/tests/test_dispatch.py`（可重复集成测试，临时 `HERMES_KANBAN_HOME`/`WORKBENCH_DB`）
+- `workbench-ui/src/api/workbench.ts`（调用 + 错误码 + `hasAcceptance` / `getTaskMetadata` / `mergeTaskMetadata`）
+- `workbench-ui/src/platform.ts`（错误对象保留 HTTP 状态与后端 `error` 码）
+
+**存储**：工作台 metadata 存 `workbench-app/workbench.db` 的 `task_metadata`
+（JSON1 按 key 更新，`write_token` 记录快照归属且不对外返回），不读写共享
+`kanban.db`；任务状态与队列位次仍只经 `/api/plugins/kanban/*` 公开 REST。
+预算只做“全局默认 + 卡上 `contract.budget` 覆盖”；routing 层在 1.2 不实现。
+数值上限：`max_minutes ≤ 10080`、`max_cost ≤ 1000`、`minutes_per_task ≤ 1440`。
 
 **接口约定**：
 
@@ -191,31 +199,67 @@ So that 每张进流水线的卡都有人说得清"怎样算对"，事后也能�
 POST /api/workbench/dispatch/{task_id}
   body: {}                       # 契约已在卡上，不在 body 里传
   200 → {"ok": true, "position": 2, "eta": "14:19", "status": "ready"}
-  400 → {"ok": false, "error": "missing_acceptance"}      # contract.accept 为空
-  409 → {"ok": false, "error": "blocked_by_parent", "status": "todo"}
+  200 → {"ok": true, "position": 0, "eta": null, "status": "running"}   # 已 running，不 PATCH
+  400 → {"ok": false, "error": "missing_acceptance"}                    # contract.accept 为空
+  409 → {"ok": false, "error": "blocked_by_parent", "status": "todo"}   # 有未完成 parent
+  409 → {"ok": false, "error": "not_ready", "status": "review"}         # 上游实际落点不是 ready
+  409 → {"ok": false, "error": "not_dispatchable", "status": "done"}
+  404 / 500 / 502 / 503 → not_found / invalid_defaults / upstream_unavailable / metadata_unavailable
+
+GET /api/workbench/metadata?ids=a,b
+  200 → {"a": {"contract": {...}, "contract_defaults": {...}, "bucket": "today"}}
+        # 无记录的 id 省略；workbench.db 不可用时 503 metadata_unavailable
 ```
 
-服务端逻辑：读卡 → 校验 `metadata.contract.accept` 非空 → 写 `metadata.contract_defaults = {max_minutes, max_cost, deny_paths}`（三层默认合并结果）→ `PATCH status=ready` → 返回队列位次（按 `/board` 中 `ready` 列顺序）与预计开始时间。
+服务端逻辑：读卡（先判 404；running → 200 `position:0`；done/archived → 409，
+均不要求验收）→ 校验 `metadata.contract.accept` 非空 → 合并 `defaults.json` 与卡上
+`contract.budget` 得到 `{max_minutes, max_cost, deny_paths}` → 先写
+`contract_defaults` 快照（不覆盖已有快照，带 `write_token`）→ `PATCH status=ready`
+→ **再 GET `/tasks/{id}` 读取真实落点**；只有 ready 才按 `/board` 的 `ready` 列顺序
+算位次与 `eta = now + minutes_per_task × 位次`（board 未命中重读一次，仍不命中 502）。
+上游实际落点不是 `ready` 时返回 409 并补偿删除本次快照。ready 中间件同时拦住
+`PATCH status=ready`、无 `triage` 的建卡、`bulk status=ready` 与 `reclaim`；PATCH
+不存在的 id 先 GET，404 透传而不是误报 400。空验收一律不转发。
 
 **Acceptance Criteria:**
 
 **Given** 一张 `metadata.contract.accept` 为空的卡
-**When** 拖进流水线 / 直接 POST dispatch
-**Then** 返回 400 `missing_acceptance`，卡仍在 `triage`，UI 抖动并提示"先补一句怎样算做完"
+**When** 直接 `PATCH status=ready`、无 `triage` 建卡、`bulk status=ready`、`reclaim` 或 POST dispatch
+**Then** 返回 400 `missing_acceptance`，卡状态不变，不发起上游状态变更、不入队
+
+**Given** 一个不存在的 id
+**When** 直接 `PATCH status=ready`
+**Then** 先 GET 卡，404 原样透传，不误报 `missing_acceptance`
 
 **Given** 一张验收非空的卡
 **When** 派发成功
-**Then** 卡状态变为 `ready`，且 `GET /api/plugins/kanban/tasks/{id}` 的 `metadata.contract_defaults` 含 `max_minutes`/`max_cost`/`deny_paths` 三个键
+**Then** 卡状态变为 `ready`，且 `GET /api/workbench/metadata?ids={id}` 的 `contract_defaults` 含 `max_minutes`/`max_cost`/`deny_paths` 三个键
 
 **Given** 一张有未完成 parent 的卡
 **When** 派发
-**Then** 接口返回 409，UI 提示"已转为 todo，等 parent 完成"，且不重复入队
+**Then** 接口返回 409 `blocked_by_parent`，卡落 `todo`，ready 队列不新增，UI 提示"已转为 todo，等 parent 完成"
 
-**Given** 同一张卡
-**When** 连续两次调用 dispatch
-**Then** 第二次为幂等（返回 200 且状态仍 `ready`，位次不变，不产生第二条队列记录）
+**Given** 上游把卡落到 `review` / `todo`（如 unblock 恢复 review）
+**When** 派发
+**Then** 返回 409 `not_ready` / `blocked_by_parent`，`status` 为实际落点，快照补偿删除
 
-**不做**：不在前端写死预算数值（必须先读 `routing.json`，缺失时用全局默认文件 `workbench-app/defaults.json`）；不改 kanban 状态机。
+**Given** PATCH 已成功
+**When** 用 GET `/tasks/{id}` 读到落点不是 `ready`，或 `/board` 连续两次没有该卡
+**Then** 前者返回 409 并补偿快照；后者返回 502 `upstream_unavailable`，不返回 position 0
+
+**Given** 同一张已 ready 的卡
+**When** 再次调用 dispatch
+**Then** 返回 200，按当前 ready 队列重算位次，不重复入队、不覆盖已有快照
+
+**Given** 一张 done / archived 的卡
+**When** 派发
+**Then** 返回 409 `not_dispatchable`，不复活
+
+**Given** `defaults.json` 类型/范围非法
+**When** 派发
+**Then** 返回 500 `invalid_defaults`，不写快照
+
+**不做**：不实现待办三区/拖拽 UI（Story 1.3 调本故事的 dispatch）；不在前端写死预算数值；不接 routing 层；不改 kanban 状态机；不写共享 `kanban.db`；不实现 provenance / `contract.ready`；不给上游 `recompute_ready` 或原生 9119 dashboard 加 watcher（明确为范围外已知限制）；不改自调用线程池设计；不删除已跟踪的 `.bak-*` / 旧 UI 文件（清理 deferred）。
 
 ---
 

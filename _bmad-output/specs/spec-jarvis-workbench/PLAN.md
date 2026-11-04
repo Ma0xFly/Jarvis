@@ -405,7 +405,7 @@ executor-run --executor claude_code --cwd <dir> --mode write              --budg
 |---|---|---|
 | Phase 1 · magpie 路由 | 网关 `127.0.0.1:3425`；Hermes provider `magpie` 挂 group/* 与单模型共 20 个名；组：`main`/`hermes-main`/`free-ds`/`简单杂活`(=`group/group`, 13 家)/`quick`/`minimax` | `POST /v1/chat/completions` 与 `hermes -m group/group -z` 均 200，`X-Magpie-Model` 可见真实承接方 |
 | Phase 2a · kanban 底座 | dispatcher 60s tick；profiles：researcher / housekeeper / coder / skeptic；各自 SOUL.md、模型 pin、精简 skill 集 | 2026-11-04 三条真实任务全部 ready→running→done |
-| Phase 2b · dashboard 插件 | `~/.hermes/plugins/workbench/`（manifest + index.js + style.css，无后端无构建）；三视图；今日标记存 localStorage `wb.today.v1` | 真实任务加载/勾选/恢复/拖拽/计数均通过 |
+| Phase 2b · dashboard 插件 | `~/.hermes/plugins/workbench/`（manifest + index.js + style.css，无后端无构建）；三视图；今日/长期归属存 `metadata.bucket`（workbench.db），排序/主题等 UI 偏好存 localStorage | 真实任务加载/勾选/恢复/拖拽/计数均通过 |
 | Phase 2c · 独立版 App | `~/Projects/Jarvis/workbench-app/`；FastAPI 挂同一套 kanban router；systemd --user `jarvis-workbench.service`，`127.0.0.1:8787` | 创建/拖拽/完成/8 列/主题切换通过 |
 
 已知限制（P1 一并解决）：固定当前 board、无任务详情、5 秒轮询、今日/排序仅浏览器本地、**看板视图是自建的（不合规，P1 移除）**。

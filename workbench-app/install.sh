@@ -34,7 +34,7 @@ cat >"$APPS/jarvis-workbench.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Jarvis 工作台
-Comment=待办 / 看板 / 已完成（读写本机 kanban.db）
+Comment=待办 / 看板 / 已完成（任务走 kanban REST，契约存工作台自有库）
 Exec=$DIR/open.sh
 Icon=$DIR/web/icon.svg
 Terminal=false
