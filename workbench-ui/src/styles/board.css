@@ -145,13 +145,6 @@
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.wb-live {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--wb-ok);
-}
-
 .wb-tag {
   border-radius: 4px;
   background: var(--wb-hover);
