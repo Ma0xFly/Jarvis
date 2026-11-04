@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, KANBAN } from "../platform";
-import { COLUMNS, COL_BY_KEY, colLabel, ENTERABLE, enterHint, type ColKey } from "./columns";
+import { COLUMNS, colLabel, ENTERABLE, enterHint, type ColKey } from "./columns";
 
 export interface Task {
   id: string;
@@ -142,7 +142,7 @@ export default function Board(): React.ReactElement {
   };
 
   const renderCard = (t: Task) => {
-    const col = COL_BY_KEY[t.status];
+    const time = timeLabel(t.completed_at || t.created_at);
     return (
       <div
         key={t.id}
@@ -155,12 +155,11 @@ export default function Board(): React.ReactElement {
         <div className="cm">
           <span className="cid">{t.id}</span>
           {t.priority && t.priority > 0 ? <span className="wb-prio">P{t.priority}</span> : null}
-          <span className="wb-tag">{t.assignee || "未指派"}</span>
+          {t.assignee ? <span className="wb-tag">{t.assignee}</span> : null}
           {t.block_kind ? <span className="wb-block">{t.block_kind}</span> : null}
-          <span className="wb-time">{timeLabel(t.completed_at || t.created_at)}</span>
+          {time ? <span className="wb-time">{time}</span> : null}
         </div>
         {t.latest_summary ? <div className="wb-sum">{t.latest_summary}</div> : null}
-        {col && t.status === "running" ? <span className="wb-live" /> : null}
       </div>
     );
   };
