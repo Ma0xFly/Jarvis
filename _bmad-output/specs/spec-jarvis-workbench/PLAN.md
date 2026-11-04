@@ -537,7 +537,34 @@ kanban 的单机约束决定了"工作台挂服务器"性价比低。除非要�
 
 ---
 
-## 16. 附录 · 社区同类项目
+## 16. 技术栈（2026-11-04 定稿）
+
+| 层 | 选型 | 理由 |
+|---|---|---|
+| 前端 | **React 18 + TypeScript + Vite** | 组件化 + 类型，长期可维护 |
+| 构建 | Vite **lib 模式**，`formats: ['iife']`，产物 `index.js` + `style.css` | 插件宿主用经典 `<script>` 加载（无 `type=module`），必须 IIFE |
+| 样式 | 原生 CSS + 现有 token | 构建只做打包与 CSS 抽取，不引 UI 库 |
+| 状态 | React 本地状态 + `store.ts`（5s 轮询） | 单 board、单人用，不引状态库 |
+| 后端 | FastAPI 保持现状（Hermes 运行时 Python） | 新增端点只加 `/api/workbench/*` |
+| 测试 | headless Chrome 冒烟脚本（截图 + DOM 断言） | 零新增依赖 |
+| 工程 | `workbench-ui/`（唯一源码）→ 构建产物分发到两个宿主 | 见下方拓扑 |
+
+**构建拓扑（唯一源 → 两份产物）**：
+
+```
+workbench-ui/src/                 ← 唯一源码（React + TS）
+        │  npm run build
+        ├─ index.js + style.css ──→ ~/.hermes/plugins/workbench/dashboard/   （manifest.entry / .css）
+        └─ index.js + style.css ──→ workbench-app/web/                       （独立版静态目录）
+```
+
+- **只改 `workbench-ui/src/`**；两个宿主目录里的 `index.js` / `style.css` 是产物，手改下次构建即丢。
+- 宿主差异只允许出现在 `src/main.tsx`：有 dashboard SDK → 注册 tab；有 `#workbench-root` → 整页渲染。
+- 旧 `sync-ui.sh` 作废，分发由 `npm run build` 完成。
+
+**为什么不走零构建**：待办三区 + 8 列看板 + 全屏验收 + 运行画布（SVG）+ 详情抽屉，合计会过 3k 行；单文件 IIFE 到那个规模改一次怕一次。而插件宿主不支持 ESM，手写模块化走不通——所以只能上构建。
+
+## 17. 附录 · 社区同类项目
 
 | 项目 | 星 | 思路 | 与本方案的差异 |
 |---|---|---|---|

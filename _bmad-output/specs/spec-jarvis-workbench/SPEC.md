@@ -75,6 +75,7 @@ sources:
 ## Constraints
 
 - **唯一状态源是 `kanban.db`**：仓库/流水线/验收全部映射到原生状态（`triage` / `ready` / `running` / `review` / `done`），不新建库、不双写。
+- **前端必须能装进经典脚本宿主**：插件用 `<script>`（无 `type=module`）加载，产物须为 IIFE；前端源码统一在 `workbench-ui/`，两个宿主目录只放构建产物。
 - **看板不得发明自己的状态模型**：自有前端可渲染，但列名、列序、`status` 字符串必须与 Hermes 原生 8 列逐项对齐，且全库只允许一处列定义常量。
 - **上游内核零改动**：只用插件 / CLI / REST；已知"答后续原会话"需改 `gateway/session_kanban.py`，明确不做。
 - **`running` 不可手动设置**；从 blocked 恢复只能落 `ready` 或 `todo`。

@@ -56,7 +56,8 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 
 | Story | 覆盖 |
 |---|---|
-| 1.1 看板回归原生 | FR-7 |
+| 1.0 构建脚手架 | 使能项（无 FR） |
+| 1.1 看板对齐原生 | FR-7 |
 | 1.2 契约字段与派发闸门 | FR-2(部分) FR-4 FR-5 FR-8 FR-9 |
 | 1.3 待办三区与拖拽 | FR-1 FR-2 FR-3 FR-8 |
 | 1.4 派发回执 | FR-6 |
@@ -70,6 +71,54 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 ## Epic 1: 派发骨架（P1）
 
 让「想法 → 仓库 → 拖进流水线 → 排队等 worker」这条最小链路在真实数据上跑通，同时把看板 tab 交还给 Hermes 原生实现。
+
+### Story 1.0: 前端构建脚手架（React + TS + Vite，双产物）
+
+As a 开发者，
+I want 一条 `npm run build` 就能产出两份可用的 IIFE 包，
+So that 后续所有 UI story 都改同一份源码，且两端行为一致。
+
+**背景**：插件宿主用经典 `<script>` 加载（无 `type="module"`），且已把 React 注入 `window.__HERMES_PLUGIN_SDK__`。
+所以产物必须是 IIFE，且插件包**不能**再打包 React。
+
+**目录**：
+
+```
+workbench-ui/
+├── package.json          # react/react-dom/typescript/vite/@vitejs/plugin-react
+├── vite.config.ts        # 两个 mode：plugin（external react）/ standalone（打包 react）
+├── tsconfig.json
+├── index.html            # 仅 standalone 用，含 <div id="workbench-root">
+├── scripts/distribute.mjs# 把产物复制到两个宿主目录
+└── src/
+    ├── main.tsx          # 唯一入口：检测宿主
+    ├── platform.ts       # api = SDK.fetchJSON | plainFetch
+    └── App.tsx           # 占位组件（一个标题即可）
+```
+
+**改动文件**：`workbench-ui/**`（新建）、`.gitignore`（加 `workbench-ui/node_modules/`、`workbench-ui/dist/`）。
+
+**Acceptance Criteria:**
+
+**Given** 干净环境
+**When** `cd workbench-ui && npm install && npm run build:plugin`
+**Then** 产出 `dist/plugin/index.js` 与 `dist/plugin/style.css`，且 `head -c 300 dist/plugin/index.js` 含 `window.__HERMES_PLUGIN_SDK__.React`
+
+**Given** 同一份源码
+**When** `npm run build:standalone`
+**Then** 产出 `dist/standalone/index.js`、`style.css` 与 `index.html`，且该 js 内**不含** `__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED`（说明 React 已打进 standalone）
+
+**Given** plugin 产物
+**When** `grep -c "__SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED" dist/plugin/index.js`
+**Then** 结果为 `0`（React 没被打进插件包）
+
+**Given** 构建完成
+**When** `npm run build`（含 distribute）
+**Then** 两个宿主目录的 `index.js` / `style.css` 与 dist 一致，`curl -s 127.0.0.1:8787/healthz` 仍 `{"ok":true}`
+
+**不做**：不实现任何业务 UI；不改 `plugin_api.py`；不动 `manifest.json` 的 entry/css 路径（仍为 `index.js` / `style.css`）。
+
+---
 
 ### Story 1.1: 看板 tab 对齐 Hermes 原生 8 列
 
@@ -94,9 +143,10 @@ So that 我不用记两套列名，也不会在拖拽时把状态搞错。
 | `done` | 已完成 |
 
 **改动文件**：
-- `~/.hermes/plugins/workbench/dashboard/index.js`（抽出 `COLUMNS` 常量、按它渲染、删掉 5 列旧映射）
-- `~/.hermes/plugins/workbench/dashboard/style.css`（8 列横排 + 横向滚动）
-- 同步：`workbench-app/sync-ui.sh`
+- `workbench-ui/src/board/columns.ts`（新增 `COLUMNS` 常量）
+- `workbench-ui/src/board/Board.tsx`（按常量渲染，删掉旧 5 列映射）
+- `workbench-ui/src/styles/board.css`（8 列横排 + 横向滚动）
+- 构建分发：`npm run build`
 
 **Acceptance Criteria:**
 
@@ -132,8 +182,8 @@ So that 每张进流水线的卡都有人说得清"怎样算对"，事后也能�
 
 **改动文件**：
 - `workbench-app/server.py`（新增 `POST /api/workbench/dispatch/{task_id}`）
-- `~/.hermes/plugins/workbench/dashboard/index.js`（拖拽前校验 + 409 提示）
-- `workbench-app/web/boot.js` 或 `sdk-shim.js`（若需按运行形态切换端点）
+- `workbench-ui/src/api/workbench.ts`（新增端点调用 + 错误映射）
+- `workbench-ui/src/todo/DragLayer.tsx`（拖拽前校验 + 409 提示）
 
 **接口约定**：
 
@@ -176,8 +226,8 @@ I want 待办页分成「流水线 / 今日 / 长期」三列，并从仓库把�
 So that 派活这件事有明确的承诺动作，而不是在一张长清单里点来点去。
 
 **改动文件**：
-- `~/.hermes/plugins/workbench/dashboard/index.js`（布局重排、三区渲染、拖拽）
-- `~/.hermes/plugins/workbench/dashboard/style.css`（三列网格、凹槽底色、拖拽高亮）
+- `workbench-ui/src/todo/TodoPage.tsx`（三列网格、三区渲染、拖拽）
+- `workbench-ui/src/styles/todo.css`（凹槽底色、投放高亮）
 
 **布局约定**：`grid-template-columns: 302px 1fr 1fr`，顺序固定为 流水线 / 今日 / 长期；底部保留一句话建卡输入框（默认落 `bucket=today`）。
 
@@ -213,7 +263,7 @@ As a 工作台用户，
 I want 派发后立刻看到"第几位、什么时候开始"，
 So that 我知道这次点击生效了，不会因为没反馈而连点三次。
 
-**改动文件**：`dashboard/index.js`（toast / 行内状态）、`style.css`。
+**改动文件**：`workbench-ui/src/todo/Receipt.tsx`（toast / 行内状态）、`workbench-ui/src/styles/todo.css`。
 
 **Acceptance Criteria:**
 

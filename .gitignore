@@ -12,6 +12,10 @@ __pycache__/
 *.log
 .dsh-runs/
 
+# 前端构建
+workbench-ui/node_modules/
+workbench-ui/dist/
+
 # 本地覆盖
 .env
 .env.*

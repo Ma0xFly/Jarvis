@@ -38,28 +38,48 @@ spec: SPEC.md
 | 路径 | 角色 | 能不能改 |
 |---|---|---|
 | `workbench-app/server.py`（99 行） | FastAPI 外壳：importlib 加载 Hermes 的 `plugins/kanban/dashboard/plugin_api.py`，原样挂到 `/api/plugins/kanban` | **可改**，只加不改 |
-| `workbench-app/web/app.js`（581 行） | 前端主逻辑 —— **它是副本** | 不要直接改，见 §3 |
-| `workbench-app/web/style.css` | 样式副本 | 同上 |
+| `workbench-ui/src/` | **前端唯一源码**（React + TS） | **只改这里** |
+| `workbench-app/web/index.js`、`style.css` | 独立版构建产物 | 产物，禁止手改 |
 | `workbench-app/web/theme.css`、`index.html`、`boot.js`、`sdk-shim.js` | 独立版外壳（主题 token、页面骨架、把 dashboard SDK 映射成 fetch） | 可改 |
-| `~/.hermes/plugins/workbench/dashboard/index.js`、`style.css` | **前端源文件**（dashboard 插件形态） | **改这里** |
+| `~/.hermes/plugins/workbench/dashboard/index.js`、`style.css` | 插件构建产物（`manifest.entry` / `.css` 指向它们） | 产物，禁止手改 |
 | `~/.hermes/plugins/workbench/plugin.yaml` | 插件清单（frontend-only，无后端能力） | 尽量不动 |
 | `~/.hermes/hermes-agent/plugins/kanban/dashboard/plugin_api.py` | 上游 kanban REST（4000+ 行，提供全部读写） | **禁止改** |
 | `~/.hermes/kanban.db` | 唯一状态源 | **禁止直接写 SQL**，一律走 REST/CLI |
 | `_bmad-output/specs/spec-jarvis-workbench/` | SPEC + 本文件 + PLAN | 文档 |
 | `.agents/skills/`、`_bmad/` | BMad 工具链 | 禁止改 |
 
-## 3. 双向同步的方向（最容易搞错的一条）
+## 3. 构建流水线（唯一源 → 两份产物）
 
 ```
-~/.hermes/plugins/workbench/dashboard/index.js   ← 源（先改这里）
-              │  workbench-app/sync-ui.sh（单向复制）
-              ▼
-workbench-app/web/app.js                          ← 副本（下次 sync 会被覆盖）
+workbench-ui/src/                 ← 唯一源码（React + TS）
+        │  npm run build
+        ├─ index.js + style.css → ~/.hermes/plugins/workbench/dashboard/
+        └─ index.js + style.css → workbench-app/web/
 ```
 
-- 改 UI：改插件那份 → `./sync-ui.sh` → `systemctl --user restart jarvis-workbench`。
-- 只改 `web/app.js` 会在下次同步时丢掉。
-- 若某个能力只属于独立版（例如调用 `/api/workbench/*`），用 `web/boot.js` 或 `sdk-shim.js` 做适配，不要污染共享的 `app.js`。
+- **只改 `workbench-ui/src/`**。两个宿主目录里的 `index.js` / `style.css` 是产物，手改下一次构建就丢。
+- 宿主差异只允许出现在 `src/main.tsx`：有 dashboard SDK → 注册 tab；有 `#workbench-root` → 整页渲染。
+- 旧 `sync-ui.sh` 作废。
+
+### 3.1 两套 build 的差异（关键）
+
+dashboard 宿主已经把 React 注入到 `window.__HERMES_PLUGIN_SDK__`（`React` / `hooks` / `fetchJSON` / `authedFetch`）。
+**插件包不能再打包一份 React**——双 React 会让 hooks 直接崩。
+
+| | plugin build | standalone build |
+|---|---|---|
+| react / react-dom | `external` + `output.globals` 指到宿主 | 正常打包 |
+| 输出 banner | `var React = window.__HERMES_PLUGIN_SDK__.React;` | 无 |
+| 数据层 | `SDK.fetchJSON`（带 loopback token） | 原生 `fetch` |
+| 出口 | `PLUGINS.register("workbench", App)` | `createRoot(#workbench-root).render(<App/>)` |
+
+源码只有一份，运行期按宿主选择数据层：
+
+```ts
+const sdk = window.__HERMES_PLUGIN_SDK__
+export const api = sdk ? sdk.fetchJSON : plainFetch
+```
+
 
 ## 4. REST 契约（已核实）
 
