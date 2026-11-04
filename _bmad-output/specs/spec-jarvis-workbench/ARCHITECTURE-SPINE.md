@@ -95,6 +95,7 @@ workbench-app/web/app.js                          ← 副本（下次 sync 会�
 | `cost` | 聚合任务 | `{minutes, tokens, usd, by_rule}` |
 | `hops` | 建子卡 | `int`，> 8 拒绝 |
 | `dsh_session_id` | coder worker | `"session-<uuid>"` |
+| `classification` | 建卡/分类器 | `{by: "human"\|"rule"\|"model", model?, label, confidence, cost?}` |
 
 `bucket` 用 `metadata` 而不是新状态：**不占用 `todo`**，仓库卡统一 `triage`。
 

@@ -302,6 +302,22 @@ magpie intent routing 上线后，快问快答自动落 cheap-lane，不走建�
 - 同时承载 §4.1 的预算包与 §4.4 的固化物登记。
 - 「定了的事 / 定了不做的事」写进 `~/Projects/Jarvis/`，由 `decisions` skill 指向。
 
+### 6.3 分类器：三层漏斗，jev 只配做第二层
+
+| 层 | 谁决定 | 成本 | 覆盖 |
+|---|---|---|---|
+| **L0 显式** | 建卡时人点类型（research / code / sheet / ops / review / summary，默认按标题预选） | 0 | ~90% |
+| **L1 规则** | `routing.json` 的 `when`（source / type / 关键词）+ webhook 事件的 `type` 字段 | 0 | 自动进来的事件 |
+| **L2 模型** | 仅在 `type` 缺失时调用，输出受限枚举 + `confidence` | 极低 | 剩余少数 |
+
+- **`typesafe/jev-router` 不是分类器**：它输出"该用哪个模型、什么推理档位"，是给请求挑执行者的路由器；拿它判任务类型是问错了问题。
+- **`typesafe/jev-1.13`（/1.14）可以当 L2**：TypeSafe 的 structured-decision 模型，返回 typed choice 而非散文，$0.042/M input、输出基本免费。已知短板是**只擅长边界清晰的问题**——类型含糊时它会给出自信但错的答案。
+- **门槛**：L2 只在分类为空时调用；`confidence < 0.7` → 落回今日仓库让人点，不自动派发。
+- **分类器永远不直接决定 assignee**，只输出 `type`；`type → worker` 由 `routing.json` 映射（与"事件不能自己选路"同一条原则）。
+- **审计**：每次分类写 `metadata.classification = {by: human\|rule\|model, model, label, confidence, cost}`。`by=human` 的记录就是将来评测模型的标注集。
+- **上 L2 的条件**：累计 ≥50 张带人工标签的卡，离线跑一次对比（jev-1.13 vs `group/group` 的 cheap 模型），top-1 ≥ 90% 才上线。当前 24 张真实卡，远未到。
+- **打扰分级不用模型**：P0/P1/P2 是三个可判定条件（有无未完成子卡 / `block_kind` / 是否越界），必须可复现，规则就够。
+
 ---
 
 ## 7. 现状基线（已完成，别重做）
