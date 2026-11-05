@@ -14,6 +14,7 @@ workbench-app/server.py  (FastAPI)
         └─ /static, /             → own frontend (workbench-ui build)
         │
         ├──▶ ~/.hermes/kanban.db          task state (upstream REST only)
+        ├──▶ ~/.hermes/state.db           worker sessions (read-only, 2.3)
         └──▶ workbench-app/workbench.db   contract metadata (workbench-owned)
 ```
 
@@ -220,6 +221,55 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
   - `WORKBENCH_INBOX_CACHE_SECONDS` count/inbox 的 /board 短缓存，默认 `1`；
     `0` 关闭缓存（仍保留 in-flight 合并），测试用
 
+## 会话追溯（2.3）
+
+验收页的「打开执行会话」和看板已完成卡的「会话」都会打开应用内只读抽屉；
+不跳 9119、不发消息、不写 `state.db`。
+
+```bash
+curl -s http://127.0.0.1:8787/api/workbench/session/<task_id>
+# 200 {"ok":true,"task_id":"t_…","session":{"id":"…","source":"kanban",
+#      "title":"…","model":"…","started_at":…,"ended_at":…,"message_count":N,
+#      "input_tokens":…,"output_tokens":…,"profile_name":"…"},
+#      "source":"run","run_id":48,"executor_session_id":null,
+#      "messages":[{"id":123,"role":"user","content":"…","content_chars":42,
+#                   "content_truncated":false,"compressed":false,
+#                   "tool_calls":[],"tool_name":null,"timestamp":…}, …],
+#      "returned_count":16,"total_count":16,"message_limit":200,
+#      "truncated":false}
+# 404 no_session / 404 session_missing / 404 not_found / 502 upstream_unavailable
+# 503 session_unavailable（state.db 缺失、锁定、损坏或读取超时）
+```
+
+规则：
+
+- 会话解析按「最新一轮」优先：run 列表按 `started_at`（同值按 run id）倒序，
+  第一个带 `metadata.worker_session_id` 的 run 优先；该会话在 `state.db` 中
+  不存在时继续尝试更早的 run，最后回退 `tasks.session_id`（标注为「发起会话」）。
+  `executor_session_id` 只从**实际解析出会话的那个 run** 返回（Epic 3 才续跑）。
+- 只读打开 `~/.hermes/state.db`（`mode=ro` + `PRAGMA query_only` + busy timeout），
+  按 `messages.id`（不是 timestamp，时钟会回退）倒序取窗口，再正序返回。
+  若表里有对应列则遵守 Hermes 的显示规则：`(active = 1 OR compacted = 1)`、
+  跳过 `display_kind='hidden'`、按 `display_identity` 去重保留最新一行、
+  `_compressed_summary` 行按 Hermes 的显示投影裁剪（只保留 prior tail / live ask）。
+- 不返回 `sessions.system_prompt`；role=`system` 以及内容以 `[System:` 或
+  `[CONTEXT COMPACTION — REFERENCE ONLY]` 开头的内部 user 行会被跳过。
+- 每条消息内容上限 ~20KB（带截断标记与 `content_chars` / `content_truncated`），
+  整个响应内容上限 ~1MB；`returned_count` / `total_count` 与
+  `sessions.message_count` 解耦（记录数不一致时以实际可显示行为准）。UI 显示
+  「显示 X / 共 Y 条消息」与 truncated 提示。
+- 工具调用只返回名称与「参数已折叠」；参数（可能含命令、路径、token）不离开
+  服务端。响应带 `Cache-Control: no-store`。
+- 环境变量覆盖：
+  - `WORKBENCH_STATE_DB` Hermes state DB 路径，默认 `~/.hermes/state.db`
+  - `WORKBENCH_SESSION_MESSAGE_LIMIT` 单次消息窗口，默认 `200`（1–1000）
+- **敏感性 / 远程绑定**：会话接口返回真实对话正文。服务默认只监听
+  `127.0.0.1` 且没有登录鉴权；不要把它绑定到 `0.0.0.0` 或暴露到不可信网络。
+  需要远程访问时先走 Tailscale 等私有网络，并自行加访问控制。
+- 已知延后：compaction 的 `parent_session_id` 祖先会话合并、`display_kind`
+  的更多变体（当前只处理 hidden + display_identity 去重）、以及多轮 run 选择器，
+  均不在本故事内；需要时另开故事。
+
 ## 通知中心 / P0 通知与动作
 
 通知引擎（`notifications.py`）只读 `/board` + `GET /tasks/{id}` 分类，不写
@@ -362,6 +412,7 @@ curl -s -X POST \
 | `tests/test_todo.py` | 待办建卡 / metadata 写端点的可重复集成测试 |
 | `tests/test_verify.py` | inbox / count / sweep / verify / 48h 自动收与退避的可重复集成测试 |
 | `tests/test_notifications.py` | 通知分类/攒批/升级/日报/槽/动作/snooze/命令失败/后台 10s 的测试 |
+| `tests/test_session.py` | 会话解析/只读 state.db/窗口与过滤/截断/脱敏/no-store 的集成测试 |
 | `web/index.js` / `web/style.css` | `workbench-ui` 的构建产物（禁止手改） |
 | `web/index.html` / `web/icon.svg` / `web/theme.css` | 独立版页面骨架与主题 |
 | `install.sh` | 用户级 systemd 服务 + 桌面入口 |
@@ -388,9 +439,11 @@ python3 workbench-app/tests/test_dispatch.py -v
 python3 workbench-app/tests/test_todo.py -v
 python3 workbench-app/tests/test_verify.py -v
 python3 workbench-app/tests/test_notifications.py -v
+python3 workbench-app/tests/test_session.py -v
 cd workbench-ui && npm run probe:todo    # headless 三列/拖拽/建卡/验收/回执/位次探针
 cd workbench-ui && npm run probe:verify  # headless 全屏验收探针
 cd workbench-ui && npm run probe:notify  # headless 通知中心探针
+cd workbench-ui && npm run probe:session # headless 会话抽屉/入口/只读/重试探针
 ```
 
 后端测试会为每个套件创建临时 `HERMES_KANBAN_HOME` 与 `WORKBENCH_DB`，并用
@@ -416,7 +469,11 @@ SDK stub（只读就绪列、其他列仍可 PATCH、缺少 `fetchJSON` 的宿�
 `npm run probe:notify` 覆盖通知中心：P0 置顶、P1 面板、P2 日报、验收槽/
 排队、倒计时数值、remind/不收/收、桌面通知失败提示、挂载后新卡 5s 轮询，
 以及插件宿主无通知中心/无轮询。
-`npm run verify` = `build + probe:todo + probe:verify + probe:notify`。
+`npm run probe:session` 覆盖会话抽屉：看板完成卡与验收页入口、task.session_id
+「发起会话」回退、按 id 的窗口/过滤/去重、显示条数与 truncated、工具参数脱敏、
+滚动到最新、body 锁滚动 + 背景 inert、Esc/焦点、state.db 503 与
+session_missing 重试、抽屉打开时 A/R/S 不影响背后验收卡，以及插件宿主无入口。
+`npm run verify` = `build + probe:todo + probe:verify + probe:notify + probe:session`。
 
 探针前置条件：Node ≥22（内置 `WebSocket`/`fetch`）、本机 Chrome/Chromium
 （自动找 `google-chrome` / Playwright 缓存，找不到时用 `CHROME_BIN` 指定）、

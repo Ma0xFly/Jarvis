@@ -12,7 +12,8 @@
     "probe:todo": "node scripts/todo-probe.mjs",
     "probe:verify": "node scripts/verify-probe.mjs",
     "probe:notify": "node scripts/notification-probe.mjs",
-    "verify": "npm run build && npm run probe:todo && npm run probe:verify && npm run probe:notify"
+    "probe:session": "node scripts/session-probe.mjs",
+    "verify": "npm run build && npm run probe:todo && npm run probe:verify && npm run probe:notify && npm run probe:session"
   },
   "dependencies": {
     "react": "^18.3.1",

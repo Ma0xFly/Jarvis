@@ -8,7 +8,7 @@
  *
  * Covered:
  *   - count-only header, full-screen open, focus/trap, 1/N, countdown tokens
- *   - text + image attachments, result/summary/run info, 2.3 slot
+ *   - text + image attachments, result/summary/run info, session entry
  *   - key repeat ignored; A accept; R reason rules (Esc, typing a/r/s,
  *     Ctrl+Enter); S skip with a remaining card; 5s poll does not re-add skip
  *   - batch stats, ~3s auto-exit, appended card during stats/poll
@@ -525,9 +525,9 @@ async function main() {
       JSON.stringify(cardState),
     );
     check(
-      "展示运行信息、自述、倒计时与 2.3 占位",
+      "展示运行信息、自述、倒计时与执行会话入口",
       cardState.run && cardState.runSummary.includes("完成") &&
-        cardState.session.includes("2.3") &&
+        cardState.session.includes("打开执行会话") &&
         cardState.countdown.includes("自动收") &&
         !cardState.countdown.includes("48h"),
       JSON.stringify(cardState),

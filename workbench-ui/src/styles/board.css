@@ -136,6 +136,27 @@
   margin-left: auto;
   opacity: 0.8;
 }
+/* 已完成卡的会话入口：拖拽卡片不受影响（按钮自己不是拖拽源）。 */
+.wb-card-session {
+  border: 1px solid var(--wb-border);
+  background: var(--wb-card);
+  color: var(--wb-muted);
+  font: inherit;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.wb-card-session:hover {
+  background: var(--wb-hover);
+  border-color: var(--wb-accent);
+  color: var(--wb-fg);
+}
+.wb-card-session:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: 1px;
+}
 .wb-sum {
   font-size: 11px;
   color: var(--wb-muted);

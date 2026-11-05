@@ -68,7 +68,10 @@ export type WorkbenchErrorCode =
   | "verify_failed"
   | "inbox_failed"
   | "sweep_failed"
-  | "notification_failed";
+  | "notification_failed"
+  | "no_session"
+  | "session_missing"
+  | "session_unavailable";
 
 const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "missing_acceptance",
@@ -102,6 +105,9 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "inbox_failed",
   "sweep_failed",
   "notification_failed",
+  "no_session",
+  "session_missing",
+  "session_unavailable",
 ];
 
 /** 后端错误码优先；宿主 SDK 只给 message 时按文本兜底，最后按 HTTP 状态兜底 */
@@ -164,13 +170,21 @@ type ErrorContext =
   | "verify"
   | "inbox"
   | "sweep"
-  | "notifications";
+  | "notifications"
+  | "session";
 
 /**
  * HTTP 状态兜底只在没有后端 error 码时使用。400 的含义随调用而变：
  * 只有 dispatch 是 missing_acceptance，create/save 一律按 invalid_* 处理。
  */
 function fallbackCode(status: number | undefined, context: ErrorContext): WorkbenchErrorCode {
+  // Session reads have their own 503 meaning: the viewer DB is unavailable,
+  // not workbench metadata. Explicit backend codes win over this map.
+  if (context === "session") {
+    if (status === 404) return "not_found";
+    if (status === 502) return "upstream_unavailable";
+    return "session_unavailable";
+  }
   switch (status) {
     case 400:
       return context === "dispatch" ? "missing_acceptance" : "invalid_request";
@@ -920,5 +934,152 @@ export async function notificationAction(
     };
   } catch (error) {
     throw toWorkbenchError(error, "notifications");
+  }
+}
+
+/* -------------------------------------------------------------------------
+ * 会话追溯（2.3）：GET /api/workbench/session/{task_id}
+ * 后端只读 state.db；最近的 200 条消息按时间正序返回，tool calls 已折叠。
+ * ---------------------------------------------------------------------- */
+
+export interface SessionToolCall {
+  name: string;
+  summary: string;
+}
+
+export interface SessionMessage {
+  id: number;
+  role: string;
+  content: string;
+  /** 原始内容长度（截断前），用于展示截断提示。 */
+  content_chars: number;
+  content_truncated: boolean;
+  /** 压缩轮次里由 _compressed_summary 投影出的行。 */
+  compressed: boolean;
+  tool_calls: SessionToolCall[];
+  tool_name: string | null;
+  timestamp: number | null;
+}
+
+export interface SessionMeta {
+  id: string;
+  source: string | null;
+  title: string | null;
+  model: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+  message_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  profile_name: string | null;
+}
+
+export interface SessionTranscript {
+  ok: true;
+  task_id: string;
+  session: SessionMeta;
+  /** run = metadata.worker_session_id；task = tasks.session_id 回退 */
+  source: "run" | "task";
+  run_id: number | null;
+  /** 只展示；续跑属 Epic 3 */
+  executor_session_id: string | null;
+  messages: SessionMessage[];
+  /** 实际返回条数（已按显示/压缩规则过滤）。 */
+  returned_count: number;
+  /** 过滤后的会话总条数（与 sessions.message_count 解耦）。 */
+  total_count: number;
+  message_limit: number;
+  truncated: boolean;
+}
+
+function normalizeSessionMessage(raw: unknown): SessionMessage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const source = raw as Record<string, unknown>;
+  const toolCalls = Array.isArray(source.tool_calls)
+    ? source.tool_calls
+        .map((entry): SessionToolCall | null => {
+          if (!entry || typeof entry !== "object") return null;
+          const call = entry as Record<string, unknown>;
+          return {
+            name: typeof call.name === "string" ? call.name : "",
+            summary: typeof call.summary === "string" ? call.summary : "",
+          };
+        })
+        .filter((call): call is SessionToolCall => call !== null)
+    : [];
+  const content = typeof source.content === "string" ? source.content : "";
+  return {
+    id: numberOr(source.id, 0),
+    role: typeof source.role === "string" ? source.role : "unknown",
+    content,
+    content_chars: numberOr(source.content_chars, content.length),
+    content_truncated: source.content_truncated === true,
+    compressed: source.compressed === true,
+    tool_calls: toolCalls,
+    tool_name: typeof source.tool_name === "string" ? source.tool_name : null,
+    timestamp: nullableNumber(source.timestamp),
+  };
+}
+
+function normalizeSessionMeta(raw: unknown): SessionMeta | null {
+  if (!raw || typeof raw !== "object") return null;
+  const source = raw as Record<string, unknown>;
+  if (typeof source.id !== "string" || !source.id) return null;
+  return {
+    id: source.id,
+    source: typeof source.source === "string" ? source.source : null,
+    title: typeof source.title === "string" ? source.title : null,
+    model: typeof source.model === "string" ? source.model : null,
+    started_at: nullableNumber(source.started_at),
+    ended_at: nullableNumber(source.ended_at),
+    message_count: numberOr(source.message_count, 0),
+    input_tokens: numberOr(source.input_tokens, 0),
+    output_tokens: numberOr(source.output_tokens, 0),
+    profile_name: typeof source.profile_name === "string" ? source.profile_name : null,
+  };
+}
+
+/**
+ * 读取一张卡的执行会话。后端 404 `no_session` / `session_missing` 与
+ * 503 `session_unavailable` 都作为 WorkbenchError 抛出，查看器按码提示。
+ */
+export async function getSession(taskId: string): Promise<SessionTranscript> {
+  if (!taskId || !taskId.trim()) {
+    throw new WorkbenchError("session_unavailable", "缺少任务 id");
+  }
+  try {
+    const data = (await api(
+      WORKBENCH + "/session/" + encodeURIComponent(taskId),
+    )) as Record<string, unknown> | null;
+    if (!data || data.ok !== true) {
+      throw new WorkbenchError("session_unavailable", "会话响应格式不正确", 200);
+    }
+    const session = normalizeSessionMeta(data.session);
+    if (!session) {
+      throw new WorkbenchError("session_unavailable", "会话响应格式不正确", 200);
+    }
+    const messages = Array.isArray(data.messages)
+      ? data.messages
+          .map(normalizeSessionMessage)
+          .filter((message): message is SessionMessage => message !== null)
+      : [];
+    return {
+      ok: true,
+      task_id: typeof data.task_id === "string" ? data.task_id : taskId,
+      session,
+      source: data.source === "task" ? "task" : "run",
+      run_id: nullableNumber(data.run_id),
+      executor_session_id:
+        typeof data.executor_session_id === "string"
+          ? data.executor_session_id
+          : null,
+      messages,
+      returned_count: numberOr(data.returned_count, messages.length),
+      total_count: numberOr(data.total_count, messages.length),
+      message_limit: numberOr(data.message_limit, 200),
+      truncated: data.truncated === true,
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "session");
   }
 }

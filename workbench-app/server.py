@@ -105,6 +105,33 @@ AUTO_COLLECT_AUDIT_SUMMARY = "48h 自动收（worker 自述保留在 review_requ
 MAX_REJECT_REASON_CHARS = 2000
 VERIFY_AUTHOR = "workbench"
 
+# Session trace (Story 2.3). The Hermes runtime owns ``~/.hermes/state.db``;
+# the workbench only opens it read-only to render one worker session. Nothing
+# in this path writes: ``mode=ro`` + ``PRAGMA query_only`` are defence in
+# depth, and every query is scoped by ``session_id`` (the DB is ~3GB).
+DEFAULT_STATE_DB_PATH = Path.home() / ".hermes" / "state.db"
+SESSION_MESSAGE_LIMIT = 200
+SESSION_BUDGET_SECONDS = 3.0
+STATE_DB_TIMEOUT_SECONDS = 2.0
+# Hard bounds so one transcript read cannot hydrate a prompt-sized payload:
+# each message is capped at ~20KB, the whole content array at ~1MB, and the
+# SQLite read itself has a best-effort wall-clock deadline.
+SESSION_MESSAGE_CONTENT_CHARS = 20_000
+SESSION_RESPONSE_CONTENT_CHARS = 1_000_000
+SESSION_DB_READ_SECONDS = 4.0
+SESSION_PROGRESS_OPCODES = 20_000
+# Internal model-facing user rows the gateway never paints (also role=system).
+SESSION_INTERNAL_USER_PREFIXES = (
+    "[System:",
+    "[CONTEXT COMPACTION — REFERENCE ONLY]",
+)
+# Compaction carriers: keep only what Hermes's display projection keeps.
+SESSION_SUMMARY_END_MARKER = (
+    "--- END OF CONTEXT SUMMARY — respond to the message below, not the summary above ---"
+)
+SESSION_MERGED_DELIMITER = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+SESSION_MERGED_PRIOR_HEADER = "[PRIOR CONTEXT — for reference only; not a new message]"
+
 # Notifications (Story 2.2). The engine lives in memory; the background poller
 # starts 5s after boot and re-reads the board. All thresholds are env-tunable
 # so tests can shorten them without sleeping for half an hour.
@@ -130,6 +157,10 @@ class UpstreamUnavailable(RuntimeError):
 
 class TaskNotFound(UpstreamUnavailable):
     """``GET /tasks/{id}`` returned 404 for a card we expected to exist."""
+
+
+class SessionUnavailable(RuntimeError):
+    """``~/.hermes/state.db`` is missing, locked, or otherwise unreadable."""
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +659,8 @@ class WorkbenchService:
         review_ttl_seconds: int = REVIEW_TTL_SECONDS,
         auto_collect_backoff_seconds: float = REVIEW_BACKOFF_SECONDS,
         inbox_cache_seconds: float = INBOX_CACHE_SECONDS,
+        state_db_path: Optional[Path] = None,
+        session_message_limit: int = SESSION_MESSAGE_LIMIT,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.store = store
@@ -635,6 +668,8 @@ class WorkbenchService:
         self.review_ttl_seconds = int(review_ttl_seconds)
         self.auto_collect_backoff_seconds = float(auto_collect_backoff_seconds)
         self.inbox_cache_seconds = float(inbox_cache_seconds)
+        self.state_db_path = Path(state_db_path) if state_db_path else DEFAULT_STATE_DB_PATH
+        self.session_message_limit = max(1, int(session_message_limit))
         # Header counts share one board read: a short cache plus a lock that
         # also acts as the in-flight guard for concurrent count/inbox calls.
         self._review_ids_lock = threading.Lock()
@@ -1789,6 +1824,469 @@ class WorkbenchService:
                 normalized, patched, "reject", "triage", comment_written
             )
 
+    # -- session trace (Story 2.3) ----------------------------------------
+
+    @staticmethod
+    def _run_order_key(run: dict[str, Any]) -> tuple[int, int]:
+        started = run.get("started_at")
+        started_at = (
+            int(started)
+            if isinstance(started, (int, float)) and not isinstance(started, bool)
+            else 0
+        )
+        run_id = run.get("id")
+        return (
+            started_at,
+            int(run_id) if isinstance(run_id, int) and not isinstance(run_id, bool) else 0,
+        )
+
+    @classmethod
+    def _ordered_runs(cls, detail: dict[str, Any]) -> list[dict[str, Any]]:
+        """Runs newest first (started_at, then id as the tie-breaker)."""
+        runs = detail.get("runs")
+        if not isinstance(runs, list):
+            return []
+        return sorted(
+            (run for run in runs if isinstance(run, dict)),
+            key=cls._run_order_key,
+            reverse=True,
+        )
+
+    @classmethod
+    def _session_candidates(cls, detail: dict[str, Any]) -> list[dict[str, Any]]:
+        """Candidate sessions for the card, newest run first ("最新一轮" first).
+
+        Order: every run carrying ``metadata.worker_session_id``, newest
+        ``started_at`` (then run id) first, followed by ``tasks.session_id``
+        as the originating-session fallback. A candidate whose id is absent
+        from state.db is skipped in the caller so the next older run can win.
+        ``executor_session_id`` travels only with the run that supplied the
+        session (the task fallback never has one).
+        """
+        candidates: list[dict[str, Any]] = []
+        for run in cls._ordered_runs(detail):
+            metadata = run.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            value = metadata.get("worker_session_id")
+            if not isinstance(value, str) or not value.strip():
+                continue
+            executor = metadata.get("executor_session_id")
+            candidates.append(
+                {
+                    "session_id": value.strip(),
+                    "run": run,
+                    "executor_session_id": executor.strip()
+                    if isinstance(executor, str) and executor.strip()
+                    else None,
+                }
+            )
+        value = cls._detail_task(detail).get("session_id")
+        if isinstance(value, str) and value.strip():
+            candidates.append(
+                {
+                    "session_id": value.strip(),
+                    "run": None,
+                    "executor_session_id": None,
+                }
+            )
+        return candidates
+
+    @staticmethod
+    def _project_compressed(content: str) -> Optional[str]:
+        """Display projection for ``_compressed_summary`` carriers.
+
+        Mirrors the string branch of Hermes's
+        ``_strip_context_summary_handoff_message``: a merged carrier keeps its
+        prior-tail content; a legacy marker keeps the live ask after it; a pure
+        handoff projects to ``None`` (not shown). Full compression-lineage
+        merging is deferred.
+        """
+        if SESSION_MERGED_DELIMITER in content:
+            prior = content.split(SESSION_MERGED_DELIMITER, 1)[0].strip()
+            if prior.startswith(SESSION_MERGED_PRIOR_HEADER):
+                prior = prior[len(SESSION_MERGED_PRIOR_HEADER):].lstrip()
+            return prior or None
+        if SESSION_SUMMARY_END_MARKER in content:
+            prior = content.split(SESSION_SUMMARY_END_MARKER, 1)[1].lstrip()
+            return prior or None
+        return None
+
+    @staticmethod
+    def _cap_content(text: str) -> tuple[str, int, bool]:
+        """Cap one message at ~20KB with a visible marker."""
+        original = len(text)
+        if original <= SESSION_MESSAGE_CONTENT_CHARS:
+            return text, original, False
+        marker = f"\n\n…[内容已截断：原 {original} 字符]"
+        keep = max(0, SESSION_MESSAGE_CONTENT_CHARS - len(marker))
+        return text[:keep] + marker, original, True
+
+    @classmethod
+    def _fold_tool_calls(cls, raw: Any) -> list[dict[str, str]]:
+        """Return tool names only; raw arguments never leave the server.
+
+        Arguments can embed commands, paths, or tokens, so the transcript
+        carries ``{name, summary:"参数已折叠"}`` rather than any argument
+        prefix or suffix.
+        """
+        if raw is None or raw == "":
+            return []
+        parsed = raw
+        if isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError):
+                return [{"name": "未命名工具", "summary": "参数已折叠"}]
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return [{"name": "未命名工具", "summary": "参数已折叠"}]
+        folded: list[dict[str, str]] = []
+        for entry in parsed:
+            name = ""
+            if isinstance(entry, dict):
+                function = entry.get("function")
+                if isinstance(function, dict):
+                    raw_name = function.get("name")
+                    if isinstance(raw_name, str):
+                        name = raw_name
+                if not name:
+                    raw_name = entry.get("name")
+                    if isinstance(raw_name, str):
+                        name = raw_name
+            folded.append(
+                {"name": name.strip() or "未命名工具", "summary": "参数已折叠"}
+            )
+        return folded
+
+    @staticmethod
+    def _message_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _open_state_db(self, deadline: Optional[float] = None) -> sqlite3.Connection:
+        """Read-only handle on the Hermes state DB (never writes).
+
+        A best-effort progress handler aborts any query that outlives
+        *deadline* so a pathological / huge session cannot pin a thread.
+        """
+        path = Path(os.path.expanduser(str(self.state_db_path)))
+        if not path.is_file():
+            raise SessionUnavailable("state DB missing")
+        uri = "file:" + urlparse.quote(str(path), safe="/") + "?mode=ro"
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=STATE_DB_TIMEOUT_SECONDS)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute(f"PRAGMA busy_timeout = {int(STATE_DB_TIMEOUT_SECONDS * 1000)}")
+            if deadline is not None:
+                conn.set_progress_handler(
+                    lambda: 1 if time.monotonic() > deadline else 0,
+                    SESSION_PROGRESS_OPCODES,
+                )
+        except sqlite3.Error as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            raise SessionUnavailable(str(exc)) from exc
+        return conn
+
+    @staticmethod
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        """Column names, defencively: older stores may lack display columns."""
+        try:
+            return {
+                str(row[1])
+                for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+            }
+        except sqlite3.Error:
+            return set()
+
+    @staticmethod
+    def _flag(value: Any) -> bool:
+        """SQLite 0/1 flags, tolerating text stores."""
+        return value not in (None, 0, False, "", "0")
+
+    def _messages_where(
+        self, columns: set[str]
+    ) -> tuple[str, list[Any], bool, bool]:
+        """Filtered message window predicate (defensive about old schemas).
+
+        Liveness/display rules mirror Hermes's reader when those columns
+        exist: ``(active = 1 OR compacted = 1)``, no ``display_kind='hidden'``
+        row, no system/internal-carrier content. Dedupe by
+        ``display_identity`` happens in Python (latest id wins).
+        """
+        clauses = ["session_id = ?", "role != 'system'"]
+        params: list[Any] = []
+        has_active = "active" in columns
+        has_compacted = "compacted" in columns
+        if has_active and has_compacted:
+            clauses.append("(active = 1 OR compacted = 1)")
+        elif has_active:
+            clauses.append("active = 1")
+        elif has_compacted:
+            clauses.append("compacted = 1")
+        if "display_kind" in columns:
+            clauses.append("COALESCE(display_kind, '') != 'hidden'")
+        prefix_sql = " OR ".join(
+            ["substr(content, 1, ?) = ?"] * len(SESSION_INTERNAL_USER_PREFIXES)
+        )
+        clauses.append(f"NOT (role = 'user' AND ({prefix_sql}))")
+        for prefix in SESSION_INTERNAL_USER_PREFIXES:
+            params.extend([len(prefix), prefix])
+        return (
+            " AND ".join(clauses),
+            params,
+            "display_identity" in columns,
+            "_compressed_summary" in columns,
+        )
+
+    @staticmethod
+    def _visible_count(
+        conn: sqlite3.Connection,
+        where: str,
+        params: list[Any],
+        dedupe_identity: bool,
+    ) -> int:
+        if dedupe_identity:
+            sql = (
+                "SELECT COUNT(*) FROM (SELECT "
+                "COALESCE(display_identity, 'row:' || id) AS ident "
+                f"FROM messages WHERE {where} GROUP BY ident)"
+            )
+        else:
+            sql = f"SELECT COUNT(*) FROM messages WHERE {where}"
+        row = conn.execute(sql, params).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def _message_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        has_compressed: bool,
+    ) -> Optional[dict[str, Any]]:
+        role = row["role"]
+        if not isinstance(role, str) or role == "system":
+            return None
+        content = self._message_text(row["content"])
+        if role == "user" and content.startswith(SESSION_INTERNAL_USER_PREFIXES):
+            return None
+        compressed = False
+        if has_compressed and self._flag(row["_compressed_summary"]):
+            compressed = True
+            projected = self._project_compressed(content)
+            if projected is None:
+                return None
+            content = projected
+        content, content_chars, content_truncated = self._cap_content(content)
+        timestamp = row["timestamp"]
+        return {
+            "id": int(row["id"]),
+            "role": role,
+            "content": content,
+            "content_chars": content_chars,
+            "content_truncated": content_truncated,
+            "compressed": compressed,
+            "tool_calls": self._fold_tool_calls(row["tool_calls"]),
+            "tool_name": row["tool_name"] if isinstance(row["tool_name"], str) else None,
+            "timestamp": timestamp
+            if isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+            else None,
+        }
+
+    def session_transcript(self, task_id: str) -> tuple[int, dict[str, Any]]:
+        """``GET /tasks/{id}`` → worker session → last N messages (read-only).
+
+        Resolution is "最新一轮" first: each run carrying
+        ``metadata.worker_session_id`` newest-first, then ``tasks.session_id``.
+        A candidate missing from ``sessions`` is skipped so the next older run
+        (or the originating session) can resolve. A card with no candidate is
+        ``404 no_session``; all candidates missing is ``404 session_missing``;
+        an unreadable/locked/corrupt/timed-out state DB is ``503
+        session_unavailable`` and never blocks verification.
+        """
+        normalized = task_id.strip() if isinstance(task_id, str) else ""
+        if not normalized:
+            return 404, {"ok": False, "error": "not_found"}
+        deadline = time.monotonic() + SESSION_BUDGET_SECONDS
+        try:
+            detail = self._task_detail(normalized, deadline)
+        except TaskNotFound:
+            return 404, {"ok": False, "error": "not_found"}
+        except UpstreamUnavailable:
+            return 502, {"ok": False, "error": "upstream_unavailable"}
+
+        candidates = self._session_candidates(detail)
+        if not candidates:
+            return 404, {"ok": False, "error": "no_session", "task_id": normalized}
+
+        read_deadline = time.monotonic() + SESSION_DB_READ_SECONDS
+        try:
+            conn = self._open_state_db(read_deadline)
+        except SessionUnavailable as exc:
+            print(
+                f"workbench: state DB unavailable for task {normalized}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 503, {"ok": False, "error": "session_unavailable"}
+
+        try:
+            resolved: Optional[tuple[dict[str, Any], sqlite3.Row]] = None
+            for candidate in candidates:
+                row = conn.execute(
+                    "SELECT id, source, title, model, started_at, ended_at, message_count, "
+                    "input_tokens, output_tokens, profile_name "
+                    "FROM sessions WHERE id = ?",
+                    (candidate["session_id"],),
+                ).fetchone()
+                if row is not None:
+                    resolved = (candidate, row)
+                    break
+            if resolved is None:
+                return 404, {
+                    "ok": False,
+                    "error": "session_missing",
+                    "session_id": candidates[0]["session_id"],
+                }
+            candidate, session_row = resolved
+
+            limit = self.session_message_limit
+            where, where_params, dedupe_identity, has_compressed = self._messages_where(
+                self._table_columns(conn, "messages")
+            )
+            params: list[Any] = [candidate["session_id"], *where_params]
+            select_columns = ["id", "role", "content", "tool_calls", "tool_name", "timestamp"]
+            if has_compressed:
+                select_columns.append("_compressed_summary")
+            if dedupe_identity:
+                select_columns.append("display_identity")
+
+            # Window by id (never timestamp: clocks regress). One extra
+            # eligible row marks the window as truncated. Display identity is
+            # deduped in Python, keeping the highest id (first seen DESC).
+            batch = max(200, min(1000, limit * 4))
+            before: Optional[int] = None
+            seen_identities: set[Any] = set()
+            collected: list[dict[str, Any]] = []
+            exhausted = False
+            while True:
+                sql = f"SELECT {', '.join(select_columns)} FROM messages WHERE {where}"
+                query_params = list(params)
+                if before is not None:
+                    sql += " AND id < ?"
+                    query_params.append(before)
+                sql += " ORDER BY id DESC LIMIT ?"
+                query_params.append(batch)
+                rows = conn.execute(sql, query_params).fetchall()
+                if not rows:
+                    exhausted = True
+                    break
+                for row in rows:
+                    before = int(row["id"])
+                    if dedupe_identity:
+                        identity = row["display_identity"]
+                        if identity is not None:
+                            if identity in seen_identities:
+                                continue
+                            seen_identities.add(identity)
+                    message = self._message_from_row(
+                        row, has_compressed=has_compressed
+                    )
+                    if message is None:
+                        continue
+                    collected.append(message)
+                    if len(collected) >= limit + 1:
+                        break
+                if len(collected) >= limit + 1:
+                    break
+                if len(rows) < batch:
+                    exhausted = True
+                    break
+
+            overflow = len(collected) > limit
+            window = collected[:limit] if overflow else collected
+            sql_total = self._visible_count(conn, where, params, dedupe_identity)
+            if exhausted:
+                # Scanned to the session start: the collected eligible rows
+                # are exact, even when sessions.message_count disagrees or
+                # hidden/compressed rows inflate it.
+                total_count = len(collected)
+            else:
+                total_count = max(sql_total, len(collected))
+        except sqlite3.Error as exc:
+            print(
+                f"workbench: state DB read failed for task {normalized}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 503, {"ok": False, "error": "session_unavailable"}
+        finally:
+            try:
+                conn.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                pass
+            conn.close()
+
+        window.reverse()
+        # Total response cap: keep the newest messages, drop the oldest ones
+        # that would push the content array past ~1MB.
+        budget = SESSION_RESPONSE_CONTENT_CHARS
+        kept_rev: list[dict[str, Any]] = []
+        for message in reversed(window):
+            cost = len(message["content"])
+            if kept_rev and cost > budget:
+                break
+            kept_rev.append(message)
+            budget -= cost
+        messages = list(reversed(kept_rev))
+
+        def _count(value: Any) -> int:
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+            return 0
+
+        message_count = _count(session_row["message_count"])
+        run = candidate["run"]
+        run_id = run.get("id") if isinstance(run, dict) else None
+        return 200, {
+            "ok": True,
+            "task_id": normalized,
+            "session": {
+                "id": session_row["id"],
+                "source": session_row["source"],
+                "title": session_row["title"],
+                "model": session_row["model"],
+                "started_at": session_row["started_at"],
+                "ended_at": session_row["ended_at"],
+                "message_count": message_count,
+                "input_tokens": _count(session_row["input_tokens"]),
+                "output_tokens": _count(session_row["output_tokens"]),
+                "profile_name": session_row["profile_name"],
+            },
+            "source": "run" if isinstance(run, dict) else "task",
+            "run_id": run_id
+            if isinstance(run_id, int) and not isinstance(run_id, bool)
+            else None,
+            "executor_session_id": candidate["executor_session_id"],
+            "messages": messages,
+            "returned_count": len(messages),
+            "total_count": total_count,
+            "message_limit": limit,
+            "truncated": total_count > len(messages),
+        }
+
     @staticmethod
     def _upstream_detail(data: Any) -> str:
         if not isinstance(data, dict):
@@ -2590,6 +3088,9 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
 
     db_path = Path(os.environ.get("WORKBENCH_DB", "").strip() or DEFAULT_DB_PATH)
     defaults_path = Path(os.environ.get("WORKBENCH_DEFAULTS", "").strip() or DEFAULT_DEFAULTS_PATH)
+    state_db_path = Path(
+        os.environ.get("WORKBENCH_STATE_DB", "").strip() or DEFAULT_STATE_DB_PATH
+    )
     store = MetadataStore(db_path)
     store.start()
 
@@ -2603,6 +3104,9 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
     inbox_cache_seconds = _env_nonnegative_float(
         "WORKBENCH_INBOX_CACHE_SECONDS", INBOX_CACHE_SECONDS
     )
+    session_message_limit = _env_positive_int(
+        "WORKBENCH_SESSION_MESSAGE_LIMIT", SESSION_MESSAGE_LIMIT, minimum=1, maximum=1000
+    )
     service = WorkbenchService(
         base_url,
         store,
@@ -2610,6 +3114,8 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
         review_ttl_seconds=review_ttl_seconds,
         auto_collect_backoff_seconds=auto_collect_backoff_seconds,
         inbox_cache_seconds=inbox_cache_seconds,
+        state_db_path=state_db_path,
+        session_message_limit=session_message_limit,
     )
 
     try:
@@ -2749,6 +3255,20 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
         # Header poll: cached board read, no per-card detail calls.
         status_code, payload = await run_in_threadpool(service.inbox_count)
         return JSONResponse(payload, status_code=status_code)
+
+    @app.get("/api/workbench/session/{task_id}")
+    async def session_transcript(task_id: str) -> JSONResponse:
+        # Pure read: upstream detail + read-only state.db. Never writes either
+        # DB, so opening the viewer cannot change a card's acceptance state.
+        status_code, payload = await run_in_threadpool(
+            service.session_transcript, task_id
+        )
+        # Transcripts carry conversation text: never cache in browser/proxy.
+        return JSONResponse(
+            payload,
+            status_code=status_code,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.post("/api/workbench/reviews/sweep")
     async def reviews_sweep(request: Request) -> JSONResponse:

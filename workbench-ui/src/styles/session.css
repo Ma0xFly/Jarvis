@@ -1,0 +1,318 @@
+/* 会话查看器（2.3）：右侧只读抽屉。
+   颜色全部走 base.css 的 --wb-* token，明暗主题共用一套布局；
+   抽屉停在验收覆盖层之上（z-index 200 > 100），Esc 只关抽屉。 */
+
+.wb-session-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(0, 0, 0, 0.46);
+}
+
+.wb-session-drawer {
+  width: min(760px, 94vw);
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 20px 14px;
+  background: var(--wb-page);
+  color: var(--wb-fg);
+  border-left: 1px solid var(--wb-border);
+  box-shadow: -18px 0 55px rgba(0, 0, 0, 0.34);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.wb-session-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+.wb-session-head-text {
+  min-width: 0;
+  flex: 1;
+}
+.wb-session-kicker {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--wb-muted);
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.wb-session-status {
+  letter-spacing: 0;
+  text-transform: none;
+  border: 1px solid var(--wb-border);
+  border-radius: 999px;
+  padding: 0 7px;
+  font-size: 10.5px;
+  color: var(--wb-muted);
+}
+.wb-session-status.running {
+  color: color-mix(in srgb, var(--wb-ok) 78%, var(--wb-fg));
+  border-color: color-mix(in srgb, var(--wb-ok) 45%, var(--wb-border));
+  background: color-mix(in srgb, var(--wb-ok) 10%, transparent);
+}
+.wb-session-title {
+  margin: 2px 0 0;
+  font-size: 17px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.wb-session-sub {
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--wb-muted);
+  overflow-wrap: anywhere;
+}
+.wb-session-close {
+  flex: 0 0 auto;
+}
+.wb-session-drawer kbd {
+  font: inherit;
+  font-size: 10.5px;
+  color: var(--wb-muted);
+  padding: 0 4px;
+  border: 1px solid var(--wb-border);
+  border-radius: 4px;
+  background: var(--wb-sunken);
+}
+
+.wb-session-state {
+  flex: 0 0 auto;
+  padding: 18px 4px;
+  color: var(--wb-muted);
+  font-size: 13px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+.wb-session-error {
+  border: 1px solid color-mix(in srgb, var(--wb-warn) 48%, var(--wb-border));
+  background: color-mix(in srgb, var(--wb-warn) 10%, var(--wb-card));
+  border-radius: 9px;
+  padding: 14px 16px;
+  color: var(--wb-fg);
+}
+.wb-session-error-code {
+  font-size: 11px;
+  color: var(--wb-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.wb-session-meta-wrap {
+  flex: 0 0 auto;
+  border: 1px solid var(--wb-border);
+  border-radius: 10px;
+  background: var(--wb-sunken);
+  padding: 10px 12px;
+}
+.wb-session-origin {
+  font-size: 11.5px;
+  color: var(--wb-muted);
+  margin-bottom: 8px;
+}
+.wb-session-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 7px 16px;
+  margin: 0;
+}
+.wb-session-meta > div {
+  min-width: 0;
+}
+.wb-session-meta dt {
+  font-size: 10.5px;
+  color: var(--wb-muted);
+  letter-spacing: 0.04em;
+}
+.wb-session-meta dd {
+  margin: 1px 0 0;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.wb-session-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+}
+.wb-session-executor {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--wb-border);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--wb-muted);
+}
+.wb-session-executor code {
+  font-size: 11.5px;
+  color: var(--wb-fg);
+  background: var(--wb-card);
+  border: 1px solid var(--wb-border);
+  border-radius: 5px;
+  padding: 0 5px;
+  overflow-wrap: anywhere;
+}
+
+.wb-session-truncated {
+  flex: 0 0 auto;
+  font-size: 11.5px;
+  color: color-mix(in srgb, var(--wb-warn) 76%, var(--wb-fg));
+  background: color-mix(in srgb, var(--wb-warn) 10%, var(--wb-card));
+  border: 1px solid color-mix(in srgb, var(--wb-warn) 40%, var(--wb-border));
+  border-radius: 8px;
+  padding: 6px 10px;
+}
+
+.wb-session-messages-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+.wb-session-count {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 3px 0 7px;
+  background: var(--wb-page);
+  color: var(--wb-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.wb-session-messages {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.wb-session-msg {
+  border: 1px solid var(--wb-border);
+  border-left: 3px solid var(--wb-border);
+  border-radius: 9px;
+  background: var(--wb-card);
+  padding: 8px 11px;
+}
+.wb-session-msg-user {
+  border-left-color: color-mix(in srgb, var(--wb-accent) 66%, var(--wb-border));
+}
+.wb-session-msg-assistant {
+  border-left-color: color-mix(in srgb, var(--wb-ok) 58%, var(--wb-border));
+}
+.wb-session-msg-tool {
+  background: var(--wb-sunken);
+  border-left-color: color-mix(in srgb, var(--wb-muted) 55%, var(--wb-border));
+}
+.wb-session-msg-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--wb-muted);
+}
+.wb-session-msg-head time {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+.wb-session-role {
+  font-weight: 700;
+  color: var(--wb-fg);
+}
+.wb-session-tool-name {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: color-mix(in srgb, var(--wb-accent) 74%, var(--wb-fg));
+  background: color-mix(in srgb, var(--wb-accent) 12%, transparent);
+  border-radius: 999px;
+  padding: 0 7px;
+}
+.wb-session-content {
+  margin: 6px 0 0;
+  font: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--wb-fg);
+}
+.wb-session-chip {
+  font-size: 10px;
+  color: color-mix(in srgb, var(--wb-warn) 78%, var(--wb-fg));
+  border: 1px solid color-mix(in srgb, var(--wb-warn) 42%, var(--wb-border));
+  border-radius: 999px;
+  padding: 0 6px;
+}
+.wb-session-msg-size {
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--wb-muted);
+  font-variant-numeric: tabular-nums;
+}
+.wb-session-tools {
+  margin-top: 7px;
+  border-top: 1px dashed var(--wb-border);
+  padding-top: 5px;
+}
+.wb-session-tools summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--wb-muted);
+  user-select: none;
+}
+.wb-session-tools ul {
+  list-style: none;
+  margin: 5px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.wb-session-tools li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 11.5px;
+}
+.wb-session-tool-summary {
+  color: var(--wb-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.wb-session-foot {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--wb-border);
+  padding-top: 8px;
+  font-size: 11px;
+  color: var(--wb-muted);
+}
+
+.wb-session-drawer button:focus-visible,
+.wb-session-drawer summary:focus-visible,
+.wb-session-drawer a:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: 2px;
+}
+
+@media (max-width: 720px) {
+  .wb-session-drawer {
+    width: 100vw;
+    padding: 12px 14px;
+  }
+  .wb-session-meta {
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  }
+}

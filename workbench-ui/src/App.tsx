@@ -3,12 +3,14 @@ import Board from "./board/Board";
 import TodoPage from "./todo/TodoPage";
 import VerifyPage from "./verify/VerifyPage";
 import NotificationCenter from "./notify/NotificationCenter";
+import SessionViewer from "./session/SessionViewer";
 import { getInboxCount, sweepReviews } from "./api/workbench";
 import { isPluginHost } from "./platform";
 import "./styles/board.css";
 import "./styles/todo.css";
 import "./styles/verify.css";
 import "./styles/notify.css";
+import "./styles/session.css";
 
 type TabKey = "todo" | "flow";
 
@@ -29,6 +31,11 @@ export default function App(): React.ReactElement {
   const [reviewCount, setReviewCount] = useState(0);
   const [verifyOpen, setVerifyOpen] = useState(false);
   const [verifyStartId, setVerifyStartId] = useState<string | null>(null);
+  // 会话抽屉独立于验收覆盖层：验收页和看板完成卡共用同一份状态。
+  const [sessionTarget, setSessionTarget] = useState<{
+    id: string;
+    title?: string;
+  } | null>(null);
 
   const refreshInbox = useCallback(async () => {
     if (isPluginHost) return;
@@ -64,6 +71,13 @@ export default function App(): React.ReactElement {
   }, [refreshInbox]);
 
   const openBoard = useCallback(() => setTab("flow"), []);
+
+  const openSession = useCallback((taskId: string, title?: string) => {
+    if (isPluginHost || !taskId.trim()) return;
+    setSessionTarget({ id: taskId, title });
+  }, []);
+
+  const closeSession = useCallback(() => setSessionTarget(null), []);
 
   return (
     <div className="wb-root">
@@ -102,7 +116,7 @@ export default function App(): React.ReactElement {
         </div>
       ) : null}
       <div className={"wb-pane" + (tab === "flow" ? "" : " wb-pane-hidden")}>
-        <Board />
+        <Board onOpenSession={isPluginHost ? undefined : openSession} />
       </div>
 
       {/* 通知中心只在独立版挂载（插件宿主没有 /api/workbench/*，也不轮询）。 */}
@@ -120,6 +134,17 @@ export default function App(): React.ReactElement {
           initialTaskId={verifyStartId}
           onClose={closeVerify}
           onChanged={refreshInbox}
+          onOpenSession={openSession}
+          sessionOpen={sessionTarget !== null}
+        />
+      ) : null}
+
+      {/* 只读会话抽屉：插件宿主没有 /api/workbench/*，入口与挂载都不存在。 */}
+      {!isPluginHost && sessionTarget ? (
+        <SessionViewer
+          taskId={sessionTarget.id}
+          taskTitle={sessionTarget.title}
+          onClose={closeSession}
         />
       ) : null}
     </div>

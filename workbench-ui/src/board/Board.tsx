@@ -50,6 +50,11 @@ interface BoardData {
 
 const POLL_MS = 5000;
 
+interface BoardProps {
+  /** 独立版：打开已完成卡本轮执行会话（插件宿主不传）。 */
+  onOpenSession?: (taskId: string, title?: string) => void;
+}
+
 /** 相对时间，与原生卡片上的 "4h ago" 同义 */
 function timeLabel(ts?: number | null): string {
   if (!ts) return "";
@@ -70,7 +75,7 @@ function dayKey(ts?: number | null): string {
   return "earlier";
 }
 
-export default function Board(): React.ReactElement {
+export default function Board({ onOpenSession }: BoardProps): React.ReactElement {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [err, setErr] = useState<string>("");
   const [dropCol, setDropCol] = useState<string | null>(null);
@@ -199,6 +204,22 @@ export default function Board(): React.ReactElement {
           {t.priority && t.priority > 0 ? <span className="wb-prio">P{t.priority}</span> : null}
           {t.assignee ? <span className="wb-tag">{t.assignee}</span> : null}
           {t.block_kind ? <span className="wb-block">{t.block_kind}</span> : null}
+          {t.status === "done" && onOpenSession ? (
+            <button
+              className="wb-card-session"
+              type="button"
+              draggable={false}
+              data-task-id={t.id}
+              title="查看该轮执行会话"
+              onPointerDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenSession(t.id, t.title);
+              }}
+            >
+              会话
+            </button>
+          ) : null}
           {time ? <span className="wb-time">{time}</span> : null}
         </div>
         {t.latest_summary ? <div className="wb-sum">{t.latest_summary}</div> : null}

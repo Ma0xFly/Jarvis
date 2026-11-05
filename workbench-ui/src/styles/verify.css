@@ -305,6 +305,10 @@
   color: var(--wb-muted);
   font-size: 11.5px;
 }
+.wb-verify-session-open {
+  font-size: 11.5px;
+  padding: 3px 10px;
+}
 
 .wb-verify-foot {
   flex: 0 0 auto;

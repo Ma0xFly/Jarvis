@@ -75,6 +75,10 @@ interface VerifyPageProps {
   onClose: () => void;
   /** 每完成一个动作后通知 App 刷新右上角计数。 */
   onChanged?: () => void;
+  /** 打开该卡本轮执行会话（只读抽屉，由 App 挂载）。 */
+  onOpenSession: (taskId: string, title?: string) => void;
+  /** 会话抽屉打开时，验收页必须让出 Esc 与 A/R/S 键。 */
+  sessionOpen?: boolean;
 }
 
 function errText(error: unknown): string {
@@ -150,6 +154,8 @@ export default function VerifyPage({
   initialTaskId,
   onClose,
   onChanged,
+  onOpenSession,
+  sessionOpen = false,
 }: VerifyPageProps): React.ReactElement {
   const [queue, setQueue] = useState<QueueItem[]>([]);
   const [ttl, setTtl] = useState(0);
@@ -404,6 +410,8 @@ export default function VerifyPage({
     const onKey = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.isComposing || event.repeat) return;
       if (event.ctrlKey || event.metaKey || event.altKey) return;
+      // 会话抽屉在上层打开时，Esc / A / R / S 都属于抽屉；这里完全让出。
+      if (sessionOpen) return;
       if (event.key === "Tab") {
         const nodes = focusables();
         if (nodes.length === 0) {
@@ -448,7 +456,7 @@ export default function VerifyPage({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [current, reasonOpen, submitting, runAction, openReject, onClose]);
+  }, [current, reasonOpen, submitting, runAction, openReject, onClose, sessionOpen]);
 
   const processed = stats.accepted + stats.rejected + stats.skipped;
   // 总数为派生值：轮询补进来的新卡会自动把 N 增大。
@@ -690,7 +698,15 @@ export default function VerifyPage({
               <div className="wb-verify-review-at">
                 进入验收 {reviewEvent ? formatClock(reviewEvent.created_at) : formatClock(reviewAt) || "时间未知"}
               </div>
-              <div className="wb-verify-session-slot">会话记录：2.3 提供</div>
+              <div className="wb-verify-session-slot">
+                <button
+                  className="wb-btn wb-verify-session-open"
+                  type="button"
+                  onClick={() => onOpenSession(current.id, title)}
+                >
+                  打开执行会话
+                </button>
+              </div>
             </div>
           </aside>
         </div>
