@@ -3218,10 +3218,16 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
                 "background_color": "#0b1110",
                 "theme_color": "#0b1110",
                 "icons": [
-                    {"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml"}
+                    {"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml"},
+                    {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                    {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"}
                 ],
             }
         )
+
+    @app.get("/sw.js")
+    def service_worker() -> FileResponse:
+        return FileResponse(WEB_DIR / "sw.js", media_type="application/javascript")
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
