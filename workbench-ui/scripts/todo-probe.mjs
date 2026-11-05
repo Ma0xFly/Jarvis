@@ -26,10 +26,10 @@
  *   - refresh re-derives positions from /board only (no receipt / ETA)
  *   - already-running re-dispatch shows「已在运行」without a position (poll paused)
  *   - badge contrast >= 4.5:1 in both themes
- *   - new card lands in today, triage, empty acceptance, not auto-dispatched
- *   - 409 parent: toast「已转为 todo，等 parent 完成」and card leaves repository
+ *   - new card lands in today as a todo store card, empty acceptance, not auto-dispatched
+ *   - 409 parent: toast「已回到仓库，等 parent 完成」and card stays in repository
  *   - 007 shell: 24px canvas + 12px app frame, 224px sidebar, 50px topbar,
- *     three real nav entries (no 活动/统计), tabs + 待你处理 + theme toggle
+ *     three real nav entries (no 活动/统计), tabs + 验收 + theme toggle
  *   - theme: inline first-paint script before stylesheet, toggle updates
  *     data-theme / localStorage / theme-color, reload keeps the theme
  *   - 已完成: empty text, done column grouped by local completed_at day
@@ -609,6 +609,22 @@ async function main() {
         return true;
       })()`);
 
+    /** 仓库互拖：把卡片拖到「今日/长期」仓库，只改 bucket，不派发。 */
+    const dragRepoCardToStore = (title, storeLabel) =>
+      evaluate(`(async () => {
+        const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+          .find((node) => node.textContent.includes(${JSON.stringify(title)}));
+        const section = [...document.querySelectorAll('.wb-todo-plane')]
+          .find((node) => node.querySelector('.wb-todo-cname')?.textContent === ${JSON.stringify(storeLabel)});
+        if (!card || !section) return false;
+        const dataTransfer = new DataTransfer();
+        card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
+        section.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+        section.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+        return true;
+      })()`);
+
     /** 看板：把卡片拖到指定列，返回 dragover 是否被接收（preventDefault）。 */
     const dragBoardCardToColumn = (title, columnLabel) =>
       evaluate(`(async () => {
@@ -786,9 +802,9 @@ async function main() {
       JSON.stringify(shellState.navCounts),
     );
     check(
-      "顶栏三个 tab + 待你处理 + 主题切换",
+      "顶栏三个 tab + 验收 + 主题切换",
       JSON.stringify(shellState.tabs) === JSON.stringify(["待办", "看板", "已完成"]) &&
-        shellState.reviewEntry.includes("待你处理") &&
+        shellState.reviewEntry.includes("验收") &&
         shellState.themeToggle === true,
       JSON.stringify(shellState),
     );
@@ -850,6 +866,21 @@ async function main() {
         "document.querySelector('.wb-nav-btn[aria-current=\"page\"]')?.querySelector('span')?.textContent || ''",
       )) === "待办",
     );
+
+    // 验收 0：入口仍然在，打开后必须停在空态，而不是 3 秒后像消失。
+    const emptyVerifyOpen = await evaluate("document.querySelector('.wb-review-entry').click(); true");
+    await waitForEval("Boolean(document.querySelector('.wb-verify-empty'))", 8000, "验收 0 空态");
+    const emptyVerifyText = await evaluate(
+      "document.querySelector('.wb-verify-empty')?.textContent || ''",
+    );
+    check(
+      "验收 0 打开明确空态",
+      emptyVerifyOpen === true && emptyVerifyText.includes("现在没有待验收的卡"),
+      emptyVerifyText,
+    );
+    await evaluate("document.querySelector('.wb-verify-empty .wb-btn')?.click(); true");
+    await waitForEval("!Boolean(document.querySelector('.wb-verify-overlay'))", 5000, "验收空态关闭");
+    check("验收空态可关闭", true);
 
     // Instrument the workbench calls made after this point.
     await installProbe();
@@ -936,6 +967,53 @@ async function main() {
         !hoverRule.includes("border") &&
         !hoverRule.includes("box-shadow"),
       hoverRule,
+    );
+
+    // 仓库互拖：长期 → 今日 → 长期，只改 bucket，不派发。
+    check(
+      "仓库互拖：长期 → 今日",
+      (await dragRepoCardToStore("长期卡", "今日")) === true,
+    );
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-plane')][0].textContent.includes('长期卡')`,
+      8000,
+      "长期卡移到今日",
+    );
+    const todayMeta = (await httpJson(
+      "GET",
+      `${base}/api/workbench/metadata?ids=${encodeURIComponent(longCard)}`,
+    )).data?.[longCard];
+    check("仓库互拖只改 bucket（长期 → 今日）", todayMeta?.bucket === "today", JSON.stringify(todayMeta));
+    check(
+      "仓库互拖不派发",
+      (await evaluate("window.__wbProbe.dispatch || 0")) === 0,
+      String(await evaluate("window.__wbProbe.dispatch || 0")),
+    );
+    check(
+      "仓库互拖：今日 → 长期",
+      (await dragRepoCardToStore("长期卡", "长期")) === true,
+    );
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-plane')][1].textContent.includes('长期卡')`,
+      8000,
+      "长期卡移回长期",
+    );
+    await waitFor(
+      async () =>
+        (await httpJson(
+          "GET",
+          `${base}/api/workbench/metadata?ids=${encodeURIComponent(longCard)}`,
+        )).data?.[longCard]?.bucket === "long",
+      { timeout: 3000, interval: 100, label: "仓库互拖恢复 bucket（今日 → 长期）" },
+    );
+    const longMetaAgain = (await httpJson(
+      "GET",
+      `${base}/api/workbench/metadata?ids=${encodeURIComponent(longCard)}`,
+    )).data?.[longCard];
+    check(
+      "仓库互拖恢复 bucket（今日 → 长期）",
+      longMetaAgain?.bucket === "long",
+      JSON.stringify(longMetaAgain),
     );
 
     const dragEndClear = await evaluate(`(async () => {
@@ -1151,6 +1229,34 @@ async function main() {
     const emptyStatus = (await httpJson("GET", `${base}/api/plugins/kanban/tasks/${emptyCard}`)).data?.task?.status;
     check("派发后上游状态 ready", emptyStatus === "ready", String(emptyStatus));
 
+    // 流水线卡（ready/running）点开详情：标题、状态、验收、位次。
+    const readyDetailOpened = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-flow-card.clickable')]
+        .find((node) => node.textContent.includes('空验收卡'));
+      if (!card) return false;
+      card.click();
+      return true;
+    })()`);
+    await waitForEval("Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "流水线卡详情");
+    const readyDetail = await evaluate(`(() => ({
+      title: document.querySelector('.wb-detail-title')?.textContent || '',
+      badge: document.querySelector('.wb-detail-badge')?.textContent || '',
+      text: document.querySelector('.wb-detail-drawer')?.textContent || '',
+      position: document.querySelector('.wb-detail-position')?.textContent || '',
+    }))()`);
+    check(
+      "流水线卡点开详情（标题/状态/验收/位次）",
+      readyDetailOpened === true &&
+        readyDetail.title.includes("空验收卡") &&
+        readyDetail.badge.includes("就绪") &&
+        readyDetail.text.includes("跑通测试") &&
+        readyDetail.position.includes("队列第"),
+      JSON.stringify(readyDetail),
+    );
+    await evaluate("document.querySelector('.wb-detail-close').click(); true");
+    await waitForEval("!Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "关闭详情");
+    check("详情可关闭", true);
+
     // ---- 5b. second dispatch: latest-attempt replaces the receipt ----
     await evaluate("window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null;");
     check("拖拽第二张有验收卡", (await dragCardToFlow("有验收卡")) === true);
@@ -1262,17 +1368,18 @@ async function main() {
     );
     check("409 drop 后先显示 pending 回执", true);
     await waitForEval(
-      `(document.querySelector('.wb-toast')?.textContent || '') === '已转为 todo，等 parent 完成'`,
+      `(document.querySelector('.wb-toast')?.textContent || '') === '已回到仓库，等 parent 完成'`,
       8000,
       "409 toast",
     );
     await evaluate("window.__wbProbe.holdMs = 0;");
     await waitForEval(
-      `![...document.querySelectorAll('.wb-todo-repo-card')]
+      `[...document.querySelectorAll('.wb-todo-repo-card')]
         .some((node) => node.textContent.includes('等 parent 卡'))`,
       8000,
-      "409 卡离开仓库",
+      "409 卡回到仓库",
     );
+    check("409 卡回到仓库（scheduled 入库，等 parent）", true);
     const blockedState = await evaluate(`(() => ({
       receipt: document.querySelector('.wb-todo-receipt-text')?.textContent || '',
       toast: document.querySelector('.wb-toast')?.textContent || '',
@@ -1284,11 +1391,11 @@ async function main() {
     );
     check(
       "409 既有 toast 保留",
-      blockedState.toast === "已转为 todo，等 parent 完成",
+      blockedState.toast === "已回到仓库，等 parent 完成",
       blockedState.toast,
     );
     const blockedStatus = (await httpJson("GET", `${base}/api/plugins/kanban/tasks/${blockedChild}`)).data?.task?.status;
-    check("有未完成 parent 的卡落 todo", blockedStatus === "todo", String(blockedStatus));
+    check("有未完成 parent 的卡落 scheduled 仓库", blockedStatus === "scheduled", String(blockedStatus));
 
     await expectBadgesMatch("三张 ready 卡的位次与 /board 顺序一致");
     const readyAfterRejects = await readReadyBadges();
@@ -1500,7 +1607,7 @@ async function main() {
     const createdCard = boardAfterCreate.columns
       .flatMap((column) => column.tasks)
       .find((task) => task.title === "探针新建卡");
-    check("新建卡上游状态 triage", createdCard?.status === "triage", String(createdCard?.status));
+    check("新建卡上游状态 scheduled（仓库，不是 triage/todo）", createdCard?.status === "scheduled", String(createdCard?.status));
     const createdMeta = (await httpJson(
       "GET",
       `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
@@ -1551,10 +1658,10 @@ async function main() {
 
     // ---- 8. 409 result re-check (dispatch + live receipt done in 5c) --
     check(
-      "409 卡仍不在仓库",
+      "409 卡回到仓库（等 parent）",
       (await evaluate(
         "[...document.querySelectorAll('.wb-todo-repo-card')].some((node) => node.textContent.includes('等 parent 卡'))",
-      )) === false,
+      )) === true,
     );
     check("409 后回执仍为空", (await readReceiptText()) === "");
 
@@ -1772,7 +1879,7 @@ async function main() {
     )).data?.[longTask.id];
     check(
       "composer 建卡落长期 bucket",
-      longTask?.status === "triage" && longMeta?.bucket === "long",
+      longTask?.status === "scheduled" && longMeta?.bucket === "long",
       JSON.stringify({ status: longTask?.status, metadata: longMeta }),
     );
 

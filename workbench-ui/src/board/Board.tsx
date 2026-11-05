@@ -13,7 +13,7 @@ function gateMessage(error: unknown): string {
       case "missing_acceptance":
         return "先补一句怎样算做完";
       case "blocked_by_parent":
-        return "已转为 todo，等 parent 完成";
+        return "已回到仓库，等 parent 完成";
       case "not_dispatchable":
         return "已完成或归档的卡不能派发";
       case "not_ready":

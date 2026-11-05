@@ -497,7 +497,11 @@ async function main() {
     const waitForEval = (expression, timeout, label) =>
       waitFor(async () => Boolean(await evaluate(expression)), { timeout, label });
 
-    await waitForEval("Boolean(document.querySelector('.wb-notify-center'))", 15000, "通知中心");
+    await waitForEval("Boolean(document.querySelector('.wb-notify-toggle'))", 15000, "通知铃铛");
+    const defaultClosed = await evaluate("!document.querySelector('.wb-notify-center')");
+    check("通知中心默认收起（不占主界面）", defaultClosed === true);
+    await evaluate("document.querySelector('.wb-notify-toggle').click(); true");
+    await waitForEval("Boolean(document.querySelector('.wb-notify-center'))", 8000, "打开通知中心");
 
     const layout = await evaluate(`(() => {
       const center = document.querySelector('.wb-notify-center');
@@ -558,6 +562,11 @@ async function main() {
       JSON.stringify(narrowPanel),
     );
     await cdp.send("Emulation.clearDeviceMetricsOverride");
+    await evaluate("document.querySelector('.wb-notify-close').click(); true");
+    await waitForEval("!Boolean(document.querySelector('.wb-notify-center'))", 5000, "关闭通知中心");
+    check("通知中心可关闭", true);
+    await evaluate("document.querySelector('.wb-notify-toggle').click(); true");
+    await waitForEval("Boolean(document.querySelector('.wb-notify-center'))", 8000, "重新打开通知中心");
     check(
       "P1 面板展示 dependency 阻塞",
       layout.p1Text.includes("等依赖的卡"),

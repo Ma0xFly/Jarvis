@@ -988,31 +988,80 @@ class WorkbenchService:
             body["status"] = task_status
         return status, body
 
-    def _land_in_todo(
+    def _land_in_store(
         self, task_id: str, current_status: Optional[str], write: SnapshotWrite, deadline: float
     ) -> tuple[int, dict[str, Any]]:
-        """A parent-gated card must land in ``todo`` (never ``ready``)."""
-        if current_status == "todo":
+        """A parent-gated card must land in the scheduled store (never ``ready``).
+
+        ``todo`` is not a store: Hermes's ``recompute_ready`` promotes a todo
+        card as soon as its parents are done (or immediately when it has no
+        parents). ``scheduled`` is the pre-dispatch status the gateway leaves
+        alone, so a failed dispatch returns the card to today/long instead of
+        silently queueing it for a later automatic run.
+        """
+        if current_status == "scheduled":
             self._rollback(write)
-            return self._fail(409, "blocked_by_parent", "todo")
+            return self._fail(409, "blocked_by_parent", "scheduled")
+
+        original = current_status
+        stepped = False
+        if current_status == "triage":
+            # triage -> scheduled is not a legal edge; park it via todo first.
+            try:
+                intermediate = self._patch_status(task_id, "todo", deadline)
+            except UpstreamUnavailable:
+                self._rollback(write)
+                return self._fail(502, "upstream_unavailable")
+            if intermediate.status == 404:
+                self._rollback(write)
+                return self._fail(404, "not_found")
+            if intermediate.status != 200:
+                self._rollback(write)
+                return self._fail(502, "upstream_unavailable")
+            current_status = "todo"
+            stepped = True
+
         try:
-            patched = self._patch_status(task_id, "todo", deadline)
+            patched = self._patch_status(task_id, "scheduled", deadline)
         except UpstreamUnavailable:
+            self._restore_store_status(task_id, original, deadline, stepped)
             self._rollback(write)
             return self._fail(502, "upstream_unavailable")
-        self._rollback(write)
         if patched.status == 404:
+            self._restore_store_status(task_id, original, deadline, stepped)
+            self._rollback(write)
             return self._fail(404, "not_found")
         if patched.status != 200:
-            # Do not claim a landing we did not observe.
+            self._restore_store_status(task_id, original, deadline, stepped)
+            self._rollback(write)
             return self._fail(502, "upstream_unavailable")
         landed = None
         if isinstance(patched.data, dict) and isinstance(patched.data.get("task"), dict):
             landed = patched.data["task"].get("status")
         if not isinstance(landed, str) or not landed:
-            # A 200 without task.status is not proof of a todo landing.
+            # A 200 without task.status is not proof of a scheduled landing.
+            self._restore_store_status(task_id, original, deadline, stepped)
+            self._rollback(write)
             return self._fail(502, "upstream_unavailable")
+        self._rollback(write)
         return self._fail(409, "blocked_by_parent", landed)
+
+    def _restore_store_status(
+        self, task_id: str, original: Optional[str], deadline: float, stepped: bool
+    ) -> None:
+        """Best effort: undo the triage -> todo step when the scheduled PATCH fails.
+
+        A failed store landing must not leave the card in ``todo`` — Hermes's
+        ``recompute_ready`` would queue it. The test proxy and a transient
+        upstream can make the scheduled PATCH fail; restoring triage keeps the
+        card visibly in the workbench store (and retryable).
+        """
+        if not stepped or original != "triage":
+            return
+        try:
+            self._patch_status(task_id, "triage", deadline)
+        except UpstreamUnavailable:
+            pass
 
     # -- endpoints --------------------------------------------------------
 
@@ -2304,12 +2353,23 @@ class WorkbenchService:
     def create_task(
         self, title: Any, bucket: Any = "today", idempotency_key: Any = None
     ) -> tuple[int, dict[str, Any]]:
-        """Create a triage card upstream, then store its todo metadata.
+        """Create a store card upstream, then store its todo metadata.
+
+        The upstream create endpoint starts cards in ``triage``; that status is
+        owned by the Hermes gateway's triage specifier, which would turn a new
+        workbench card into auto-generated clarification work before the user
+        ever drags it into the pipeline. ``todo`` is no safer: Hermes's
+        ``recompute_ready`` promotes parentless (or parent-satisfied) todo
+        cards straight to ``ready``. We immediately move the card to
+        ``scheduled`` — the one pre-dispatch status Hermes leaves alone — and
+        keep the bucket in workbench.db. Only an explicit dispatch may move it
+        to ``ready``.
 
         ``idempotency_key`` is forwarded to upstream, which returns the
         existing non-archived task for a repeated key. The follow-up GET
-        verifies the idempotent hit is still a triage card. The two writes are
-        not atomic: a metadata failure leaves a triage card with no bucket and
+        verifies the idempotent hit is still a store card (``scheduled``; a
+        legacy ``triage``/``todo`` card is parked once). The writes are not
+        atomic: a metadata failure leaves a store card with no bucket and
         returns 503 plus the task id, so an idempotent retry can finish the
         metadata without creating a duplicate.
         """
@@ -2356,7 +2416,10 @@ class WorkbenchService:
         task_id = task["id"]
 
         # A repeated idempotency key can return a card that has since moved on;
-        # only report success when the card is still the promised triage card.
+        # only report success when the card is still in the store. Legacy
+        # triage/todo cards (created before this contract, or returned by an
+        # idempotent retry) are parked once so Hermes cannot triage/auto-promote
+        # them; an already-scheduled card skips the PATCH.
         try:
             fetched = self._get_task(task_id, time.monotonic() + GATE_UPSTREAM_TIMEOUT)
         except UpstreamUnavailable:
@@ -2369,7 +2432,38 @@ class WorkbenchService:
         if not isinstance(fresh, dict):
             return self._fail(502, "upstream_unavailable")
         actual = fresh.get("status")
-        if actual != "triage":
+        if actual == "triage":
+            # The kanban status machine does not allow triage -> scheduled;
+            # triage -> todo -> scheduled is the supported path. Both PATCHes
+            # happen immediately, well inside the gateway's 60s tick.
+            stepped = self._patch_status(
+                task_id, "todo", time.monotonic() + GATE_UPSTREAM_TIMEOUT
+            )
+            if stepped.status != 200 or not isinstance(stepped.data, dict):
+                return self._fail(
+                    502, "upstream_unavailable", actual if isinstance(actual, str) else None
+                )
+            stepped_task = stepped.data.get("task")
+            fresh = (
+                stepped_task
+                if isinstance(stepped_task, dict) and stepped_task.get("id") == task_id
+                else {**fresh, "status": "todo"}
+            )
+            actual = "todo"
+        if actual == "todo":
+            patched = self._patch_status(
+                task_id, "scheduled", time.monotonic() + GATE_UPSTREAM_TIMEOUT
+            )
+            if patched.status != 200 or not isinstance(patched.data, dict):
+                return self._fail(
+                    502, "upstream_unavailable", actual if isinstance(actual, str) else None
+                )
+            patched_task = patched.data.get("task")
+            if isinstance(patched_task, dict) and patched_task.get("id") == task_id:
+                fresh = patched_task
+            else:
+                fresh = {**fresh, "status": "scheduled"}
+        elif actual != "scheduled":
             return self._fail(502, "upstream_unavailable", actual if isinstance(actual, str) else None)
 
         # An idempotent retry may hit a card whose requirements were already
@@ -2552,7 +2646,7 @@ class WorkbenchService:
         if patched.status != 200:
             detail = self._error_detail(patched)
             if self._has_open_parents(task) or "blocked by parent" in detail or "unsatisfied parent" in detail:
-                return self._land_in_todo(task_id, status, write, deadline)
+                return self._land_in_store(task_id, status, write, deadline)
             # The PATCH was refused; use a fresh task read (not /board) to
             # report the actual status without inventing a landing.
             try:
@@ -2582,6 +2676,12 @@ class WorkbenchService:
                 if position is None:
                     return self._fail(502, "upstream_unavailable")
                 return self._queued(position, minutes)
+            if actual == "todo" and (
+                self._has_open_parents(task)
+                or "blocked by parent" in detail
+                or "unsatisfied parent" in detail
+            ):
+                return self._land_in_store(task_id, actual, write, deadline)
             self._rollback(write)
             return self._landing_error(actual, task, detail)
 
@@ -2615,6 +2715,8 @@ class WorkbenchService:
                 return self._fail(502, "upstream_unavailable")
             return self._queued(position, minutes)
 
+        if actual == "todo" and self._has_open_parents(task):
+            return self._land_in_store(task_id, actual, write, deadline)
         self._rollback(write)
         return self._landing_error(actual, task)
 

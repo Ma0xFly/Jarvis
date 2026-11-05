@@ -57,6 +57,8 @@ export default function App(): React.ReactElement {
   const [theme, setTheme] = useState<Theme>(() => (isPluginHost ? "light" : readInitialTheme()));
   const [reviewCount, setReviewCount] = useState(0);
   const [gatewayOk, setGatewayOk] = useState(true);
+  const [notifyOpen, setNotifyOpen] = useState(false);
+  const [notifyCounts, setNotifyCounts] = useState({ p0: 0, p1: 0, p2: 0, total: 0 });
   const [todoCounts, setTodoCounts] = useState({ today: 0, long: 0 });
   const [boardStats, setBoardStats] = useState({ running: 0, done: 0 });
   const [composerFocus, setComposerFocus] = useState(0);
@@ -136,6 +138,13 @@ export default function App(): React.ReactElement {
   const handleBoardStats = useCallback((stats: { running: number; done: number }) => {
     setBoardStats(stats);
   }, []);
+
+  const handleNotifyCounts = useCallback(
+    (counts: { p0: number; p1: number; p2: number; total: number }) => {
+      setNotifyCounts(counts);
+    },
+    [],
+  );
 
   /** 新建不是全局入口：切到待办并聚焦 composer，不新增 N 快捷键。 */
   const newTodo = useCallback(() => {
@@ -225,13 +234,26 @@ export default function App(): React.ReactElement {
             </div>
             <div className="wb-actions">
               <button
+                className={"wb-iconbtn wb-notify-toggle" + (notifyCounts.total > 0 ? " active" : "")}
+                type="button"
+                onClick={() => setNotifyOpen((value) => !value)}
+                title={notifyOpen ? "收起通知中心" : "打开通知中心"}
+                aria-label={notifyOpen ? "收起通知中心" : "打开通知中心"}
+                aria-expanded={notifyOpen}
+              >
+                <span aria-hidden="true">🔔</span>
+                {notifyCounts.total > 0 ? (
+                  <span className="wb-notify-badge">{notifyCounts.total}</span>
+                ) : null}
+              </button>
+              <button
                 className={"wb-review-entry" + (reviewCount > 0 ? " active" : "")}
                 type="button"
                 onClick={() => openVerify()}
-                title="进入全屏验收"
+                title="打开全屏验收（收完才进已完成）"
               >
                 <span className="wb-review-ring" aria-hidden="true" />
-                待你处理
+                验收
                 <span className="wb-review-entry-count">{reviewCount}</span>
               </button>
               <button
@@ -252,8 +274,10 @@ export default function App(): React.ReactElement {
             <div className={"wb-pane" + (tab === "todo" ? "" : " wb-pane-hidden")}>
               <TodoPage
                 onVerify={openVerify}
+                onOpenSession={openSession}
                 onCounts={handleTodoCounts}
                 focusComposer={composerFocus}
+                active={tab === "todo"}
               />
             </div>
             <div className={"wb-pane" + (tab === "flow" ? "" : " wb-pane-hidden")}>
@@ -273,12 +297,16 @@ export default function App(): React.ReactElement {
         onOpenBoard={openBoard}
         onOpenVerify={openVerify}
         onChanged={refreshInbox}
+        open={notifyOpen}
+        onOpenChange={setNotifyOpen}
+        onCounts={handleNotifyCounts}
       />
 
       {/* 验收是全屏覆盖层，不是 tab；插件宿主的 TABS 里没有入口。 */}
       {verifyOpen ? (
         <VerifyPage
           initialTaskId={verifyStartId}
+          manualOpen={verifyStartId === null}
           onClose={closeVerify}
           onChanged={refreshInbox}
           onOpenSession={openSession}

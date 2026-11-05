@@ -41,6 +41,12 @@
 .wb-todo-plane {
   background: var(--wb-card);
 }
+/* 仓库互拖：只改 bucket，不派发；落点用 accent 细环，和流水线的派发区分开。 */
+.wb-todo-plane.drop {
+  border-color: var(--wb-accent);
+  background: color-mix(in srgb, var(--wb-accent) 5%, var(--wb-card));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wb-accent) 12%, transparent);
+}
 
 .wb-todo-body {
   flex: 1;

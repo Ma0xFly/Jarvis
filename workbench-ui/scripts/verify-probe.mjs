@@ -723,7 +723,9 @@ async function main() {
       card.click();
       return true;
     })()`);
-    check("点击待收行进入验收", rowOpened === true);
+    check("点击待收行打开详情", rowOpened === true);
+    await waitForEval("Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "待收行详情");
+    await evaluate("document.querySelector('.wb-detail-btn.primary')?.click(); true");
     await waitForEval("Boolean(document.querySelector('.wb-verify-overlay'))", 8000, "行入口覆盖层");
     await waitForEval(
       `document.querySelector('.wb-verify-title')?.textContent === ${JSON.stringify(titleC)}`,

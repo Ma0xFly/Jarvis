@@ -3,7 +3,7 @@
 
 Covers the workbench-owned write endpoints introduced for the todo page:
 
-* ``POST /api/workbench/tasks`` — upstream triage card + default metadata
+* ``POST /api/workbench/tasks`` — upstream store card (scheduled) + default metadata
 * ``PATCH /api/workbench/metadata/{task_id}`` — bucket / contract merge
 
 The kanban + workbench DBs are throwaway temp files (see ``test_dispatch``),
@@ -71,7 +71,7 @@ def fixed_upstream(status: int, payload: bytes, *, get_status: int | None = None
             length = int(self.headers.get("Content-Length") or 0)
             if length:
                 self.rfile.read(length)
-            self._respond(200, b'{"task":{"id":"t_fake","status":"triage"}}')
+            self._respond(200, b'{"task":{"id":"t_fake","status":"scheduled"}}')
 
         def log_message(self, *args) -> None:
             pass
@@ -167,7 +167,7 @@ class CreateTaskTests(TodoBackendTestCase):
         self.assertEqual(code, 200, body)
         self.assertTrue(body["ok"])
         task = body["task"]
-        self.assertEqual(task["status"], "triage")
+        self.assertEqual(task["status"], "scheduled")
         self.assertTrue(task["id"])
 
         expected = {
@@ -177,8 +177,8 @@ class CreateTaskTests(TodoBackendTestCase):
         self.assertEqual(body["metadata"], expected)
         self.assertEqual(self.metadata(task["id"]), expected)
 
-        # The card is in triage on the upstream board (ready gate passed via triage).
-        self.assertEqual(self.server.status(task["id"]), "triage")
+        # The card is in the workbench store (scheduled), not triage/todo queues.
+        self.assertEqual(self.server.status(task["id"]), "scheduled")
         self.assertIn("第一张", self.board_titles())
 
         # Empty acceptance still blocks dispatch: creating never auto-dispatches.
@@ -186,11 +186,11 @@ class CreateTaskTests(TodoBackendTestCase):
         self.assertEqual(code, 400, dispatch)
         self.assertEqual(dispatch["error"], "missing_acceptance")
 
-    def test_create_accepts_long_bucket_without_occupying_todo(self):
+    def test_create_accepts_long_bucket_in_store(self):
         code, body = self.create("长期卡", bucket="long")
         self.assertEqual(code, 200, body)
         self.assertEqual(body["metadata"]["bucket"], "long")
-        self.assertEqual(self.server.status(body["task"]["id"]), "triage")
+        self.assertEqual(self.server.status(body["task"]["id"]), "scheduled")
 
     def test_create_rejects_empty_title_and_bad_buckets(self):
         before = self.board_titles()
@@ -315,7 +315,7 @@ class CreateTaskTests(TodoBackendTestCase):
                 self.assertEqual(body, {"ok": False, "error": "invalid_request"})
         self.assertEqual(self.board_titles(), before)
 
-    def test_create_refuses_non_triage_landing(self):
+    def test_create_refuses_non_store_landing(self):
         with tempfile.TemporaryDirectory() as tmp, fixed_upstream(
             200,
             b'{"task":{"id":"t_fake","status":"triage"}}',
@@ -713,7 +713,7 @@ class RequestGuardTests(TodoBackendTestCase):
         )
         self.assertEqual(code, 403, body)
         self.assertEqual(body, {"ok": False, "error": "forbidden_origin"})
-        self.assertEqual(self.server.status(task_id), "triage")
+        self.assertEqual(self.server.status(task_id), "scheduled")
 
         # Same-origin passes the guard and reaches the acceptance check.
         code, body = self.raw_request(

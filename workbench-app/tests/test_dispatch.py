@@ -767,11 +767,11 @@ class DispatchTests(ServerTestCase):
         self.assertEqual(self.server.metadata_row(card)["contract_defaults"], second_snapshot)
         self.assertEqual(self.server.metadata_token(card), second_token)
 
-    def test_blocked_by_parent_lands_todo(self):
+    def test_blocked_by_parent_lands_scheduled(self):
         parent = self.server.create_task("blocking-parent", triage=True)
 
-        # Card already in todo: dispatch must report blocked_by_parent without
-        # a second PATCH.
+        # A legacy todo card with an unfinished parent must be parked in the
+        # scheduled store, not left in todo (Hermes would auto-promote it).
         todo_child = self.server.create_task("blocked-todo-child", parents=[parent])
         self.assertEqual(self.server.patch_status(todo_child, "todo")[0], 200)
         self.assertEqual(self.server.status(todo_child), "todo")
@@ -780,21 +780,21 @@ class DispatchTests(ServerTestCase):
         before = set(self.server.ready_ids())
         code, body = self.server.dispatch(todo_child)
         self.assertEqual(code, 409)
-        self.assertEqual(body, {"ok": False, "error": "blocked_by_parent", "status": "todo"})
-        self.assertEqual(self.server.status(todo_child), "todo")
+        self.assertEqual(body, {"ok": False, "error": "blocked_by_parent", "status": "scheduled"})
+        self.assertEqual(self.server.status(todo_child), "scheduled")
         self.assertEqual(set(self.server.ready_ids()), before)
         self.assert_no_snapshot(todo_child)
 
-        # A triage card with an unfinished parent must be moved to todo, not
-        # silently left in triage.
+        # A triage card with an unfinished parent must be moved to the
+        # scheduled store, not silently left in triage.
         triage_child = self.server.create_task("blocked-triage-child", parents=[parent])
         self.assertEqual(self.server.status(triage_child), "triage")
         self.seed_accept(triage_child)
         code, body = self.server.dispatch(triage_child)
         self.assertEqual(code, 409)
         self.assertEqual(body["error"], "blocked_by_parent")
-        self.assertEqual(body["status"], "todo")
-        self.assertEqual(self.server.status(triage_child), "todo")
+        self.assertEqual(body["status"], "scheduled")
+        self.assertEqual(self.server.status(triage_child), "scheduled")
         self.assert_no_snapshot(triage_child)
 
     def test_blocked_card_that_resumes_review_is_not_reported_ready(self):
@@ -1328,7 +1328,7 @@ class UpstreamPatchFailureTests(unittest.TestCase):
 
 
 class TodoPatchFailureTests(unittest.TestCase):
-    """The 409 blocked_by_parent flow must not fabricate a todo landing."""
+    """The 409 blocked_by_parent flow must not fabricate a scheduled landing."""
 
     tmp: Path
     defaults: Path
@@ -1387,7 +1387,7 @@ class TodoPatchFailureTests(unittest.TestCase):
                         payload = json.loads(body or b"{}")
                     except json.JSONDecodeError:
                         payload = {}
-                    if payload.get("status") == "todo":
+                    if payload.get("status") == "scheduled":
                         if cls.todo_state["mode"] == "500":
                             self._respond(500, b'{"detail":"todo boom"}')
                         else:
@@ -1432,7 +1432,7 @@ class TodoPatchFailureTests(unittest.TestCase):
         self.target.seed_metadata(child, {"contract": {"accept": "ok"}})
         return child, self.server.dispatch(child)
 
-    def test_todo_patch_500_returns_502_and_compensates(self):
+    def test_scheduled_patch_500_returns_502_and_compensates(self):
         child, (code, body) = self._dispatch_blocked_child("500")
         self.assertEqual(code, 502, body)
         self.assertEqual(body["error"], "upstream_unavailable")
@@ -1440,7 +1440,7 @@ class TodoPatchFailureTests(unittest.TestCase):
         metadata = self.target.metadata_row(child)
         self.assertNotIn("contract_defaults", metadata or {})
 
-    def test_todo_patch_200_without_task_status_returns_502(self):
+    def test_scheduled_patch_200_without_task_status_returns_502(self):
         child, (code, body) = self._dispatch_blocked_child("no-status")
         self.assertEqual(code, 502, body)
         self.assertEqual(body["error"], "upstream_unavailable")

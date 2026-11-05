@@ -30,6 +30,11 @@ interface NotificationCenterProps {
   onOpenVerify: (taskId: string) => void;
   /** 动作完成后通知 App 刷新验收计数。 */
   onChanged?: () => void;
+  /** 面板是否展开；收起时仍轮询，只把计数交给顶栏铃铛。 */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  /** 顶栏铃铛徽标：P0/P1/P2 计数；无快照时为 0。 */
+  onCounts?: (counts: { p0: number; p1: number; p2: number; total: number }) => void;
 }
 
 function errText(error: unknown): string {
@@ -76,6 +81,9 @@ export default function NotificationCenter({
   onOpenBoard,
   onOpenVerify,
   onChanged,
+  open = true,
+  onOpenChange,
+  onCounts,
 }: NotificationCenterProps): React.ReactElement | null {
   const [snapshot, setSnapshot] = useState<NotificationSnapshot | null>(null);
   const [error, setError] = useState("");
@@ -203,10 +211,30 @@ export default function NotificationCenter({
     [reason, runAction],
   );
 
+  const notifyCounts = snapshot?.counts ?? { p0: 0, p1: 0, p2: 0, total: 0 };
+  useEffect(() => {
+    onCounts?.(notifyCounts);
+  }, [notifyCounts.p0, notifyCounts.p1, notifyCounts.p2, notifyCounts.total, onCounts]);
+
+  // 收起不是停止工作：轮询继续，计数通过 onCounts 交给顶栏铃铛。
+  if (!open) return null;
+
   if (!snapshot) {
     if (!error) return null;
     return (
       <aside className="wb-notify-center" aria-label="通知中心">
+        <header className="wb-notify-top">
+          <span className="wb-notify-title">通知</span>
+          <button
+            className="wb-notify-close"
+            type="button"
+            onClick={() => onOpenChange?.(false)}
+            aria-label="关闭通知中心"
+            title="关闭"
+          >
+            ✕
+          </button>
+        </header>
         <div className="wb-notify-error" role="alert">
           {error}
         </div>
@@ -373,6 +401,15 @@ export default function NotificationCenter({
           onClick={() => void refresh(true)}
         >
           刷新
+        </button>
+        <button
+          className="wb-notify-close"
+          type="button"
+          onClick={() => onOpenChange?.(false)}
+          aria-label="关闭通知中心"
+          title="关闭"
+        >
+          ✕
         </button>
       </header>
 

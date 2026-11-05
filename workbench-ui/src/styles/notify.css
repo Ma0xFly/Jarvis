@@ -61,6 +61,52 @@
   background: var(--wb-hover);
   color: var(--wb-fg);
 }
+.wb-notify-close {
+  flex: 0 0 auto;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--wb-border);
+  border-radius: 6px;
+  background: var(--wb-card);
+  color: var(--wb-muted);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.wb-notify-close:hover {
+  border-color: var(--wb-accent-border);
+  color: var(--wb-accent);
+}
+.wb-notify-close:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: 1px;
+}
+
+/* 顶栏铃铛：默认收起，徽标显示 P0/P1/P2 总数。 */
+.wb-notify-toggle {
+  position: relative;
+}
+.wb-notify-toggle.active {
+  border-color: color-mix(in srgb, var(--wb-block) 50%, var(--wb-border));
+  color: var(--wb-block);
+}
+.wb-notify-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--wb-block);
+  color: var(--wb-accent-fg);
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
 
 .wb-notify-pinned,
 .wb-notify-panel,

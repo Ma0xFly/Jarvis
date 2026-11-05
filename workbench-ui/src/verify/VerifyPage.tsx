@@ -72,6 +72,8 @@ type QueueItem = InboxTask & { receivedAt: number };
 interface VerifyPageProps {
   /** 从「待收」行进入时优先展示该卡；从计数进入时为 null。 */
   initialTaskId?: string | null;
+  /** 顶栏「验收 0」进入：队列为空时停在空态，不 3 秒自动退出。 */
+  manualOpen?: boolean;
   onClose: () => void;
   /** 每完成一个动作后通知 App 刷新右上角计数。 */
   onChanged?: () => void;
@@ -152,6 +154,7 @@ function latestReviewEvent(events: VerifyEvent[] | undefined): VerifyEvent | nul
 
 export default function VerifyPage({
   initialTaskId,
+  manualOpen = false,
   onClose,
   onChanged,
   onOpenSession,
@@ -170,6 +173,8 @@ export default function VerifyPage({
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState("");
   const [stats, setStats] = useState<VerifyStats>({ accepted: 0, rejected: 0, skipped: 0 });
+  const [openedEmpty, setOpenedEmpty] = useState(false);
+  const openedDetermined = useRef(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const reasonRef = useRef<HTMLTextAreaElement | null>(null);
   const loadSeq = useRef(0);
@@ -205,6 +210,10 @@ export default function VerifyPage({
           : inbox.tasks;
       const receivedAt = Date.now();
       setQueue(ordered.map((task) => ({ ...task, receivedAt })));
+      if (!openedDetermined.current) {
+        openedDetermined.current = true;
+        setOpenedEmpty(!initialTaskId && ordered.length === 0);
+      }
       setTtl(inbox.review_ttl_seconds);
       setFailedIds(inbox.failed_ids);
     } catch (error) {
@@ -264,6 +273,8 @@ export default function VerifyPage({
   // 关闭前最后查一次 inbox：统计页期间新到的卡要重新铺回队列，而不是被带走。
   useEffect(() => {
     if (!loaded || queue.length > 0) return;
+    // 从「验收 0」进入且队列本来就空：用户是来确认界面的，停在空态。
+    if (manualOpen && openedEmpty) return;
     const timer = window.setTimeout(async () => {
       try {
         const inbox = await getInbox();
@@ -281,7 +292,7 @@ export default function VerifyPage({
       onClose();
     }, AUTO_EXIT_MS);
     return () => window.clearTimeout(timer);
-  }, [loaded, queue.length, onClose]);
+  }, [loaded, queue.length, manualOpen, openedEmpty, onClose]);
 
   // Focus the dialog on open, trap Tab inside it, and restore focus on close.
   useEffect(() => {
@@ -549,30 +560,42 @@ export default function VerifyPage({
       ) : !loaded ? (
         <div className="wb-verify-state">加载验收队列…</div>
       ) : !current ? (
-        <div className="wb-verify-finish">
-          <div className="wb-verify-finish-title">本批验收完成</div>
-          <div className="wb-verify-stats">
-            <div className="wb-verify-stat accepted">
-              <b>{stats.accepted}</b>
-              <span>已收</span>
-            </div>
-            <div className="wb-verify-stat rejected">
-              <b>{stats.rejected}</b>
-              <span>不收</span>
-            </div>
-            <div className="wb-verify-stat skipped">
-              <b>{stats.skipped}</b>
-              <span>跳过</span>
-            </div>
+        manualOpen && openedEmpty ? (
+          <div className="wb-verify-finish wb-verify-empty">
+            <div className="wb-verify-finish-title">现在没有待验收的卡</div>
+            <p className="wb-verify-finish-hint">
+              验收队列是空的。收完的卡会进入「已完成」；新的待收会自动出现在这里。
+            </p>
+            <button className="wb-btn wb-verify-primary" type="button" onClick={onClose}>
+              返回 <kbd>Esc</kbd>
+            </button>
           </div>
-          <p className="wb-verify-finish-hint">
-            {stats.skipped > 0 ? "跳过的卡仍在待收，下次进入会再次出现。" : "队列已清空。"}
-          </p>
-          <p className="wb-verify-finish-hint">3 秒后自动返回；Esc 可立即退出。</p>
-          <button className="wb-btn wb-verify-primary" type="button" onClick={onClose}>
-            返回待办 <kbd>Esc</kbd>
-          </button>
-        </div>
+        ) : (
+          <div className="wb-verify-finish">
+            <div className="wb-verify-finish-title">本批验收完成</div>
+            <div className="wb-verify-stats">
+              <div className="wb-verify-stat accepted">
+                <b>{stats.accepted}</b>
+                <span>已收</span>
+              </div>
+              <div className="wb-verify-stat rejected">
+                <b>{stats.rejected}</b>
+                <span>不收</span>
+              </div>
+              <div className="wb-verify-stat skipped">
+                <b>{stats.skipped}</b>
+                <span>跳过</span>
+              </div>
+            </div>
+            <p className="wb-verify-finish-hint">
+              {stats.skipped > 0 ? "跳过的卡仍在待收，下次进入会再次出现。" : "队列已清空。"}
+            </p>
+            <p className="wb-verify-finish-hint">3 秒后自动返回；Esc 可立即退出。</p>
+            <button className="wb-btn wb-verify-primary" type="button" onClick={onClose}>
+              返回待办 <kbd>Esc</kbd>
+            </button>
+          </div>
+        )
       ) : (
         <div className="wb-verify-body">
           <section className="wb-verify-pane wb-verify-produce">

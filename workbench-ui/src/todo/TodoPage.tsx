@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, KANBAN } from "../platform";
 import type { Task } from "../board/Board";
+import TaskDetail from "./TaskDetail";
+import "../styles/detail.css";
 import {
   createTask,
   dispatchTask,
@@ -45,10 +47,16 @@ function acceptText(task: TaskWithMeta): string {
   return typeof accept === "string" ? accept.trim() : "";
 }
 
-/** 仓库卡：triage + 对应 bucket；固定 created_at 倒序，不做栏内拖动 */
+/** 仓库卡：triage（旧卡）/ todo（旧仓库）/ scheduled（新仓库） + bucket；固定 created_at 倒序 */
 function repoCards(tasks: TaskWithMeta[], bucket: Bucket): TaskWithMeta[] {
   return tasks
-    .filter((task) => task.status === "triage" && task.metadata?.bucket === bucket)
+    .filter(
+      (task) =>
+        (task.status === "triage" ||
+          task.status === "todo" ||
+          task.status === "scheduled") &&
+        task.metadata?.bucket === bucket,
+    )
     .sort(
       (a, b) =>
         (b.created_at ?? 0) - (a.created_at ?? 0) ||
@@ -67,21 +75,28 @@ function newIdempotencyKey(): string {
 interface TodoPageProps {
   /** 独立版入口：打开全屏验收；带 taskId 时先看这张卡。 */
   onVerify?: (taskId?: string) => void;
+  /** 打开只读执行会话抽屉（详情里的出口）。 */
+  onOpenSession?: (taskId: string, title?: string) => void;
   /** 外壳侧栏计数：今日 + 长期仓库卡数量。 */
   onCounts?: (counts: { today: number; long: number }) => void;
   /** 每次自增表示「切到待办并聚焦 composer」；0 表示首屏不抢焦点。 */
   focusComposer?: number;
+  /** 当前是否为可见 tab；切走时关闭详情，避免 body 锁留在隐藏面板里。 */
+  active?: boolean;
 }
 
 export default function TodoPage({
   onVerify,
+  onOpenSession,
   onCounts,
   focusComposer,
+  active = true,
 }: TodoPageProps): React.ReactElement {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [metadataById, setMetadataById] = useState<Record<string, TaskMetadata>>({});
   const [err, setErr] = useState("");
   const [dropActive, setDropActive] = useState(false);
+  const [bucketDrop, setBucketDrop] = useState<Bucket | null>(null);
   const [toast, setToast] = useState("");
   const [receipt, setReceipt] = useState<ReceiptState | null>(null);
   const [loaded, setLoaded] = useState(false);
@@ -95,6 +110,7 @@ export default function TodoPage({
   const [draft, setDraft] = useState("");
   const [draftBucket, setDraftBucket] = useState<Bucket>("today");
   const [creating, setCreating] = useState(false);
+  const [detailId, setDetailId] = useState<string | null>(null);
 
   const composerRef = useRef<HTMLInputElement | null>(null);
   const toastTimer = useRef<number | null>(null);
@@ -245,6 +261,26 @@ export default function TodoPage({
   }));
   const flowCount = flowLists.reduce((sum, segment) => sum + segment.cards.length, 0);
 
+  const detailTask = useMemo(
+    () => (detailId ? tasks.find((task) => task.id === detailId) : undefined),
+    [detailId, tasks],
+  );
+  const readyList = flowLists.find((segment) => segment.key === "ready")?.cards || [];
+  const detailPosition =
+    detailTask?.status === "ready"
+      ? readyList.findIndex((task) => task.id === detailTask.id) + 1
+      : undefined;
+
+  useEffect(() => {
+    if (detailId && loaded && !tasks.some((task) => task.id === detailId)) {
+      setDetailId(null);
+    }
+  }, [detailId, loaded, tasks]);
+
+  useEffect(() => {
+    if (!active) setDetailId(null);
+  }, [active]);
+
   const dispatchToFlow = useCallback(
     async (task: TaskWithMeta) => {
       // 防御性串行化：handleDrop 已拦一次，这里再兜底。
@@ -262,7 +298,7 @@ export default function TodoPage({
       } catch (error) {
         clearReceipt();
         if (error instanceof WorkbenchError && error.code === "blocked_by_parent") {
-          showToast("已转为 todo，等 parent 完成");
+          showToast("已回到仓库，等 parent 完成");
         } else if (error instanceof WorkbenchError && error.code === "missing_acceptance") {
           flashWarn(task.id);
           return;
@@ -310,6 +346,51 @@ export default function TodoPage({
   const handleDragLeave = (event: React.DragEvent<HTMLElement>) => {
     const next = event.relatedTarget as Node | null;
     if (!next || !event.currentTarget.contains(next)) setDropActive(false);
+  };
+
+  /** 仓库之间拖拽只改归属（bucket），不派发；只有流水线的 drop 才调用 dispatch。 */
+  const moveTaskBucket = useCallback(
+    async (task: TaskWithMeta, bucket: Bucket) => {
+      if (task.metadata?.bucket === bucket) return;
+      if (task.status !== "triage" && task.status !== "todo") return;
+      if (savingCardsRef.current.has(task.id)) return;
+      savingCardsRef.current.add(task.id);
+      setSavingId(task.id);
+      mutationSeq.current += 1;
+      try {
+        const metadata = await updateTaskMetadata(task.id, { bucket });
+        setMetadataById((prev) => ({ ...prev, [task.id]: metadata }));
+        showToast(bucket === "today" ? "已移到今日" : "已移到长期");
+      } catch (error) {
+        showToast("移动失败：" + errText(error));
+      } finally {
+        savingCardsRef.current.delete(task.id);
+        setSavingId(null);
+      }
+    },
+    [showToast],
+  );
+
+  const handleBucketDragOver = (event: React.DragEvent<HTMLElement>, bucket: Bucket) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setBucketDrop(bucket);
+  };
+
+  const handleBucketDragLeave = (event: React.DragEvent<HTMLElement>, bucket: Bucket) => {
+    const next = event.relatedTarget as Node | null;
+    if (!next || !event.currentTarget.contains(next)) {
+      setBucketDrop((current) => (current === bucket ? null : current));
+    }
+  };
+
+  const handleBucketDrop = (event: React.DragEvent<HTMLElement>, bucket: Bucket) => {
+    event.preventDefault();
+    setBucketDrop(null);
+    const taskId = event.dataTransfer.getData("text/plain");
+    if (!taskId) return;
+    const task = tasks.find((candidate) => candidate.id === taskId);
+    if (task) void moveTaskBucket(task, bucket);
   };
 
   const startEdit = (task: TaskWithMeta) => {
@@ -415,7 +496,10 @@ export default function TodoPage({
           event.dataTransfer.setData("text/plain", task.id);
           event.dataTransfer.effectAllowed = "move";
         }}
-        onDragEnd={() => setDropActive(false)}
+        onDragEnd={() => {
+          setDropActive(false);
+          setBucketDrop(null);
+        }}
         title={task.title}
       >
         <div className="wb-todo-title">{task.title}</div>
@@ -514,27 +598,21 @@ export default function TodoPage({
                     const accept = acceptText(task);
                     // 位次是派生值：ready 段内按 /board 顺序 1-based，每次渲染重算。
                     const position = segment.key === "ready" ? index + 1 : 0;
-                    const openThis = openVerify ? () => openVerify(task.id) : undefined;
+                    const openDetail = () => setDetailId(task.id);
                     return (
                       <div
-                        className={
-                          "wb-todo-card wb-todo-flow-card" + (openThis ? " clickable" : "")
-                        }
+                        className="wb-todo-card wb-todo-flow-card clickable"
                         key={task.id}
-                        role={openThis ? "button" : undefined}
-                        tabIndex={openThis ? 0 : undefined}
-                        title={openThis ? "打开验收" : task.title}
-                        onClick={openThis}
-                        onKeyDown={
-                          openThis
-                            ? (event) => {
-                                if (event.key === "Enter" || event.key === " ") {
-                                  event.preventDefault();
-                                  openThis();
-                                }
-                              }
-                            : undefined
-                        }
+                        role="button"
+                        tabIndex={0}
+                        title="查看卡片详情"
+                        onClick={openDetail}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
+                            event.preventDefault();
+                            openDetail();
+                          }
+                        }}
                       >
                         <div className="wb-todo-flow-head">
                           <span className="wb-todo-title">{task.title}</span>
@@ -570,11 +648,16 @@ export default function TodoPage({
           </div>
         </section>
 
-        <section className="wb-todo-col wb-todo-plane">
+        <section
+          className={"wb-todo-col wb-todo-plane" + (bucketDrop === "today" ? " drop" : "")}
+          onDragOver={(event) => handleBucketDragOver(event, "today")}
+          onDragLeave={(event) => handleBucketDragLeave(event, "today")}
+          onDrop={(event) => handleBucketDrop(event, "today")}
+        >
           <div className="wb-todo-chead">
             <span className="wb-todo-cname">今日</span>
             <span className="wb-todo-count">{today.length}</span>
-            <span className="wb-todo-hint">只存信息 · 无状态</span>
+            <span className="wb-todo-hint">只存信息 · 可互拖</span>
           </div>
           <div className="wb-todo-body">
             <div className="wb-todo-list">{today.map(renderRepoCard)}</div>
@@ -584,11 +667,16 @@ export default function TodoPage({
           </div>
         </section>
 
-        <section className="wb-todo-col wb-todo-plane">
+        <section
+          className={"wb-todo-col wb-todo-plane" + (bucketDrop === "long" ? " drop" : "")}
+          onDragOver={(event) => handleBucketDragOver(event, "long")}
+          onDragLeave={(event) => handleBucketDragLeave(event, "long")}
+          onDrop={(event) => handleBucketDrop(event, "long")}
+        >
           <div className="wb-todo-chead">
             <span className="wb-todo-cname">长期</span>
             <span className="wb-todo-count">{long.length}</span>
-            <span className="wb-todo-hint">冷存储 · 想不起就别做</span>
+            <span className="wb-todo-hint">冷存储 · 可互拖</span>
           </div>
           <div className="wb-todo-body">
             <div className="wb-todo-list">{long.map(renderRepoCard)}</div>
@@ -637,6 +725,16 @@ export default function TodoPage({
       </div>
 
       {toast ? <div className="wb-toast">{toast}</div> : null}
+
+      {detailTask ? (
+        <TaskDetail
+          task={detailTask}
+          position={detailPosition || undefined}
+          onClose={() => setDetailId(null)}
+          onVerify={onVerify}
+          onOpenSession={onOpenSession}
+        />
+      ) : null}
     </div>
   );
 }
