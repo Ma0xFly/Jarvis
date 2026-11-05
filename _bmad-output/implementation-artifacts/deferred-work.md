@@ -78,3 +78,6 @@
   summary: 决定顶栏计数 1s `/board` 缓存的去留，或在验收动作后主动失效缓存。
   evidence: （BH2 残留）`INBOX_CACHE_SECONDS=1.0`；verify 成功后 `/inbox/count` 最多 1s 仍显示旧值，验收页与顶栏两个 5s 轮询共用该缓存。当前单用户规模可接受，记录为已知延迟。
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-p0-notifications.md`
+  summary: 补一条通知 sweep 与 accept/reject 并发的 guard 测试（board 读取窗口内完成动作）。
+  evidence: （VG6）`server.py` 的 `notification_lock` 已把 board 读取 + collect 与动作串行化，但测试只顺序调用 sweep/action；重叠窗口为一次 board 读取，下一轮 sweep 会自愈。可仿照 `tests/test_dispatch.py:1598` 的 GateLockTests 构造阻塞 board 读取。

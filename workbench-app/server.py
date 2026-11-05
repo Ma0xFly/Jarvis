@@ -52,6 +52,13 @@ from starlette.concurrency import run_in_threadpool  # noqa: E402
 from starlette.requests import ClientDisconnect  # noqa: E402
 
 APP_DIR = Path(__file__).resolve().parent
+# The test harness starts this file with ``python -I`` (no script directory on
+# sys.path); make the sibling notification module importable.
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+from notifications import NotificationEngine, NotificationPoller  # noqa: E402
+
 WEB_DIR = APP_DIR / "web"
 DEFAULT_DB_PATH = APP_DIR / "workbench.db"
 DEFAULT_DEFAULTS_PATH = APP_DIR / "defaults.json"
@@ -83,6 +90,7 @@ MAX_IDEMPOTENCY_KEY = 128
 # human decision so the review lane cannot stay clogged; the background sweeper
 # runs every 5 minutes and every inbox read is also a fallback sweep.
 REVIEW_STATUS = "review"
+BLOCKED_STATUS = "blocked"
 REVIEW_TTL_SECONDS = 48 * 60 * 60
 REVIEW_SWEEP_SECONDS = 5 * 60
 REVIEW_BACKOFF_SECONDS = 5 * 60
@@ -96,6 +104,16 @@ AUTO_COLLECT_COMMENT = "48h 自动收"
 AUTO_COLLECT_AUDIT_SUMMARY = "48h 自动收（worker 自述保留在 review_requested 事件/run）"
 MAX_REJECT_REASON_CHARS = 2000
 VERIFY_AUTHOR = "workbench"
+
+# Notifications (Story 2.2). The engine lives in memory; the background poller
+# starts 5s after boot and re-reads the board. All thresholds are env-tunable
+# so tests can shorten them without sleeping for half an hour.
+NOTIFY_SWEEP_SECONDS = 5.0
+NOTIFY_BATCH_SIZE = 3
+NOTIFY_BATCH_SECONDS = 30 * 60
+NOTIFY_ESCALATE_SECONDS = 30 * 60
+NOTIFY_SNOOZE_SECONDS = 10 * 60
+NOTIFY_DAILY_HOUR = 8
 
 
 class MetadataUnavailable(RuntimeError):
@@ -860,17 +878,25 @@ class WorkbenchService:
     # -- helpers ----------------------------------------------------------
 
     @staticmethod
-    def _find_on_board(board: dict[str, Any], task_id: str) -> Optional[dict[str, Any]]:
+    def _iter_board_cards(board: dict[str, Any]):
+        """Yield ``(card, column_status, index)`` for dict cards on a board."""
         for column in board.get("columns") or []:
             if not isinstance(column, dict):
                 continue
+            column_status = column.get("name")
             for index, card in enumerate(column.get("tasks") or []):
-                if isinstance(card, dict) and card.get("id") == task_id:
-                    return {
-                        "status": card.get("status") or column.get("name"),
-                        "column": column.get("name"),
-                        "position": index + 1,
-                    }
+                if isinstance(card, dict):
+                    yield card, column_status, index
+
+    @classmethod
+    def _find_on_board(cls, board: dict[str, Any], task_id: str) -> Optional[dict[str, Any]]:
+        for card, column_status, index in cls._iter_board_cards(board):
+            if card.get("id") == task_id:
+                return {
+                    "status": card.get("status") or column_status,
+                    "column": column_status,
+                    "position": index + 1,
+                }
         return None
 
     @staticmethod
@@ -1062,17 +1088,11 @@ class WorkbenchService:
     def _review_ids_on_board(self, deadline: float) -> list[str]:
         board = self._board(deadline)
         ids: list[str] = []
-        for column in board.get("columns") or []:
-            if not isinstance(column, dict):
-                continue
-            column_status = column.get("name")
-            for card in column.get("tasks") or []:
-                if not isinstance(card, dict):
-                    continue
-                task_id = card.get("id")
-                status = card.get("status") or column_status
-                if status == REVIEW_STATUS and isinstance(task_id, str) and task_id:
-                    ids.append(task_id)
+        for card, column_status, _index in self._iter_board_cards(board):
+            task_id = card.get("id")
+            status = card.get("status") or column_status
+            if status == REVIEW_STATUS and isinstance(task_id, str) and task_id:
+                ids.append(task_id)
         return ids
 
     def _invalidate_review_cache(self) -> None:
@@ -1142,6 +1162,14 @@ class WorkbenchService:
         with self._auto_collect_guard:
             self._auto_collect_failures.pop(task_id, None)
 
+    @staticmethod
+    def _parent_ids(detail: dict[str, Any]) -> list[str]:
+        links = detail.get("links")
+        parents = links.get("parents") if isinstance(links, dict) else None
+        if not isinstance(parents, list):
+            return []
+        return [value for value in parents if isinstance(value, str) and value]
+
     def _inbox_item(
         self, task_id: str, detail: dict[str, Any], metadata: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1163,6 +1191,92 @@ class WorkbenchService:
             "review_age_seconds": age,
             "auto_collect_due": age is not None and age >= self.review_ttl_seconds,
             "auto_collect_error": self._auto_collect_error_for(task_id),
+        }
+
+    # -- notification board slice (Story 2.2) ------------------------------
+
+    @staticmethod
+    def _int_field(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0
+        return int(value)
+
+    def board_snapshot(self) -> tuple[int, dict[str, Any]]:
+        """Read-only board + detail slice for the notification engine.
+
+        Only ``blocked`` / ``review`` cards are returned. Blocked cards need
+        nothing beyond the board (block_kind, block_recurrences, progress);
+        review cards get ``GET /tasks/{id}`` for the review clock and parent
+        links used by acceptance-slot bundling. A board or detail failure is a
+        502: the engine then keeps its previous snapshot and sends nothing.
+        """
+        deadline = time.monotonic() + INBOX_BUDGET_SECONDS
+        try:
+            board = self._board(deadline)
+        except UpstreamUnavailable:
+            return self._fail(502, "upstream_unavailable")
+
+        cards: dict[str, dict[str, Any]] = {}
+        review_ids: list[str] = []
+        for card, column_status, _index in self._iter_board_cards(board):
+            task_id = card.get("id")
+            status = card.get("status") or column_status
+            if status not in (BLOCKED_STATUS, REVIEW_STATUS):
+                continue
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            block_kind = card.get("block_kind")
+            progress = card.get("progress")
+            entry: dict[str, Any] = {
+                "id": task_id,
+                "title": card.get("title") if isinstance(card.get("title"), str) else "",
+                "status": status,
+                "block_kind": block_kind if isinstance(block_kind, str) and block_kind else None,
+                "block_recurrences": self._int_field(card.get("block_recurrences")),
+                "progress": progress if isinstance(progress, dict) else None,
+                "review_requested_at": None,
+                "parent_ids": [],
+            }
+            cards[task_id] = entry
+            if status == REVIEW_STATUS:
+                review_ids.append(task_id)
+
+        if review_ids:
+            details: dict[str, dict[str, Any]] = {}
+            workers = min(MAX_INBOX_WORKERS, len(review_ids))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._task_detail, task_id, deadline): task_id
+                    for task_id in review_ids
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    task_id = futures[future]
+                    try:
+                        details[task_id] = future.result()
+                    except TaskNotFound:
+                        # Gone between /board and the detail read: resolved.
+                        continue
+                    except Exception:
+                        return self._fail(502, "upstream_unavailable")
+            for task_id in review_ids:
+                detail = details.get(task_id)
+                if detail is None:
+                    cards.pop(task_id, None)
+                    continue
+                task = self._detail_task(detail)
+                if task.get("status") != REVIEW_STATUS:
+                    # Moved between the board read and now; next round sees it.
+                    cards.pop(task_id, None)
+                    continue
+                entry = cards[task_id]
+                entry["review_requested_at"] = self._latest_review_requested_at(detail)
+                entry["parent_ids"] = self._parent_ids(detail)
+
+        return 200, {
+            "ok": True,
+            "generated_at": int(time.time()),
+            "review_ttl_seconds": self.review_ttl_seconds,
+            "tasks": list(cards.values()),
         }
 
     def _read_status(
@@ -1552,7 +1666,11 @@ class WorkbenchService:
         }
 
     def verify(
-        self, task_id: str, action: Any, reason: Any = None
+        self,
+        task_id: str,
+        action: Any,
+        reason: Any = None,
+        expected_review_at: Any = None,
     ) -> tuple[int, dict[str, Any]]:
         """``accept`` / ``reject`` / ``skip`` one review card.
 
@@ -1560,12 +1678,23 @@ class WorkbenchService:
         PATCH triage (a failed comment never changes the status); ``skip``
         leaves the upstream card untouched. The frontend and this endpoint
         both require a non-empty reason (<= 2000 chars) for reject.
+
+        ``expected_review_at`` scopes a notification action to the review
+        round it was rendered from; a newer ``review_requested`` rejects the
+        action with 409 ``stale_review`` instead of acting on the new round.
         """
         normalized = task_id.strip() if isinstance(task_id, str) else ""
         if not normalized:
             return self._fail(400, "invalid_request")
         if action not in VERIFY_ACTIONS:
             return self._fail(400, "invalid_action")
+        expected: Optional[int] = None
+        if expected_review_at is not None:
+            if isinstance(expected_review_at, bool) or not isinstance(
+                expected_review_at, (int, float)
+            ):
+                return self._fail(400, "invalid_request")
+            expected = int(expected_review_at)
         rejection_reason: Optional[str] = None
         if action == "reject":
             if not isinstance(reason, str) or not reason.strip():
@@ -1593,6 +1722,15 @@ class WorkbenchService:
                     "error": "not_in_review",
                     "status": current if isinstance(current, str) else None,
                     "comment_written": False,
+                }
+            latest_review_at = self._latest_review_requested_at(detail)
+            if expected is not None and latest_review_at != expected:
+                return 409, {
+                    "ok": False,
+                    "error": "stale_review",
+                    "status": REVIEW_STATUS,
+                    "comment_written": False,
+                    "review_requested_at": latest_review_at,
                 }
             if action == "skip":
                 return 200, {
@@ -2353,6 +2491,33 @@ def _env_sweep_seconds() -> float:
     return min(value, 86400.0)
 
 
+def _env_positive_int(name: str, default: int, *, minimum: int = 1, maximum: int = 1000) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(raw)
+    except ValueError:
+        return int(default)
+    if value < minimum or value > maximum:
+        return int(default)
+    return value
+
+
+def _env_notify_sweep_seconds() -> float:
+    """Notification poll interval: finite >0 (capped at a day), else disabled."""
+    raw = os.environ.get("WORKBENCH_NOTIFY_SWEEP_SECONDS", "").strip()
+    if not raw:
+        return float(NOTIFY_SWEEP_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return min(value, 86400.0)
+
+
 def _json_error(status_code: int, error: str, **extra: Any) -> JSONResponse:
     body: dict[str, Any] = {"ok": False, "error": error}
     body.update(extra)
@@ -2459,6 +2624,73 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
         sweeper.start()
         app.router.add_event_handler("shutdown", sweeper.stop)
 
+    notification_engine = NotificationEngine(
+        verify=service.verify,
+        review_ttl_seconds=review_ttl_seconds,
+        notify_command=os.environ.get("WORKBENCH_NOTIFY_COMMAND", "").strip() or None,
+        batch_size=_env_positive_int(
+            "WORKBENCH_NOTIFY_BATCH_SIZE", NOTIFY_BATCH_SIZE, minimum=1, maximum=1000
+        ),
+        batch_seconds=_env_positive_float(
+            "WORKBENCH_NOTIFY_BATCH_SECONDS", NOTIFY_BATCH_SECONDS
+        ),
+        escalate_seconds=_env_positive_float(
+            "WORKBENCH_NOTIFY_ESCALATE_SECONDS", NOTIFY_ESCALATE_SECONDS
+        ),
+        snooze_seconds=_env_positive_float(
+            "WORKBENCH_NOTIFY_SNOOZE_SECONDS", NOTIFY_SNOOZE_SECONDS
+        ),
+        daily_hour=_env_positive_int(
+            "WORKBENCH_NOTIFY_DAILY_HOUR", NOTIFY_DAILY_HOUR, minimum=0, maximum=23
+        ),
+    )
+
+    # Serialise board-read+collect against actions: otherwise a sweep that
+    # fetched the board just before an accept could re-add the review card as
+    # a new event (and notify again) after the action removed it.
+    notification_lock = threading.Lock()
+
+    def notification_sweep() -> tuple[int, dict[str, Any]]:
+        """One collection round; a failed upstream keeps the old snapshot."""
+        with notification_lock:
+            status_code, payload = service.board_snapshot()
+            if status_code != 200:
+                error = (
+                    payload.get("error")
+                    if isinstance(payload, dict)
+                    else "upstream_unavailable"
+                )
+                notification_engine.record_sweep(error=error)
+                return status_code, payload
+            try:
+                notification_engine.collect(payload)
+            except Exception as exc:
+                notification_engine.record_sweep(error=str(exc))
+                raise
+            notification_engine.record_sweep()
+            # Rebuild so the sweep response itself carries the freshness just
+            # recorded (the UIs then GET a consistent snapshot).
+            return 200, notification_engine.snapshot()
+
+    def notification_action(
+        event_id: str, action: Any, reason: Any
+    ) -> tuple[int, dict[str, Any]]:
+        with notification_lock:
+            return notification_engine.action(event_id, action, reason)
+
+    notify_sweep_seconds = _env_notify_sweep_seconds()
+    notification_poller: Optional[NotificationPoller] = None
+    if notify_sweep_seconds > 0:
+        notification_poller = NotificationPoller(
+            notification_sweep,
+            notify_sweep_seconds,
+            log=lambda message: print(
+                f"workbench: {message}", file=sys.stderr, flush=True
+            ),
+        )
+        notification_poller.start()
+        app.router.add_event_handler("shutdown", notification_poller.stop)
+
     app.add_middleware(ReadyGateMiddleware, service=service)
 
     app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
@@ -2542,7 +2774,11 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
                 return _json_error(413, "payload_too_large")
             return _json_error(400, "invalid_request")
         status_code, body = await run_in_threadpool(
-            service.verify, task_id, payload.get("action"), payload.get("reason")
+            service.verify,
+            task_id,
+            payload.get("action"),
+            payload.get("reason"),
+            payload.get("expected_review_at"),
         )
         return JSONResponse(body, status_code=status_code)
 
@@ -2564,6 +2800,42 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
             # Missing bucket defaults to today; an explicit null is invalid.
             payload.get("bucket", "today"),
             payload.get("idempotency_key"),
+        )
+        return JSONResponse(body, status_code=status_code)
+
+    @app.get("/api/workbench/notifications")
+    async def notifications() -> JSONResponse:
+        # Pure read: the engine's in-memory snapshot; never talks to upstream.
+        return JSONResponse(await run_in_threadpool(notification_engine.snapshot))
+
+    @app.post("/api/workbench/notifications/sweep")
+    async def notifications_sweep(request: Request) -> JSONResponse:
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        payload, body_error = await _request_json_object(request)
+        if body_error is not None:
+            if body_error == "payload_too_large":
+                return _json_error(413, "payload_too_large")
+            return _json_error(400, "invalid_request")
+        status_code, body = await run_in_threadpool(notification_sweep)
+        return JSONResponse(body, status_code=status_code)
+
+    @app.post("/api/workbench/notifications/{event_id}/action")
+    async def notifications_action(event_id: str, request: Request) -> JSONResponse:
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        payload, body_error = await _request_json_object(request)
+        if body_error is not None:
+            if body_error == "payload_too_large":
+                return _json_error(413, "payload_too_large")
+            return _json_error(400, "invalid_request")
+        status_code, body = await run_in_threadpool(
+            notification_action,
+            event_id,
+            payload.get("action"),
+            payload.get("reason"),
         )
         return JSONResponse(body, status_code=status_code)
 

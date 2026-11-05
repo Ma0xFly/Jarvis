@@ -55,6 +55,7 @@ def start_server(
     # 1s header cache so a card created within the same test is always visible.
     env.setdefault("WORKBENCH_REVIEW_SWEEP_SECONDS", "0")
     env.setdefault("WORKBENCH_INBOX_CACHE_SECONDS", "0")
+    env.setdefault("WORKBENCH_NOTIFY_SWEEP_SECONDS", "0")
     if upstream is not None:
         env["WORKBENCH_UPSTREAM_BASE"] = upstream
     return base.WorkbenchServer(root, make_defaults(root), env_extra=env).start()
@@ -69,6 +70,10 @@ def fake_task(
     result: str | None = None,
     review_events: list[tuple[int, int]] | None = None,
     comments: list[dict] | None = None,
+    block_kind: str | None = None,
+    block_recurrences: int = 0,
+    links: dict | None = None,
+    progress: dict | None = None,
 ) -> dict:
     now = int(time.time())
     events = [
@@ -82,6 +87,7 @@ def fake_task(
         }
         for event_id, created_at in (review_events or [(1, now - 600)])
     ]
+    normalized_links = links or {"parents": [], "children": []}
     return {
         "id": task_id,
         "title": title or task_id,
@@ -89,6 +95,14 @@ def fake_task(
         "created_at": now - 7200,
         "result": result,
         "latest_summary": summary,
+        "block_kind": block_kind,
+        "block_recurrences": block_recurrences,
+        "link_counts": {
+            "parents": len(normalized_links.get("parents") or []),
+            "children": len(normalized_links.get("children") or []),
+        },
+        "progress": progress,
+        "links": normalized_links,
         "events": events,
         "comments": list(comments or []),
         "attachments": [],
@@ -183,6 +197,11 @@ class FakeKanban:
                                     "id": task["id"],
                                     "title": task["title"],
                                     "status": task["status"],
+                                    "block_kind": task.get("block_kind"),
+                                    "block_recurrences": task.get("block_recurrences", 0),
+                                    "link_counts": task.get("link_counts")
+                                    or {"parents": 0, "children": 0},
+                                    "progress": task.get("progress"),
                                 }
                             )
                         self._respond(
@@ -215,10 +234,14 @@ class FakeKanban:
                                     "created_at": task["created_at"],
                                     "result": task["result"],
                                     "latest_summary": task["latest_summary"],
+                                    "block_kind": task.get("block_kind"),
+                                    "block_recurrences": task.get("block_recurrences", 0),
                                 },
                                 "events": list(task["events"]),
                                 "comments": list(task["comments"]),
                                 "attachments": list(task["attachments"]),
+                                "links": task.get("links")
+                                or {"parents": [], "children": []},
                                 "runs": list(task["runs"]),
                             },
                         )

@@ -263,6 +263,10 @@ async function main() {
         // deterministic and free of background writes.
         WORKBENCH_REVIEW_SWEEP_SECONDS: "0",
         WORKBENCH_INBOX_CACHE_SECONDS: "0",
+        // Notification polling is covered by notification-probe.mjs; keep
+        // this probe free of background desktop notifications.
+        WORKBENCH_NOTIFY_SWEEP_SECONDS: "0",
+        WORKBENCH_NOTIFY_COMMAND: "true",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
