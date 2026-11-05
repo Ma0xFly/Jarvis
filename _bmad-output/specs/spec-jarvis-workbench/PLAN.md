@@ -3,7 +3,7 @@
 > **唯一执行入口。** v0.5 的全部需求与 v0.6 脑暴结论已合并，不再有增量补充文件。
 > 历史版本：`_bmad-output/archive/自动化工作台-计划-v0.5-20261104.md`；脑暴日志：`_bmad-output/brainstorming/brainstorm-ai-automation-workbench-2026-11-04/.memlog.md`
 > 原则：**不重复造轮子**——能复用的开源组件全部复用，自己只写薄胶水。
-> 最后更新：2026-11-04
+> 最后更新：2026-11-05（as-built 对账；变更摘要见 §0.2）
 
 ---
 
@@ -31,6 +31,18 @@
 | 6 | 2d-4 事件接入改为"先落候选区，人一键转卡" | 原为直接建卡 |
 | 7 | 三项待拍板已定（成本聚合口径 / 手机暂不做 / worker 可改自己 skills） | 见 §15.1 |
 
+### 0.2 as-built 对账（2026-11-05）
+
+计划文本保留 v1.0 的设计意图；以下按已交付实现校正事实描述，后续章节已同步：
+
+| 计划原假设 | as-built | 证据 |
+|---|---|---|
+| dashboard 插件承载待办/看板/验收三视图 | 插件宿主**只渲染看板 tab**；待办三区与全屏验收只在独立版 8787 | `workbench-ui/src/App.tsx`、`platform.ts`；`spec-2-1-fullscreen-verify.md` |
+| 今日/长期排序与主题等 UI 偏好存 `localStorage` | 归属存 `workbench.db` 的 `task_metadata.bucket`；今日/长期固定 `created_at` 倒序，React UI 不写 `localStorage` | `ARCHITECTURE-SPINE.md` §5/§9；`workbench-app/README.md`「界面」 |
+| 契约/预算快照写上游 `task.metadata` | `bucket` / `contract` / `contract_defaults` 全部写 `workbench-app/workbench.db`；共享 `kanban.db` 零改动 | `server.py` `MetadataStore`；`ARCHITECTURE-SPINE.md` §5 |
+| 验收属 P2 待做 | 2.1 已交付 `GET /api/workbench/inbox`、`GET /inbox/count`、`POST /reviews/sweep`、`POST /verify/{task_id}` 与 48h 自动收 | `spec-2-1-fullscreen-verify.md` |
+| 看板视图是 P1 要移除的自建 5 列 | 1.1 起自有前端与原生 8 列逐项对齐，列定义单点 | `spec-1-1-native-kanban.md` |
+
 ---
 
 ## 1. 定位与边界
@@ -47,7 +59,7 @@
 
 1. **任务优先**：先建卡，再派发，跑完为止。不做"执行优先、事后追认任务"。
 2. **不自建看板模型**：看板 tab 由我们自己的前端渲染，但列名、列序、`status` 必须与 Hermes 原生 8 列逐项对齐。禁的是"另发明一套列/状态"，不是视图本身。
-3. **单机单库**：kanban 是单机设计，唯一事实源是 `kanban.db`；不做跨主机共享看板。
+3. **单机单库**：kanban 是单机设计，**任务状态**唯一事实源是 `kanban.db`；工作台契约 metadata 存 `workbench-app/workbench.db`，不写共享库；不做跨主机共享看板。
 
 ---
 
@@ -78,7 +90,7 @@
 |---|---|---|---|
 | 模型路由/成本 | **magpie**（本地 gateway 3425） | ✅ 已装 | 组路由/故障转移/masking/预热 |
 | 任务状态机 + A2A 总线 | **Hermes kanban**（SQLite、原子认领、gateway 内嵌调度器） | ✅ 自带 | `specify`/`decompose` 原生有 REST 端点 |
-| 可视化工作台 | **Hermes dashboard**（内置 Kanban 插件） | ✅ 自带 | 拖拽/REST/WS；非回环绑定强制认证 |
+| 可视化工作台 | **自有 React 前端**（`workbench-ui/`，双 IIFE 产物） | ✅ 已落地 | 独立版 8787 提供待办/看板/验收；插件宿主只渲染看板，dashboard 9119 作原生对照 |
 | 一次性调用 | `hermes -z "..."` | ✅ 实测可用 | 单发单收，用于互调用 |
 | 长编码执行 | **dsh headless**（`--json`/`--session-id`） | ✅ 0.2.1-rc.5 | 经 magpie Custom model API 接模型 |
 | 时间触发 | Hermes cron（`[SILENT]` 降噪） | ✅ 自带 | |
@@ -111,12 +123,12 @@
 卡覆盖      只在这次要偏离时才写
 ```
 
-进 `ready` 那一刻，把三层算出的生效值**快照进 `task.metadata`**。不这么做，明天改了全局预算，上周那张卡的审计记录就变了——你再也说不清它当时按什么跑的。
+进 `ready` 那一刻，把三层算出的生效值**快照进工作台自有库**（`workbench.db` 的 `task_metadata.contract_defaults`，不写共享 `kanban.db`）。不这么做，明天改了全局预算，上周那张卡的审计记录就变了——你再也说不清它当时按什么跑的。
 
 ### 4.2 仓库存信息，流水线产状态
 
 - 仓库卡只有**标题 + 验收一行**：没有状态点、没有进度、没有 assignee、没有边框高亮。
-- 仓库卡统一 `triage`，今日/长期用 `metadata.bucket = today|long` 区分（**不占 `todo`**——`todo` 是"等 parent 完成"的语义，手动塞会与自动提升冲突）。
+- 仓库卡统一 `triage`，今日/长期用工作台 metadata 的 `bucket = today|long` 区分（存 `workbench.db`，**不占 `todo`**——`todo` 是"等 parent 完成"的语义，手动塞会与自动提升冲突）。
 - 视觉上流水线用凹槽底色、仓库用平面底色；**视觉分区即语义分区**。仓库里一旦长出状态点，人就会管理仓库，它会长成第二个看板。
 
 状态映射（零内核改动）：
@@ -132,7 +144,7 @@
 
 ### 4.3 验收：全屏模式，不是 tab
 
-- 入口：右上角「待你处理 N」+ 流水线「待收」行。
+- 入口：右上角「验收 N」+ 流水线「待收」行。
 - 一张一屏：左样张、右验收标准原文 + AI 自述三行 + 本次运行；键位 `A 收` `R 不收` `S 跳过` `Esc`。
 - **`R` 必填理由**（不填不能提交）——那句理由是唯一天然会变成规则/skill patch 的输入。
 - 清空即退出，给一行"本次收 7、退 1"。
@@ -158,8 +170,8 @@
 | 可重跑脚本 | 能机械重做的那部分 | `check_feeds.py`，每周扫信源可用性 |
 
 - 固化物有两态：**未验证 → 已验证**。被下一次任务真正引用过才转正。
-- **谁写**：worker 可以直接改自己 profile 的 `skills/`（2026-11-04 授权），改完在 `kanban_complete` 的 `metadata.solidified` 登记 `{type: skill_patch, path, status: pending}`；**跨 profile 的修改仍要人合**。
-- **成本口径**：`task_runs`（起止/耗时/轮次）+ `~/.config/magpie/usage.jsonl`（token/费用）按时间窗聚合，写 `task.metadata.cost`；「第 N 次成本」按 `routing.json` 的规则名分组。
+- **谁写**：worker 可以直接改自己 profile 的 `skills/`（2026-11-04 授权），改完在 `kanban_request_review` 的 `metadata.solidified` 登记 `{type: skill_patch, path, status: pending}`（P3 落地）；**跨 profile 的修改仍要人合**。
+- **成本口径**：`task_runs`（起止/耗时/轮次）+ `~/.config/magpie/usage.jsonl`（token/费用）按时间窗聚合，写工作台 metadata `cost`（`workbench.db`，待 P3 落地）；「第 N 次成本」按 `routing.json` 的规则名分组。
 - KPI 是**同类任务第 N 次的成本曲线**（40 分钟 → 8 分钟 → 0 分钟），不是"完成卡数"。
 - 防假固化：只看"已验证沉淀数"，不看"写了多少"。
 
@@ -275,6 +287,7 @@ webhook ─┼→  调度器  →  routing.json  →  researcher ─→ web/exa 
 - **倒计时代替未读**：每张 review 显示"还有 42h 自动收"。未读数积压成焦虑，倒计时会自愈。
 - 通知里就要能操作（收 / 不收 / 10 分钟后再提醒），别让人点进详情才算开始。
 - 验收槽：固定容量 3，**有空槽就推、没空槽排队**（任务少时零等待，任务密时最多 3 个在眼前）；同一次 `decompose` 的兄弟卡自动成束。
+- **已落地（2.1）**：验收侧先有 `GET /api/workbench/inbox` / `GET /inbox/count`（review 队列与顶栏计数）和 `POST /verify/{task_id}`（A/R/S）；48h 自动收由后台 5 分钟 sweeper + 显式 `POST /reviews/sweep` 完成。P0 通知、30 分钟升级与验收槽容量 3 仍属 2.2/P5。
 
 ---
 
@@ -411,10 +424,12 @@ executor-run --executor claude_code --cwd <dir> --mode write              --budg
 |---|---|---|
 | Phase 1 · magpie 路由 | 网关 `127.0.0.1:3425`；Hermes provider `magpie` 挂 group/* 与单模型共 20 个名；组：`main`/`hermes-main`/`free-ds`/`简单杂活`(=`group/group`, 13 家)/`quick`/`minimax` | `POST /v1/chat/completions` 与 `hermes -m group/group -z` 均 200，`X-Magpie-Model` 可见真实承接方 |
 | Phase 2a · kanban 底座 | dispatcher 60s tick；profiles：researcher / housekeeper / coder / skeptic；各自 SOUL.md、模型 pin、精简 skill 集 | 2026-11-04 三条真实任务全部 ready→running→done |
-| Phase 2b · dashboard 插件 | `~/.hermes/plugins/workbench/`（manifest + index.js + style.css，无后端无构建）；三视图；今日/长期归属存 `metadata.bucket`（workbench.db），排序/主题等 UI 偏好存 localStorage | 真实任务加载/勾选/恢复/拖拽/计数均通过 |
-| Phase 2c · 独立版 App | `~/Projects/Jarvis/workbench-app/`；FastAPI 挂同一套 kanban router；systemd --user `jarvis-workbench.service`，`127.0.0.1:8787` | 创建/拖拽/完成/8 列/主题切换通过 |
+| Phase 2b · dashboard 插件 | `~/.hermes/plugins/workbench/`（manifest + `workbench-ui` 构建产物，无后端）；**插件宿主只渲染看板 tab**；不写 localStorage | 插件产物与 dist 字节一致；9119 真实运行时验收仍未做（deferred）；待办/验收不在插件提供 |
+| Phase 2c · 独立版 App | `~/Projects/Jarvis/workbench-app/`；FastAPI 挂同一套 kanban router + `/api/workbench/*`；契约 metadata 存 `workbench-app/workbench.db`；systemd --user `jarvis-workbench.service`，`127.0.0.1:8787` | 建卡/拖拽/闸门/回执/8 列/主题通过 |
+| P1 · 界面骨架（Epic 1） | 1.1 看板对齐 8 列 → 1.2 契约闸门 → 1.3 待办三区/拖拽 → 1.4 派发回执 | 1.0–1.4 全部 done；38 项 dispatch + 29 项 todo 后端测试、115 项 UI 探针 |
+| P2.1 · 全屏验收（Epic 2） | `GET /workbench/inbox`、`GET /inbox/count`、`POST /workbench/reviews/sweep`、`POST /workbench/verify/{id}`；48h 自动收 | 2.1 done；34 项 verify 后端测试 + 验收探针（`npm run probe:verify`） |
 
-已知限制（P1 一并解决）：固定当前 board、无任务详情、5 秒轮询、今日/排序仅浏览器本地、**看板视图是自建的（不合规，P1 移除）**。
+截至 2026-11-05 的已知限制（与 `ARCHITECTURE-SPINE.md` §9 对齐）：固定当前 board、5 秒轮询；今日/长期固定 `created_at` 倒序，不做栏内排序持久化；插件宿主只显示看板且没有 `/api/workbench/*`（待办/验收只在 8787）；上游 `recompute_ready` 与原生 9119 不经过 ready 闸门；routing / 固化 / 成本 / 执行器 metadata 仍为 deferred。
 
 ---
 
@@ -423,10 +438,12 @@ executor-run --executor claude_code --cwd <dir> --mode write              --budg
 | 批次 | 内容 | 预估 | 完成后能干什么 |
 |---|---|---|---|
 | **P1 界面骨架** | M5 看板对齐原生 → M1 卡契约+闸门 → M2 待办三区+拖拽+回执 | 2.5 天 | 能真派活，界面不再自建看板 |
-| **P2 闭环** | M3 验收全屏模式 → M4 通知 P0（桌面+手机）→ 2d-8 会话追溯入口 | 2 天 | 派出去、跑完、推给你、你验收，闭环成立 |
+| **P2 闭环** | M3 验收全屏模式 → M4 通知 P0（仅桌面，手机不做）→ 2d-8 会话追溯入口 | 2 天 | 派出去、跑完、推给你、你验收，闭环成立 |
 | **P3 变强** | S1 自述三行 → S3 完成即固化 → 2d-3 定时唤醒 → **执行器契约（CAP-14）** | 3 天 | 系统开始自己变强，且换执行器不改流程 |
 | **P4 触发层** | 2d-4 ingest/事件接入 → 2d-5 四配方 → 2d-6 熔断+成本 | 3 天 | 不靠你手建卡也能进活 |
 | **P5 持续** | 2d-2 回执协议、S2 运行画布、S4 验收槽精细化、抽样验收、热力图 | 按需 | 效率与可观测性 |
+
+**进度（2026-11-05）：** P1 已完成（Epic 1：1.0–1.4 全部 done）；P2 进行中——2.1 全屏验收已 done，2.2 P0 通知与 2.3 会话追溯未开工；P3–P5 未开始。
 
 执行器切换（CAP-14）放在 P3 末尾：先落 `bin/executor-run` 与 `executors.json`，再把 coder 从 dsh 切到 `claude_code`。P1/P2 不依赖它。
 
@@ -449,7 +466,7 @@ M2 ──→ S2        画布读同一份状态
 | M5 | 看板对齐原生 | 看板 tab 的 8 列名称/顺序/status 与原生一致；拖拽换列真的改状态；列定义全库只有一处常量 |
 | M1 | 卡契约 + 闸门 | 建一张验收为空的卡 → 拖进流水线被拒并提示 → 补完可派发 |
 | M2 | 待办三区 | 从今日拖一张到流水线 → 3 秒内出现"第 N 位 · 预计 HH:MM"；刷新后位置不丢 |
-| M3 | 验收模式 | 点「待你处理 N」进全屏；按 A 后进已完成；按 R 不填理由不能提交；清空自动退出 |
+| M3 | 验收模式 | 点「验收 N」进全屏；A → done；R 不填理由不能提交，填后写 comment 并回 triage；S 跳过；清空给统计并退出；review 超 48h 自动 done + 留记录 |
 | M4 | 通知 | 构造一张 P0（有子卡被堵）→ 10 秒内收到系统通知；非 P0 不打扰 |
 | 2d-8 | 会话追溯 | 任取一张已完成卡 → 验收页点"打开执行会话"→ 读到该轮完整对话；执行器任务的 `metadata.executor_session_id` 存在且可续 |
 | S1 | 自述三行 | 任一张卡验收页能看到交付/依据/没底三行，且"没底"不为空 |
@@ -516,16 +533,20 @@ dispatcher tick(60s) → 扫 ready（priority DESC, created_at ASC）
 
 ### 10.4 metadata 约定
 
-| 键 | 谁写 | 用途 |
-|---|---|---|
-| `bucket` | 建卡入口 | `today` / `long`，区分两个仓库 |
-| `contract_defaults` | 进 ready 时 | 预算/禁区生效值快照 |
-| `worker_session_id` | Hermes 自动 | 跳转执行会话 |
-| `executor` | worker | `hermes` / `claude_code` / `dsh` / `codex` |
-| `executor_session_id` | worker | 续跑执行器会话 |
-| `hops` | 建子卡时 | 熔断计数（超 8 层拒绝建卡，只随完成清零，不随 unblock 清零） |
-| `solidified` | 验收时 | `{type, path, status: pending\|verified}` |
-| `cost` | 聚合任务 | `{minutes, tokens, usd, by_rule}`，来源 `task_runs` + magpie `usage.jsonl` |
+| 键 | 存储 | 状态 | 谁写 / 用途 |
+|---|---|---|---|
+| `bucket` | `workbench.db` | ✅ 1.3 | 建卡入口；`today` / `long`，区分两个仓库 |
+| `contract` | `workbench.db` | ✅ 1.2/1.3 | 建卡/编辑；`{input, accept, ready?, budget?}`，`ready` 暂无闸门语义 |
+| `contract_defaults` | `workbench.db` | ✅ 1.2 | 派发瞬间；预算/禁区生效值快照（重派按生命周期重拍） |
+| `worker_session_id` | 上游 `kanban.db` `task.metadata` | ✅ Hermes 自动 | 跳转执行会话（2.3 用） |
+| `executor` | — | ⏳ P3 | worker；`hermes` / `claude_code` / `dsh` / `codex` |
+| `executor_session_id` | — | ⏳ P3 | worker；续跑执行器会话 |
+| `hops` | — | ⏳ P4 | 建子卡时；熔断计数（超 8 层拒绝建卡，只随完成清零，不随 unblock 清零） |
+| `solidified` | — | ⏳ P3 | 验收时；`{type, path, status: pending\|verified}` |
+| `cost` | — | ⏳ P3/P4 | 聚合任务；`{minutes, tokens, usd, by_rule}`，来源 `task_runs` + magpie `usage.jsonl` |
+| `classification` | — | ⏳ P4 | 分类器；`{by, model?, label, confidence, cost?}` |
+
+> 2.1 验收不新增 metadata：验收读 `workbench.db` 的 `contract` 与上游 `result` / `latest_summary` / attachments / events / runs；成功收卡写上游 status，拒绝写 comment；48h 自动收以 `author=workbench` 的 comment 留痕。
 
 ---
 
@@ -616,8 +637,8 @@ kanban 的单机约束决定了"工作台挂服务器"性价比低。除非要�
 | 前端 | **React 18 + TypeScript + Vite** | 组件化 + 类型，长期可维护 |
 | 构建 | Vite **lib 模式**，`formats: ['iife']`，产物 `index.js` + `style.css` | 插件宿主用经典 `<script>` 加载（无 `type=module`），必须 IIFE |
 | 样式 | 原生 CSS + 现有 token | 构建只做打包与 CSS 抽取，不引 UI 库 |
-| 状态 | React 本地状态 + `store.ts`（5s 轮询） | 单 board、单人用，不引状态库 |
-| 后端 | FastAPI 保持现状（Hermes 运行时 Python） | 新增端点只加 `/api/workbench/*` |
+| 状态 | React 本地状态（页面内 hook，5s 轮询） | 单 board、单人用，不引状态库；无 `store.ts` |
+| 后端 | FastAPI（`workbench-app/server.py`：挂上游 kanban router + `/api/workbench/*`） | 新增端点只加 `/api/workbench/*` |
 | 测试 | headless Chrome 冒烟脚本（截图 + DOM 断言） | 零新增依赖 |
 | 工程 | `workbench-ui/`（唯一源码）→ 构建产物分发到两个宿主 | 见下方拓扑 |
 

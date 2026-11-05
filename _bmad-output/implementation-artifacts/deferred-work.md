@@ -62,3 +62,19 @@
   summary: 抽取 Board / TodoPage 共享的轮询、toast、拖拽与 loading hook。
   evidence: `Board.tsx` 与 `TodoPage.tsx` 各自实现 5s 轮询、toast 定时器与 HTML5 拖拽；1.4 又在 TodoPage 增加了回执 6s 定时器与常驻 live-region，行为已出现重复维护点（如拖拽高亮/清理、定时器清理），后续做详情抽屉或多视图时应先抽 hook。
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-fullscreen-verify.md`
+  summary: 抽取 `workbench-ui/scripts/` 两个探针重复的 CDP harness 到共享 `scripts/lib/`。
+  evidence: （BH23）`todo-probe.mjs` 与 `verify-probe.mjs` 各自实现浏览器启动/连接/断言/收尾逻辑；2.1 新增第二份副本后，任何探针基础设施改动都要同步两处。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-fullscreen-verify.md`
+  summary: 让 48h 自动收的记录 comment 从 best-effort 变为可核对的终态（失败可重试/可观测）。
+  evidence: （BH5 残留）`_auto_collect_locked` 在 PATCH 落 `done` 后调用 `_auto_collect_comment` 但忽略返回值；comment 连续失败只打 stderr，卡已收但「48h 自动收」审计记录可能缺失，只能靠日志发现。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-fullscreen-verify.md`
+  summary: 处理 `/inbox` 并行详情失败的尾部：让 `failed_ids` 可见/可重试，并与 `/inbox/count` 口径对齐。
+  evidence: （BH3 残留）`inbox()` 在整体 deadline 下跳过失败详情并返回 `failed_ids`，但 `count` 只数成功项，`/inbox/count` 按 `/board` 计数；UI 目前不展示 `failed_ids`，计数与可见队列可能不一致。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-1-fullscreen-verify.md`
+  summary: 决定顶栏计数 1s `/board` 缓存的去留，或在验收动作后主动失效缓存。
+  evidence: （BH2 残留）`INBOX_CACHE_SECONDS=1.0`；verify 成功后 `/inbox/count` 最多 1s 仍显示旧值，验收页与顶栏两个 5s 轮询共用该缓存。当前单用户规模可接受，记录为已知延迟。
+
