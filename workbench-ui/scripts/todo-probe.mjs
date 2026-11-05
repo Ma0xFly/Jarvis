@@ -446,7 +446,7 @@ async function main() {
     const readFlowSegment = (label) =>
       evaluate(`(() => {
         const seg = [...document.querySelectorAll('.wb-todo-seg')].find(
-          (node) => node.querySelector('.wb-todo-seghead span:first-child')?.textContent === ${JSON.stringify(label)},
+          (node) => node.querySelector('.wb-todo-seghead > span:first-child, .wb-todo-seghead > button:first-child')?.textContent === ${JSON.stringify(label)},
         );
         if (!seg) return [];
         return [...seg.querySelectorAll('.wb-todo-flow-card')].map((card) => ({
@@ -594,7 +594,7 @@ async function main() {
     );
 
     const segments = await evaluate(
-      "[...document.querySelectorAll('.wb-todo-seghead span:first-child')].map((node) => node.textContent)",
+      "[...document.querySelectorAll('.wb-todo-seghead > span:first-child, .wb-todo-seghead > button:first-child')].map((node) => node.textContent)",
     );
     check(
       "流水线分段 队列→运行→待收",
@@ -1106,7 +1106,7 @@ async function main() {
     await waitForEval(
       `(() => {
         const seg = [...document.querySelectorAll('.wb-todo-seg')].find(
-          (node) => node.querySelector('.wb-todo-seghead span:first-child')?.textContent === '运行',
+          (node) => node.querySelector('.wb-todo-seghead > span:first-child, .wb-todo-seghead > button:first-child')?.textContent === '运行',
         );
         return Boolean(seg) && [...seg.querySelectorAll('.wb-todo-flow-card')].some(
           (card) => card.textContent.includes('运行竞态卡') &&

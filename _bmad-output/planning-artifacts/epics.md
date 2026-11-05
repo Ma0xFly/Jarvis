@@ -1,18 +1,20 @@
 ---
 status: draft
 stepsCompleted: [1, 2, 3]
+p2StepsCompleted: [1, 2, 3]
 inputDocuments:
   - _bmad-output/specs/spec-jarvis-workbench/SPEC.md
   - _bmad-output/specs/spec-jarvis-workbench/ARCHITECTURE-SPINE.md
   - _bmad-output/specs/spec-jarvis-workbench/PLAN.md
-scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
+  - sketches/006-final/index.html
+scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 ---
 
 # Jarvis 人机工作台 - Epic Breakdown
 
 ## Overview
 
-把 `SPEC.md` 的 13 项能力拆成可独立派发的 story。本文件当前只覆盖 **P1（界面骨架，约 2.5 天）**：让工作台**能真派活**，并把它与 Hermes 原生看板的关系摆正。P2–P4 的 story 在对应批次开工前追加。
+把 `SPEC.md` 的 13 项能力拆成可独立派发的 story。**P1（界面骨架）已完成**（Epic 1，1.0–1.4 全部 done）；本文件正在追加 **P2（闭环）**：全屏验收（CAP-3）、P0 通知（CAP-4）、会话追溯（CAP-12）。P3–P5 的 story 在对应批次开工前追加。
 
 ## Requirements Inventory
 
@@ -29,6 +31,10 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 | FR-7 | 看板 tab 以自有前端渲染，但 8 列名/序/status 与原生逐项对齐，列定义单点 | CAP-5 |
 | FR-8 | 今日/长期用 `metadata.bucket` 区分，不占用 `todo` 状态 | CAP-2 |
 | FR-9 | 派发遇到未完成 parent 返回 409，前端提示"已转 todo" | CAP-2 |
+| FR-10 | 全屏验收：从右上角计数或待收行进全屏，逐张展示产出物/验收标准/本轮运行信息；A 收 / R 不收 / S 跳过 / Esc 退出；队列清空自动退出并给本批统计；review 超 48h 按规则静默通过并记录 | CAP-3 |
+| FR-11 | 验收动作：accept → done；reject 写理由 comment 并回 triage；skip 保留；走 `POST /api/workbench/verify/{task_id}` | CAP-3 |
+| FR-12 | P0 通知：会堵下游的卡 10 秒内系统通知 + 右上角常驻/置顶；非 P0 不打扰；同一事件 30 分钟只升级一次；P1 攒批、P2 日报；通知内可收/不收/10 分钟后再提醒；倒计时代替未读；验收槽容量 3 | CAP-4 |
+| FR-13 | 会话追溯：验收/已完成卡可「打开执行会话」，读 `worker_session_id` / `executor_session_id`，看到该轮完整对话并可用执行器续跑参数接上 | CAP-12 |
 
 ### NonFunctional Requirements
 
@@ -39,18 +45,28 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 | NFR-3 | 首屏 ≤ 1s，轮询 5s（不引入 WebSocket） |
 | NFR-4 | 改动可从 git 以外的方式回滚：源码只改 `workbench-ui/` 与 `workbench-app/`，插件 `dashboard/` 与 `web/` 是构建产物 |
 | NFR-5 | 服务重启后 `/healthz` 仍 200，不破坏正在跑的任务 |
+| NFR-6 | P0 只走桌面系统通知，手机通道不做（接口预留） |
+| NFR-7 | 验收/通知/会话均 5s 轮询，不引入 WebSocket；首屏 ≤ 1s |
+| NFR-8 | 上游零改动；`state.db` 只读反查，不直接写 `kanban.db`；新端点只加在 `/api/workbench/*` |
 
 ### Additional Requirements
 
 - 前端唯一源码在 `workbench-ui/src/`；改完 `npm run build` 分发到插件 dashboard 与 `workbench-app/web/`。旧 `sync-ui.sh` 与 `web/app.js` 流程已作废。
 - 自定义后端端点只允许加在 `workbench-app/server.py` 的 `/api/workbench/*`。
+- P2 端点：`GET /api/workbench/inbox`（review + P0 blocked 聚合）、`POST /api/workbench/verify/{task_id}`（accept/reject/skip）、会话追溯只读 `state.db` 与任务 metadata。
+- P2 规则：review 超 48h 自动收并记录；验收槽容量 3，兄弟卡成束；桌面通知走系统通知（notify-send/桌面环境），手机通道不做。
+- 会话追溯优先读 `task.metadata.worker_session_id`；执行器卡读 `executor_session_id`，dsh 续跑参数由执行器契约提供。
 
 ### UX Design Requirements
 
-- 三列宽度：流水线固定 302px，今日/长期等分剩余。
-- 流水线面板底色比仓库深一档（凹槽 vs 平面），视觉分区即语义分区。
-- 拖拽中整列高亮；被拒时卡片抖动 300ms + 红字提示。
-- 明暗双主题全部走 `theme.css` 的 token，不硬编码色值。
+- UX-DR1：三列宽度：流水线固定 302px，今日/长期等分剩余。
+- UX-DR2：流水线面板底色比仓库深一档（凹槽 vs 平面），视觉分区即语义分区。
+- UX-DR3：拖拽中整列高亮；被拒时卡片抖动 300ms + 红字提示。
+- UX-DR4：明暗双主题全部走 `theme.css` 的 token，不硬编码色值。
+- UX-DR5：验收全屏布局——顶栏「验收 1/3 + 进度 + 退出」、左侧产出物样张（可翻页）、右侧验收标准 + 自述/运行信息、底部 `A/R/S`。
+- UX-DR6：键盘优先（A/R/S/Esc）；拒绝理由为必填输入，不填不能提交。
+- UX-DR7：通知内可直接操作（收/不收/10 分钟后再提醒）；右上角 P0 常驻/置顶；review 卡显示「还有 42h 自动收」倒计时。
+- UX-DR8：验收槽固定容量 3；同一次 decompose 的兄弟卡成束。
 
 ### FR Coverage Map
 
@@ -61,12 +77,16 @@ scope: P1（界面骨架）—— 后续批次 P2–P4 见文末预告
 | 1.2 契约字段与派发闸门 | FR-2(部分) FR-4 FR-5 FR-8 FR-9 |
 | 1.3 待办三区与拖拽 | FR-1 FR-2 FR-3 FR-8 |
 | 1.4 派发回执 | FR-6 |
+| 2.1 全屏验收与验收动作 | FR-10 FR-11 |
+| 2.2 P0 通知与通知操作 | FR-12 |
+| 2.3 会话追溯入口 | FR-13 |
 
 ## Epic List
 
 | Epic | 标题 | 价值 |
 |---|---|---|
 | 1 | 派发骨架（P1） | 工作台第一次能真派活，且不再维护一套自建看板 |
+| 2 | 闭环（P2） | 收得掉、叫得应、追得回 |
 
 ## Epic 1: 派发骨架（P1）
 
@@ -326,6 +346,38 @@ So that 我知道这次点击生效了，不会因为没反馈而连点三次。
 **不做**：不做进度条动画；不做预估模型训练（先用固定 7 分钟/张的占位估算，写在 `defaults.json`）。
 
 ---
+
+## Epic 2: 闭环（P2）
+
+让跑完的活能在全屏验收里逐张判断，P0 卡主动叫人，任何一张卡都能跳回执行会话。
+
+### Story 2.1: 全屏验收与验收动作
+
+As a 工作台用户，
+I want 在全屏里逐张收掉 `review` 卡、拒绝时留下理由，
+So that 跑完的活有明确结论，队列不会自堵。
+
+**改动文件**：`workbench-app/server.py`、`workbench-ui/src/verify/`、`workbench-ui/src/api/workbench.ts`、`workbench-ui/src/App.tsx`、`workbench-ui/src/todo/TodoPage.tsx`、`workbench-ui/src/styles/verify.css`。
+
+**Acceptance Criteria：** 见 `_bmad-output/implementation-artifacts/spec-2-1-fullscreen-verify.md`（已实现；34 项后端测试 + 31 项验收探针）。
+
+**不做**：P0 通知（2.2）、会话查看器（2.3）、完成即固化闸门（P3）。
+
+### Story 2.2: P0 通知与通知操作
+
+As a 工作台用户，
+I want 只有会堵下游的卡主动打扰我，且通知里就能处理，
+So that 不被无关提醒淹没，也不漏掉真正卡住的事。
+
+**Acceptance Criteria：** 待 2.2 的 spec 细化（P0 判定、系统通知、30 分钟只升级一次、通知内收/不收/稍后）。
+
+### Story 2.3: 会话追溯入口
+
+As a 工作台用户，
+I want 从验收/已完成卡直接打开该轮执行会话，
+So that 判断和排障不必去翻日志。
+
+**Acceptance Criteria：** 待 2.3 的 spec 细化（`worker_session_id` 路径优先，`executor_session_id` 属 Epic 3）。
 
 ## 后续 Epic 预告（暂不拆 story）
 

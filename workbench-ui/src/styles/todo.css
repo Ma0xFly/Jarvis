@@ -144,6 +144,29 @@
 .wb-todo-flow-card .wb-todo-accept:hover {
   background: transparent;
 }
+/* 待收行是验收入口：只有 review 段可点进全屏验收 */
+.wb-todo-flow-card.clickable {
+  cursor: pointer;
+}
+.wb-todo-flow-card.clickable:hover {
+  background: var(--wb-hover);
+}
+.wb-todo-flow-card.clickable:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: -2px;
+}
+.wb-todo-seghead-open {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+}
+.wb-todo-seghead-open:hover {
+  color: var(--wb-fg);
+  text-decoration: underline;
+}
 
 /* 回执槽位：始终预留高度，回执出现/消失不会重排三列。 */
 .wb-todo-receipt-slot {

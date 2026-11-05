@@ -64,7 +64,12 @@ function newIdempotencyKey(): string {
   return "wb-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
 }
 
-export default function TodoPage(): React.ReactElement {
+interface TodoPageProps {
+  /** 独立版入口：打开全屏验收；带 taskId 时先看这张卡。 */
+  onVerify?: (taskId?: string) => void;
+}
+
+export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElement {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [metadataById, setMetadataById] = useState<Record<string, TaskMetadata>>({});
   const [err, setErr] = useState("");
@@ -456,30 +461,62 @@ export default function TodoPage(): React.ReactElement {
             <span className="wb-todo-count">{flowCount}</span>
           </div>
 
-          {flowLists.map((segment) => (
-            <div className="wb-todo-seg" key={segment.key}>
-              <div className="wb-todo-seghead">
-                <span>{segment.label}</span>
-                <span>{segment.cards.length}</span>
+          {flowLists.map((segment) => {
+            const openVerify = segment.key === "review" ? onVerify : undefined;
+            return (
+              <div className="wb-todo-seg" key={segment.key}>
+                <div className="wb-todo-seghead">
+                  {openVerify ? (
+                    <button
+                      className="wb-todo-seghead-open"
+                      type="button"
+                      onClick={() => openVerify()}
+                      title="进入全屏验收"
+                    >
+                      {segment.label}
+                    </button>
+                  ) : (
+                    <span>{segment.label}</span>
+                  )}
+                  <span>{segment.cards.length}</span>
+                </div>
+                {segment.cards.map((task, index) => {
+                  const accept = acceptText(task);
+                  // 位次是派生值：ready 段内按 /board 顺序 1-based，每次渲染重算。
+                  const position = segment.key === "ready" ? index + 1 : 0;
+                  const openThis = openVerify ? () => openVerify(task.id) : undefined;
+                  return (
+                    <div
+                      className={"wb-todo-card wb-todo-flow-card" + (openThis ? " clickable" : "")}
+                      key={task.id}
+                      role={openThis ? "button" : undefined}
+                      tabIndex={openThis ? 0 : undefined}
+                      title={openThis ? "打开验收" : task.title}
+                      onClick={openThis}
+                      onKeyDown={
+                        openThis
+                          ? (event) => {
+                              if (event.key === "Enter" || event.key === " ") {
+                                event.preventDefault();
+                                openThis();
+                              }
+                            }
+                          : undefined
+                      }
+                    >
+                      <div className="wb-todo-flow-head">
+                        <span className="wb-todo-title">{task.title}</span>
+                        <PositionBadge status={task.status} position={position} />
+                      </div>
+                      <div className={"wb-todo-accept" + (accept ? "" : " empty")}>
+                        {accept || "未写验收"}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
-              {segment.cards.map((task, index) => {
-                const accept = acceptText(task);
-                // 位次是派生值：ready 段内按 /board 顺序 1-based，每次渲染重算。
-                const position = segment.key === "ready" ? index + 1 : 0;
-                return (
-                  <div className="wb-todo-card wb-todo-flow-card" key={task.id}>
-                    <div className="wb-todo-flow-head">
-                      <span className="wb-todo-title">{task.title}</span>
-                      <PositionBadge status={task.status} position={position} />
-                    </div>
-                    <div className={"wb-todo-accept" + (accept ? "" : " empty")}>
-                      {accept || "未写验收"}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ))}
+            );
+          })}
 
           {flowCount === 0 ? <div className="wb-todo-dropempty">拖到这里派发</div> : null}
         </section>

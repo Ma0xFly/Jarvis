@@ -59,7 +59,14 @@ export type WorkbenchErrorCode =
   | "dispatch_failed"
   | "dispatch_timeout"
   | "create_failed"
-  | "metadata_failed";
+  | "metadata_failed"
+  | "not_in_review"
+  | "reason_required"
+  | "reason_too_long"
+  | "invalid_action"
+  | "verify_failed"
+  | "inbox_failed"
+  | "sweep_failed";
 
 const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "missing_acceptance",
@@ -84,6 +91,13 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "dispatch_timeout",
   "create_failed",
   "metadata_failed",
+  "not_in_review",
+  "reason_required",
+  "reason_too_long",
+  "invalid_action",
+  "verify_failed",
+  "inbox_failed",
+  "sweep_failed",
 ];
 
 /** 后端错误码优先；宿主 SDK 只给 message 时按文本兜底，最后按 HTTP 状态兜底 */
@@ -139,7 +153,13 @@ function isWorkbenchCode(value: unknown): value is WorkbenchErrorCode {
   return typeof value === "string" && (ERROR_CODES as readonly string[]).includes(value);
 }
 
-type ErrorContext = "dispatch" | "create" | "metadata";
+type ErrorContext =
+  | "dispatch"
+  | "create"
+  | "metadata"
+  | "verify"
+  | "inbox"
+  | "sweep";
 
 /**
  * HTTP 状态兜底只在没有后端 error 码时使用。400 的含义随调用而变：
@@ -151,22 +171,26 @@ function fallbackCode(status: number | undefined, context: ErrorContext): Workbe
       return context === "dispatch" ? "missing_acceptance" : "invalid_request";
     case 404:
       return "not_found";
+    case 409:
+      return "not_in_review";
     case 500:
-      return context === "dispatch"
-        ? "invalid_defaults"
-        : context === "create"
-          ? "create_failed"
-          : "metadata_failed";
+      if (context === "dispatch") return "invalid_defaults";
+      if (context === "create") return "create_failed";
+      if (context === "verify") return "verify_failed";
+      if (context === "inbox") return "inbox_failed";
+      if (context === "sweep") return "sweep_failed";
+      return "metadata_failed";
     case 502:
       return "upstream_unavailable";
     case 503:
       return "metadata_unavailable";
     default:
-      return context === "dispatch"
-        ? "dispatch_failed"
-        : context === "create"
-          ? "create_failed"
-          : "metadata_failed";
+      if (context === "dispatch") return "dispatch_failed";
+      if (context === "create") return "create_failed";
+      if (context === "verify") return "verify_failed";
+      if (context === "inbox") return "inbox_failed";
+      if (context === "sweep") return "sweep_failed";
+      return "metadata_failed";
   }
 }
 
@@ -359,4 +383,181 @@ export function mergeTaskMetadata<T extends { id: string }>(
         : patch;
     return { ...task, metadata: merged };
   });
+}
+
+export interface AutoCollectError {
+  message: string;
+  attempts?: number;
+  retry_in_seconds?: number;
+}
+
+/** 验收队列的一张 review 卡；`review_age_seconds` 缺失 = 无 review_requested 事件。 */
+export interface InboxTask {
+  id: string;
+  title: string;
+  status: string;
+  assignee?: string | null;
+  priority?: number | null;
+  created_at?: number | null;
+  completed_at?: number | null;
+  result?: string | null;
+  latest_summary?: string | null;
+  metadata: TaskMetadata;
+  review_requested_at?: number | null;
+  review_age_seconds?: number | null;
+  /** 已到自动收时限；sweep 端点是唯一的写入口。 */
+  auto_collect_due?: boolean;
+  /** PATCH 失败后的退避信息；窗口内 sweeper 不再重试。 */
+  auto_collect_error?: AutoCollectError | null;
+}
+
+export interface InboxResult {
+  ok: true;
+  tasks: InboxTask[];
+  count: number;
+  /** 自动收窗口（秒），后端权威值。 */
+  review_ttl_seconds: number;
+  /** 详情读取失败被跳过的卡；队列本身仍返回 200。 */
+  failed_ids: string[];
+}
+
+export interface InboxCountResult {
+  ok: true;
+  count: number;
+  review_ttl_seconds: number;
+}
+
+export interface SweepResult {
+  ok: true;
+  collected: number;
+  failed: number;
+  skipped: number;
+  collected_ids: string[];
+  failed_ids: string[];
+}
+
+export type VerifyAction = "accept" | "reject" | "skip";
+
+export interface VerifyResult {
+  ok: true;
+  action: VerifyAction;
+  status: string;
+  comment_written: boolean;
+}
+
+/** 与服务端 MAX_REJECT_REASON_CHARS 保持一致。 */
+export const MAX_REJECT_REASON_CHARS = 2000;
+
+/**
+ * 验收队列：pure read。48h 自动收由 POST /reviews/sweep 显式触发，
+ * 不在轮询里写卡。
+ */
+export async function getInbox(): Promise<InboxResult> {
+  try {
+    const data = (await api(WORKBENCH + "/inbox")) as Partial<InboxResult> | null;
+    if (!data || data.ok !== true || !Array.isArray(data.tasks)) {
+      throw new WorkbenchError("inbox_failed", "验收队列响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      tasks: data.tasks as InboxTask[],
+      count: typeof data.count === "number" ? data.count : data.tasks.length,
+      review_ttl_seconds:
+        typeof data.review_ttl_seconds === "number" ? data.review_ttl_seconds : 0,
+      failed_ids: Array.isArray(data.failed_ids) ? data.failed_ids : [],
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "inbox");
+  }
+}
+
+/** 右上角计数专用：只读 board，不拉每张卡的详情。 */
+export async function getInboxCount(): Promise<InboxCountResult> {
+  try {
+    const data = (await api(WORKBENCH + "/inbox/count")) as Partial<InboxCountResult> | null;
+    if (!data || data.ok !== true || typeof data.count !== "number") {
+      throw new WorkbenchError("inbox_failed", "验收计数响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      count: data.count,
+      review_ttl_seconds:
+        typeof data.review_ttl_seconds === "number" ? data.review_ttl_seconds : 0,
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "inbox");
+  }
+}
+
+/** 显式触发 48h 自动收（POST 带同源/JSON 守卫）；失败不阻塞队列读取。 */
+export async function sweepReviews(): Promise<SweepResult> {
+  try {
+    const data = (await api(WORKBENCH + "/reviews/sweep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    })) as Partial<SweepResult> | null;
+    if (!data || data.ok !== true) {
+      throw new WorkbenchError("sweep_failed", "自动收响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      collected: typeof data.collected === "number" ? data.collected : 0,
+      failed: typeof data.failed === "number" ? data.failed : 0,
+      skipped: typeof data.skipped === "number" ? data.skipped : 0,
+      collected_ids: Array.isArray(data.collected_ids) ? data.collected_ids : [],
+      failed_ids: Array.isArray(data.failed_ids) ? data.failed_ids : [],
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "sweep");
+  }
+}
+
+/**
+ * 验收动作统一入口：accept → done；reject → comment + triage；skip 不改状态。
+ * reject 的前端预检在发请求前拦下空理由；后端仍会再校验一次。
+ */
+export async function verifyTask(
+  taskId: string,
+  action: VerifyAction,
+  reason?: string,
+): Promise<VerifyResult> {
+  if (!taskId || !taskId.trim()) {
+    throw new WorkbenchError("verify_failed", "缺少任务 id");
+  }
+  const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+  if (action === "reject" && !trimmedReason) {
+    throw new WorkbenchError("reason_required", "不收必须写理由");
+  }
+  if (action === "reject" && trimmedReason.length > MAX_REJECT_REASON_CHARS) {
+    throw new WorkbenchError(
+      "reason_too_long",
+      `理由最多 ${MAX_REJECT_REASON_CHARS} 字，请精简后再提交`,
+    );
+  }
+  const payload: Record<string, unknown> = { action };
+  if (action === "reject") payload.reason = trimmedReason;
+  try {
+    const data = (await api(WORKBENCH + "/verify/" + encodeURIComponent(taskId), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })) as {
+      ok?: unknown;
+      action?: unknown;
+      status?: unknown;
+      comment_written?: unknown;
+    } | null;
+    if (!data || data.ok !== true) {
+      throw new WorkbenchError("verify_failed", "验收响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      action: (data.action as VerifyAction) || action,
+      status: typeof data.status === "string" ? data.status : "",
+      comment_written: data.comment_written === true,
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "verify");
+  }
 }

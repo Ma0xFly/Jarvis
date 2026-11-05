@@ -18,6 +18,7 @@ Run with the Hermes runtime Python (see run.sh). Binds loopback by default.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import http.client
 import importlib.util
 import json
@@ -78,6 +79,24 @@ MAX_DENY_PATHS = 100
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_IDEMPOTENCY_KEY = 128
 
+# Verification (Story 2.1). A review card is auto-accepted after 48h without a
+# human decision so the review lane cannot stay clogged; the background sweeper
+# runs every 5 minutes and every inbox read is also a fallback sweep.
+REVIEW_STATUS = "review"
+REVIEW_TTL_SECONDS = 48 * 60 * 60
+REVIEW_SWEEP_SECONDS = 5 * 60
+REVIEW_BACKOFF_SECONDS = 5 * 60
+REVIEW_BUDGET_SECONDS = 5.0
+INBOX_BUDGET_SECONDS = 3.0
+INBOX_CACHE_SECONDS = 1.0
+MAX_INBOX_WORKERS = 8
+VERIFY_ACTIONS = ("accept", "reject", "skip")
+ACCEPT_SUMMARY = "验收通过"
+AUTO_COLLECT_COMMENT = "48h 自动收"
+AUTO_COLLECT_AUDIT_SUMMARY = "48h 自动收（worker 自述保留在 review_requested 事件/run）"
+MAX_REJECT_REASON_CHARS = 2000
+VERIFY_AUTHOR = "workbench"
+
 
 class MetadataUnavailable(RuntimeError):
     """The workbench metadata DB cannot be opened or queried."""
@@ -89,6 +108,10 @@ class DefaultsError(ValueError):
 
 class UpstreamUnavailable(RuntimeError):
     """A loopback kanban REST call failed or exceeded the dispatch budget."""
+
+
+class TaskNotFound(UpstreamUnavailable):
+    """``GET /tasks/{id}`` returned 404 for a card we expected to exist."""
 
 
 # ---------------------------------------------------------------------------
@@ -578,10 +601,30 @@ class UpstreamResult:
 class WorkbenchService:
     """Dispatch/gate/metadata logic on top of the public loopback REST API."""
 
-    def __init__(self, base_url: str, store: MetadataStore, defaults_path: Path) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        store: MetadataStore,
+        defaults_path: Path,
+        *,
+        review_ttl_seconds: int = REVIEW_TTL_SECONDS,
+        auto_collect_backoff_seconds: float = REVIEW_BACKOFF_SECONDS,
+        inbox_cache_seconds: float = INBOX_CACHE_SECONDS,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.store = store
         self.defaults_path = Path(defaults_path)
+        self.review_ttl_seconds = int(review_ttl_seconds)
+        self.auto_collect_backoff_seconds = float(auto_collect_backoff_seconds)
+        self.inbox_cache_seconds = float(inbox_cache_seconds)
+        # Header counts share one board read: a short cache plus a lock that
+        # also acts as the in-flight guard for concurrent count/inbox calls.
+        self._review_ids_lock = threading.Lock()
+        self._review_ids_cache: Optional[tuple[float, list[str]]] = None
+        # Auto-collect failures are kept per task so an inbox read can expose
+        # them and the sweeper backs off instead of hammering a broken upstream.
+        self._auto_collect_failures: dict[str, dict[str, Any]] = {}
+        self._auto_collect_guard = threading.Lock()
         # Loopback calls made by this service carry an in-process token. The
         # middleware trusts it and skips re-gating: dispatch's own ready PATCH
         # already passed the gate before it was sent, and re-entering the gate
@@ -687,6 +730,114 @@ class WorkbenchService:
             payload={"status": status},
             deadline=deadline,
         )
+
+    def _patch_task(
+        self, task_id: str, payload: dict[str, Any], deadline: float
+    ) -> UpstreamResult:
+        return self._request(
+            "PATCH",
+            "/api/plugins/kanban/tasks/" + urlparse.quote(task_id, safe=""),
+            payload=payload,
+            deadline=deadline,
+        )
+
+    def _post_comment(self, task_id: str, body: str, deadline: float) -> UpstreamResult:
+        return self._request(
+            "POST",
+            "/api/plugins/kanban/tasks/"
+            + urlparse.quote(task_id, safe="")
+            + "/comments",
+            payload={"body": body, "author": VERIFY_AUTHOR},
+            deadline=deadline,
+        )
+
+    def _task_detail(self, task_id: str, deadline: float) -> dict[str, Any]:
+        """``GET /tasks/{id}`` with the event/comment/attachment/run detail.
+
+        The verify page and the 48h sweeper both read the review handoff from
+        here; the inbox only needs the events for the review clock.
+        """
+        res = self._request(
+            "GET",
+            "/api/plugins/kanban/tasks/" + urlparse.quote(task_id, safe=""),
+            deadline=deadline,
+        )
+        if res.status == 404:
+            raise TaskNotFound("task not found")
+        if res.status != 200 or not isinstance(res.data, dict):
+            raise UpstreamUnavailable("task detail unavailable")
+        task = res.data.get("task")
+        if not isinstance(task, dict):
+            raise UpstreamUnavailable("task detail unavailable")
+        return res.data
+
+    @staticmethod
+    def _latest_review_requested_event(detail: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Newest ``review_requested`` event, or None.
+
+        The newest event starts the current review round: it resets the 48h
+        clock and scopes the auto-collect record. Cards without that event have
+        no trustworthy review clock, so they are never auto-collected.
+        """
+        events = detail.get("events")
+        if not isinstance(events, list):
+            return None
+        latest: Optional[dict[str, Any]] = None
+        latest_stamp: Optional[int] = None
+        for event in events:
+            if not isinstance(event, dict) or event.get("kind") != "review_requested":
+                continue
+            created = event.get("created_at")
+            if not isinstance(created, (int, float)) or isinstance(created, bool):
+                continue
+            stamp = int(created)
+            if latest is None or latest_stamp is None or stamp >= latest_stamp:
+                latest = event
+                latest_stamp = stamp
+        return latest
+
+    @classmethod
+    def _latest_review_requested_at(cls, detail: dict[str, Any]) -> Optional[int]:
+        event = cls._latest_review_requested_event(detail)
+        if event is None:
+            return None
+        created = event.get("created_at")
+        return int(created) if isinstance(created, (int, float)) else None
+
+    @staticmethod
+    def _review_round_marker(event: dict[str, Any]) -> str:
+        """Stable marker for one review round: event id, else its timestamp."""
+        event_id = event.get("id")
+        if isinstance(event_id, int) and not isinstance(event_id, bool):
+            return f"review:{event_id}"
+        created = event.get("created_at")
+        return f"review:at:{int(created) if isinstance(created, (int, float)) else 0}"
+
+    @classmethod
+    def _worker_summary(cls, detail: dict[str, Any]) -> Optional[str]:
+        """The worker's handoff summary that auto-collect must not overwrite."""
+        task = cls._detail_task(detail)
+        summary = task.get("latest_summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary.strip()
+        event = cls._latest_review_requested_event(detail)
+        payload = event.get("payload") if isinstance(event, dict) else None
+        if isinstance(payload, dict):
+            value = payload.get("summary")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    @staticmethod
+    def _detail_task(detail: dict[str, Any]) -> dict[str, Any]:
+        task = detail.get("task")
+        return task if isinstance(task, dict) else {}
+
+    @staticmethod
+    def _review_age_seconds(review_at: Optional[int], now: float) -> Optional[int]:
+        if review_at is None:
+            return None
+        return max(0, int(now - review_at))
 
     def _board(self, deadline: float) -> dict[str, Any]:
         # ``include_archived=true`` exposes archived cards and gives this read a
@@ -905,6 +1056,600 @@ class WorkbenchService:
             return 200, self.store.get_many(task_ids)
         except MetadataUnavailable:
             return self._fail(503, "metadata_unavailable")
+
+    # -- verification inbox / 48h sweeper ---------------------------------
+
+    def _review_ids_on_board(self, deadline: float) -> list[str]:
+        board = self._board(deadline)
+        ids: list[str] = []
+        for column in board.get("columns") or []:
+            if not isinstance(column, dict):
+                continue
+            column_status = column.get("name")
+            for card in column.get("tasks") or []:
+                if not isinstance(card, dict):
+                    continue
+                task_id = card.get("id")
+                status = card.get("status") or column_status
+                if status == REVIEW_STATUS and isinstance(task_id, str) and task_id:
+                    ids.append(task_id)
+        return ids
+
+    def _invalidate_review_cache(self) -> None:
+        with self._review_ids_lock:
+            self._review_ids_cache = None
+
+    def _review_ids_cached(self) -> list[str]:
+        """Short cache + in-flight guard for header counts and inbox reads.
+
+        Holding the lock across the board call means concurrent 5s polls from
+        the App and the verify page share one upstream read instead of stacking
+        up. The cache is intentionally tiny (1s) so a new review card shows up
+        on the next poll.
+        """
+        with self._review_ids_lock:
+            now = time.monotonic()
+            cached = self._review_ids_cache
+            if (
+                cached is not None
+                and self.inbox_cache_seconds > 0
+                and now - cached[0] <= self.inbox_cache_seconds
+            ):
+                return list(cached[1])
+            ids = self._review_ids_on_board(now + INBOX_BUDGET_SECONDS)
+            if self.inbox_cache_seconds > 0:
+                self._review_ids_cache = (now, list(ids))
+            return ids
+
+    def _auto_collect_error_for(self, task_id: str) -> Optional[dict[str, Any]]:
+        """Active auto-collect failure/backoff for an inbox item, if any."""
+        now = time.monotonic()
+        with self._auto_collect_guard:
+            entry = self._auto_collect_failures.get(task_id)
+            if entry is None:
+                return None
+            remaining = float(entry["until"]) - now
+            if remaining <= 0:
+                return None
+            return {
+                "message": entry["message"],
+                "attempts": entry["attempts"],
+                "retry_in_seconds": max(0, int(math.ceil(remaining))),
+            }
+
+    def _in_auto_collect_backoff(self, task_id: str) -> bool:
+        now = time.monotonic()
+        with self._auto_collect_guard:
+            entry = self._auto_collect_failures.get(task_id)
+            if entry is None:
+                return False
+            if float(entry["until"]) <= now:
+                self._auto_collect_failures.pop(task_id, None)
+                return False
+            return True
+
+    def _record_auto_collect_failure(self, task_id: str, message: str) -> None:
+        with self._auto_collect_guard:
+            previous = self._auto_collect_failures.get(task_id)
+            attempts = int(previous["attempts"]) + 1 if previous else 1
+            self._auto_collect_failures[task_id] = {
+                "message": str(message)[:500],
+                "attempts": attempts,
+                "until": time.monotonic() + max(0.0, self.auto_collect_backoff_seconds),
+            }
+
+    def _clear_auto_collect_failure(self, task_id: str) -> None:
+        with self._auto_collect_guard:
+            self._auto_collect_failures.pop(task_id, None)
+
+    def _inbox_item(
+        self, task_id: str, detail: dict[str, Any], metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        task = self._detail_task(detail)
+        review_at = self._latest_review_requested_at(detail)
+        age = self._review_age_seconds(review_at, time.time())
+        return {
+            "id": task_id,
+            "title": task.get("title") if isinstance(task.get("title"), str) else "",
+            "status": task.get("status"),
+            "assignee": task.get("assignee"),
+            "priority": task.get("priority"),
+            "created_at": task.get("created_at"),
+            "completed_at": task.get("completed_at"),
+            "result": task.get("result"),
+            "latest_summary": task.get("latest_summary"),
+            "metadata": metadata,
+            "review_requested_at": review_at,
+            "review_age_seconds": age,
+            "auto_collect_due": age is not None and age >= self.review_ttl_seconds,
+            "auto_collect_error": self._auto_collect_error_for(task_id),
+        }
+
+    def _read_status(
+        self, task_id: str
+    ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+        """Fresh status read used after a failed auto-collect PATCH."""
+        try:
+            detail = self._task_detail(task_id, time.monotonic() + REVIEW_BUDGET_SECONDS)
+        except TaskNotFound:
+            return "missing", None
+        except UpstreamUnavailable:
+            return None, None
+        task = self._detail_task(detail)
+        status = task.get("status")
+        return (status if isinstance(status, str) else None), detail
+
+    @staticmethod
+    def _has_auto_record(detail: dict[str, Any], marker: str) -> bool:
+        comments = detail.get("comments")
+        return isinstance(comments, list) and any(
+            isinstance(comment, dict)
+            and comment.get("author") == VERIFY_AUTHOR
+            and isinstance(comment.get("body"), str)
+            and comment["body"].startswith(AUTO_COLLECT_COMMENT)
+            and marker in comment["body"]
+            for comment in comments
+        )
+
+    def _auto_collect_comment(
+        self, task_id: str, detail: dict[str, Any], event: dict[str, Any]
+    ) -> bool:
+        """Write the 48h record after the card landed ``done``.
+
+        The marker scopes idempotency to this review round, so a re-review that
+        becomes overdue again writes a new record instead of being suppressed
+        by the previous round's comment.
+        """
+        marker = self._review_round_marker(event)
+        body = f"{AUTO_COLLECT_COMMENT}（{marker}）"
+        if self._has_auto_record(detail, marker):
+            return True
+        for attempt in range(2):
+            try:
+                posted = self._post_comment(
+                    task_id, body, time.monotonic() + REVIEW_BUDGET_SECONDS
+                )
+            except UpstreamUnavailable as exc:
+                if attempt == 1:
+                    print(
+                        f"workbench: auto-collect comment failed for {task_id}: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return False
+                # A lost response may already have written the comment; re-read
+                # before retrying so the record cannot be duplicated.
+                try:
+                    fresh = self._task_detail(
+                        task_id, time.monotonic() + REVIEW_BUDGET_SECONDS
+                    )
+                    if self._has_auto_record(fresh, marker):
+                        return True
+                except UpstreamUnavailable:
+                    pass
+                continue
+            if posted.status == 200:
+                return True
+            if attempt == 1:
+                print(
+                    f"workbench: auto-collect comment failed for {task_id}: {posted.status}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+            try:
+                fresh = self._task_detail(
+                    task_id, time.monotonic() + REVIEW_BUDGET_SECONDS
+                )
+                if self._has_auto_record(fresh, marker):
+                    return True
+            except UpstreamUnavailable:
+                pass
+        return False
+
+    def _auto_collect_locked(
+        self, task_id: str, detail: dict[str, Any]
+    ) -> tuple[str, Optional[str]]:
+        """Auto-accept one overdue review card. Caller holds the task lock.
+
+        Returns ``(outcome, error)`` where outcome is ``collected``,
+        ``skipped`` (not due / moved elsewhere / no review event) or
+        ``failed`` (PATCH refused/failed; a backoff is recorded). The record
+        comment is written only after the PATCH actually lands ``done``.
+        """
+        task = self._detail_task(detail)
+        if task.get("status") != REVIEW_STATUS:
+            return "skipped", None
+        event = self._latest_review_requested_event(detail)
+        if event is None:
+            return "skipped", None
+        review_at = self._latest_review_requested_at(detail)
+        if review_at is None or time.time() - review_at < self.review_ttl_seconds:
+            return "skipped", None
+
+        def landed_done(result: UpstreamResult) -> bool:
+            if result.status != 200:
+                return False
+            landed = self._detail_task(result.data) if isinstance(result.data, dict) else {}
+            return landed.get("status") == "done"
+
+        # Try to keep the worker's handoff as the latest summary. This upstream
+        # synthesizes "review approved" when a review completion omits the
+        # summary, so the worker summary is re-sent when one exists; with no
+        # worker summary the completion is summary-less.
+        worker_summary = self._worker_summary(detail)
+        first_payload: dict[str, Any] = {"status": "done"}
+        if worker_summary:
+            first_payload["summary"] = worker_summary
+        try:
+            patched = self._patch_task(
+                task_id, first_payload, time.monotonic() + REVIEW_BUDGET_SECONDS
+            )
+        except UpstreamUnavailable as exc:
+            self._record_auto_collect_failure(task_id, f"PATCH failed: {exc}")
+            return "failed", str(exc)
+
+        if landed_done(patched):
+            self._clear_auto_collect_failure(task_id)
+            self._auto_collect_comment(task_id, detail, event)
+            return "collected", None
+
+        status_after, detail_after = self._read_status(task_id)
+        if status_after in (None, "done", "missing"):
+            # Unknown read, someone else completed it, or it disappeared: do
+            # not fabricate a collection record.
+            if status_after == "done" or status_after == "missing":
+                self._clear_auto_collect_failure(task_id)
+                return "skipped", None
+            self._record_auto_collect_failure(task_id, "status re-read failed")
+            return "failed", "status re-read failed"
+        if status_after != REVIEW_STATUS:
+            self._clear_auto_collect_failure(task_id)
+            return "skipped", None
+
+        # Still in review. An upstream that refuses a summary-less completion
+        # gets one retry with a distinct audit summary (the worker summary
+        # remains in the review_requested event/run).
+        retryable = patched.status in (400, 422) or (
+            patched.status == 200 and not landed_done(patched)
+        )
+        if retryable or patched.status == 409:
+            try:
+                patched_retry = self._patch_task(
+                    task_id,
+                    {"status": "done", "summary": AUTO_COLLECT_AUDIT_SUMMARY},
+                    time.monotonic() + REVIEW_BUDGET_SECONDS,
+                )
+            except UpstreamUnavailable as exc:
+                self._record_auto_collect_failure(task_id, f"PATCH retry failed: {exc}")
+                return "failed", str(exc)
+            if landed_done(patched_retry):
+                self._clear_auto_collect_failure(task_id)
+                self._auto_collect_comment(
+                    task_id, detail_after or detail, event
+                )
+                return "collected", None
+            self._record_auto_collect_failure(
+                task_id, f"PATCH refused ({patched.status}/{patched_retry.status})"
+            )
+            return "failed", "PATCH refused"
+
+        self._record_auto_collect_failure(task_id, f"PATCH failed ({patched.status})")
+        return "failed", f"PATCH failed ({patched.status})"
+
+    def _auto_collect(self, task_id: str) -> tuple[str, Optional[str]]:
+        """Lock, re-read, and auto-accept a card whose review clock expired."""
+        if self._in_auto_collect_backoff(task_id):
+            return "skipped", None
+        with self._task_lock(task_id):
+            if self._in_auto_collect_backoff(task_id):
+                return "skipped", None
+            try:
+                detail = self._task_detail(task_id, time.monotonic() + REVIEW_BUDGET_SECONDS)
+            except TaskNotFound:
+                self._clear_auto_collect_failure(task_id)
+                return "skipped", None
+            except UpstreamUnavailable as exc:
+                self._record_auto_collect_failure(task_id, f"read failed: {exc}")
+                return "failed", str(exc)
+            return self._auto_collect_locked(task_id, detail)
+
+    def sweep_reviews(self) -> tuple[int, dict[str, Any]]:
+        """Auto-accept every review card older than the TTL.
+
+        Shared by the guarded sweep endpoint and the daemon thread. A failed
+        card keeps its review status, gets a backoff window, and is reported in
+        ``failed_ids``; one failure never aborts the rest of the sweep.
+        """
+        try:
+            review_ids = self._review_ids_on_board(
+                time.monotonic() + INBOX_BUDGET_SECONDS
+            )
+        except UpstreamUnavailable:
+            return 502, {"ok": False, "error": "upstream_unavailable"}
+        collected: list[str] = []
+        failed: list[str] = []
+        skipped = 0
+        for task_id in review_ids:
+            outcome, _error = self._auto_collect(task_id)
+            if outcome == "collected":
+                collected.append(task_id)
+            elif outcome == "failed":
+                failed.append(task_id)
+            else:
+                skipped += 1
+        self._invalidate_review_cache()
+        return 200, {
+            "ok": True,
+            "collected": len(collected),
+            "failed": len(failed),
+            "skipped": skipped,
+            "collected_ids": collected,
+            "failed_ids": failed,
+        }
+
+    def inbox_count(self) -> tuple[int, dict[str, Any]]:
+        """Header count: one cached board read, no per-card detail calls."""
+        try:
+            review_ids = self._review_ids_cached()
+        except UpstreamUnavailable:
+            return self._fail(502, "upstream_unavailable")
+        return 200, {
+            "ok": True,
+            "count": len(review_ids),
+            "review_ttl_seconds": self.review_ttl_seconds,
+        }
+
+    def inbox(self) -> tuple[int, dict[str, Any]]:
+        """Review queue sorted by the earliest ``review_requested`` event.
+
+        Pure read: expired cards are left for ``POST /reviews/sweep`` (called
+        by the UI) or the background sweeper. Card details are fetched in
+        parallel under one overall deadline; one failed detail is skipped and
+        reported in ``failed_ids`` instead of blanking the whole queue.
+        """
+        try:
+            review_ids = self._review_ids_cached()
+        except UpstreamUnavailable:
+            return self._fail(502, "upstream_unavailable")
+        try:
+            metadata_by_id = self.store.get_many(review_ids)
+        except MetadataUnavailable:
+            return self._fail(503, "metadata_unavailable")
+
+        details: dict[str, dict[str, Any]] = {}
+        failed_ids: list[str] = []
+        if review_ids:
+            deadline = time.monotonic() + INBOX_BUDGET_SECONDS
+            workers = min(MAX_INBOX_WORKERS, len(review_ids))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._task_detail, task_id, deadline): task_id
+                    for task_id in review_ids
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    task_id = futures[future]
+                    try:
+                        details[task_id] = future.result()
+                    except TaskNotFound:
+                        # Already gone; not a failure worth surfacing.
+                        continue
+                    except UpstreamUnavailable:
+                        failed_ids.append(task_id)
+                    except Exception:  # a bug in one read must not blank the queue
+                        failed_ids.append(task_id)
+
+        items: list[dict[str, Any]] = []
+        for task_id in review_ids:
+            detail = details.get(task_id)
+            if detail is None:
+                continue
+            if self._detail_task(detail).get("status") != REVIEW_STATUS:
+                continue
+            items.append(self._inbox_item(task_id, detail, metadata_by_id.get(task_id, {})))
+
+        # Oldest review first (clear the backlog first); cards without a
+        # review_requested event sort last because their age is unknown.
+        items.sort(
+            key=lambda item: (
+                item["review_requested_at"] is None,
+                item["review_requested_at"] or item["created_at"] or 0,
+                item["id"],
+            )
+        )
+        failed_ids.sort()
+        return 200, {
+            "ok": True,
+            "count": len(items),
+            "review_ttl_seconds": self.review_ttl_seconds,
+            "tasks": items,
+            "failed_ids": failed_ids,
+        }
+
+    @staticmethod
+    def _has_round_comment(detail: dict[str, Any], reason: str) -> bool:
+        """True when this review round already has the same workbench comment.
+
+        Re-sending the identical rejection for the same round would duplicate
+        the comment after a retry; the check is scoped to comments created at
+        or after the latest ``review_requested`` event.
+        """
+        review_at = WorkbenchService._latest_review_requested_at(detail)
+        if review_at is None:
+            return False
+        comments = detail.get("comments")
+        if not isinstance(comments, list):
+            return False
+        for comment in comments:
+            if not isinstance(comment, dict):
+                continue
+            if comment.get("author") != VERIFY_AUTHOR or comment.get("body") != reason:
+                continue
+            created = comment.get("created_at")
+            if isinstance(created, (int, float)) and not isinstance(created, bool):
+                if int(created) >= review_at:
+                    return True
+        return False
+
+    def _verify_patch_response(
+        self,
+        task_id: str,
+        patched: UpstreamResult,
+        action: str,
+        expected: str,
+        comment_written: bool,
+    ) -> tuple[int, dict[str, Any]]:
+        """Map a PATCH result, re-reading the card on anything unexpected.
+
+        If the card is still ``review`` after a failed/odd PATCH, report 502
+        (the action did not land) rather than pretending it left the queue.
+        ``comment_written`` is present on every outcome.
+        """
+        if patched.status == 404:
+            return 404, {
+                "ok": False,
+                "error": "not_found",
+                "comment_written": comment_written,
+            }
+        landed = self._detail_task(patched.data) if isinstance(patched.data, dict) else {}
+        actual = landed.get("status")
+        if patched.status == 200 and actual == expected:
+            return 200, {
+                "ok": True,
+                "action": action,
+                "status": actual,
+                "comment_written": comment_written,
+            }
+
+        status_after, _detail = self._read_status(task_id)
+        if status_after == "missing":
+            return 404, {
+                "ok": False,
+                "error": "not_found",
+                "comment_written": comment_written,
+            }
+        if status_after is None:
+            return 502, {
+                "ok": False,
+                "error": "upstream_unavailable",
+                "comment_written": comment_written,
+            }
+        if status_after == REVIEW_STATUS:
+            body: dict[str, Any] = {
+                "ok": False,
+                "error": "upstream_unavailable",
+                "status": REVIEW_STATUS,
+                "comment_written": comment_written,
+            }
+            if patched.status:
+                body["upstream_status"] = patched.status
+            return 502, body
+        return 409, {
+            "ok": False,
+            "error": "not_in_review",
+            "status": status_after,
+            "comment_written": comment_written,
+        }
+
+    def verify(
+        self, task_id: str, action: Any, reason: Any = None
+    ) -> tuple[int, dict[str, Any]]:
+        """``accept`` / ``reject`` / ``skip`` one review card.
+
+        ``accept`` = PATCH done + summary; ``reject`` = comment first, then
+        PATCH triage (a failed comment never changes the status); ``skip``
+        leaves the upstream card untouched. The frontend and this endpoint
+        both require a non-empty reason (<= 2000 chars) for reject.
+        """
+        normalized = task_id.strip() if isinstance(task_id, str) else ""
+        if not normalized:
+            return self._fail(400, "invalid_request")
+        if action not in VERIFY_ACTIONS:
+            return self._fail(400, "invalid_action")
+        rejection_reason: Optional[str] = None
+        if action == "reject":
+            if not isinstance(reason, str) or not reason.strip():
+                return self._fail(400, "reason_required")
+            rejection_reason = reason.strip()
+            if len(rejection_reason) > MAX_REJECT_REASON_CHARS:
+                return self._fail(400, "reason_too_long")
+
+        with self._task_lock(normalized):
+            deadline = time.monotonic() + REVIEW_BUDGET_SECONDS
+            try:
+                detail = self._task_detail(normalized, deadline)
+            except TaskNotFound:
+                return 404, {
+                    "ok": False,
+                    "error": "not_found",
+                    "comment_written": False,
+                }
+            except UpstreamUnavailable:
+                return self._fail(502, "upstream_unavailable")
+            current = self._detail_task(detail).get("status")
+            if current != REVIEW_STATUS:
+                return 409, {
+                    "ok": False,
+                    "error": "not_in_review",
+                    "status": current if isinstance(current, str) else None,
+                    "comment_written": False,
+                }
+            if action == "skip":
+                return 200, {
+                    "ok": True,
+                    "action": "skip",
+                    "status": REVIEW_STATUS,
+                    "comment_written": False,
+                }
+
+            if action == "accept":
+                try:
+                    patched = self._patch_task(
+                        normalized,
+                        {"status": "done", "summary": ACCEPT_SUMMARY},
+                        deadline,
+                    )
+                except UpstreamUnavailable:
+                    return self._fail(502, "upstream_unavailable")
+                return self._verify_patch_response(
+                    normalized, patched, "accept", "done", False
+                )
+
+            # reject: write the reason comment first; only then move the card
+            # back to triage. A comment failure leaves it in review. A retry
+            # of the same round with the same reason reuses the comment.
+            comment_written = self._has_round_comment(detail, rejection_reason or "")
+            if not comment_written:
+                try:
+                    commented = self._post_comment(
+                        normalized, rejection_reason or "", deadline
+                    )
+                except UpstreamUnavailable:
+                    return self._fail(502, "upstream_unavailable")
+                if commented.status == 404:
+                    return 404, {
+                        "ok": False,
+                        "error": "not_found",
+                        "comment_written": False,
+                    }
+                if commented.status != 200:
+                    return 502, {
+                        "ok": False,
+                        "error": "upstream_unavailable",
+                        "comment_written": False,
+                    }
+                comment_written = True
+            try:
+                patched = self._patch_status(normalized, "triage", deadline)
+            except UpstreamUnavailable:
+                return 502, {
+                    "ok": False,
+                    "error": "upstream_unavailable",
+                    "comment_written": comment_written,
+                }
+            return self._verify_patch_response(
+                normalized, patched, "reject", "triage", comment_written
+            )
 
     @staticmethod
     def _upstream_detail(data: Any) -> str:
@@ -1238,6 +1983,40 @@ class WorkbenchService:
         return self._landing_error(actual, task)
 
 
+class ReviewSweeper:
+    """Daemon thread that auto-accepts review cards older than 48h.
+
+    Every inbox read also performs the same fallback sweep, so the thread is
+    only needed to unclog the queue when nobody has the verify page open.
+    """
+
+    def __init__(self, service: WorkbenchService, interval_seconds: float) -> None:
+        self.service = service
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="workbench-review-sweeper", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        # First pass after one interval: startup must not block on the board,
+        # and the inbox read covers cards that are already overdue.
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.service.sweep_reviews()
+            except Exception as exc:  # a daemon thread must never die silently
+                print(f"workbench: review sweep failed: {exc}", file=sys.stderr, flush=True)
+
+
 # ---------------------------------------------------------------------------
 # PATCH status=ready gate (pure ASGI middleware)
 # ---------------------------------------------------------------------------
@@ -1532,6 +2311,48 @@ def _parse_ids(raw: str) -> tuple[list[str], bool]:
     return seen, False
 
 
+def _env_positive_float(name: str, default: float) -> float:
+    """Finite positive float from the environment, else the given default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(default)
+    if not math.isfinite(value) or value <= 0:
+        return float(default)
+    return value
+
+
+def _env_nonnegative_float(name: str, default: float) -> float:
+    """Finite non-negative float from the environment, else the default."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        return float(default)
+    if not math.isfinite(value) or value < 0:
+        return float(default)
+    return value
+
+
+def _env_sweep_seconds() -> float:
+    """Sweep interval: finite >0 (capped at a day), otherwise disabled."""
+    raw = os.environ.get("WORKBENCH_REVIEW_SWEEP_SECONDS", "").strip()
+    if not raw:
+        return float(REVIEW_SWEEP_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        return 0.0
+    if not math.isfinite(value) or value <= 0:
+        return 0.0
+    return min(value, 86400.0)
+
+
 def _json_error(status_code: int, error: str, **extra: Any) -> JSONResponse:
     body: dict[str, Any] = {"ok": False, "error": error}
     body.update(extra)
@@ -1608,12 +2429,35 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
     store.start()
 
     base_url = os.environ.get("WORKBENCH_UPSTREAM_BASE", "").strip() or _self_base(host, port)
-    service = WorkbenchService(base_url, store, defaults_path)
+    review_ttl_seconds = int(
+        _env_positive_float("WORKBENCH_REVIEW_TTL_SECONDS", REVIEW_TTL_SECONDS)
+    )
+    auto_collect_backoff_seconds = _env_positive_float(
+        "WORKBENCH_REVIEW_BACKOFF_SECONDS", REVIEW_BACKOFF_SECONDS
+    )
+    inbox_cache_seconds = _env_nonnegative_float(
+        "WORKBENCH_INBOX_CACHE_SECONDS", INBOX_CACHE_SECONDS
+    )
+    service = WorkbenchService(
+        base_url,
+        store,
+        defaults_path,
+        review_ttl_seconds=review_ttl_seconds,
+        auto_collect_backoff_seconds=auto_collect_backoff_seconds,
+        inbox_cache_seconds=inbox_cache_seconds,
+    )
 
     try:
         load_defaults(defaults_path)
     except DefaultsError as exc:
         print(f"workbench: defaults invalid at startup: {exc}", file=sys.stderr, flush=True)
+
+    sweep_seconds = _env_sweep_seconds()
+    sweeper: Optional[ReviewSweeper] = None
+    if sweep_seconds > 0:
+        sweeper = ReviewSweeper(service, sweep_seconds)
+        sweeper.start()
+        app.router.add_event_handler("shutdown", sweeper.stop)
 
     app.add_middleware(ReadyGateMiddleware, service=service)
 
@@ -1660,6 +2504,47 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
             return _json_error(400, "too_many_ids")
         status_code, payload = service.metadata_for(task_ids)
         return JSONResponse(payload, status_code=status_code)
+
+    @app.get("/api/workbench/inbox")
+    async def inbox() -> JSONResponse:
+        # Pure read; the 48h sweep is a guarded POST /reviews/sweep call made
+        # by the UI, so polling cannot mutate cards.
+        status_code, payload = await run_in_threadpool(service.inbox)
+        return JSONResponse(payload, status_code=status_code)
+
+    @app.get("/api/workbench/inbox/count")
+    async def inbox_count() -> JSONResponse:
+        # Header poll: cached board read, no per-card detail calls.
+        status_code, payload = await run_in_threadpool(service.inbox_count)
+        return JSONResponse(payload, status_code=status_code)
+
+    @app.post("/api/workbench/reviews/sweep")
+    async def reviews_sweep(request: Request) -> JSONResponse:
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        payload, body_error = await _request_json_object(request)
+        if body_error is not None:
+            if body_error == "payload_too_large":
+                return _json_error(413, "payload_too_large")
+            return _json_error(400, "invalid_request")
+        status_code, body = await run_in_threadpool(service.sweep_reviews)
+        return JSONResponse(body, status_code=status_code)
+
+    @app.post("/api/workbench/verify/{task_id}")
+    async def verify(task_id: str, request: Request) -> JSONResponse:
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        payload, body_error = await _request_json_object(request)
+        if body_error is not None:
+            if body_error == "payload_too_large":
+                return _json_error(413, "payload_too_large")
+            return _json_error(400, "invalid_request")
+        status_code, body = await run_in_threadpool(
+            service.verify, task_id, payload.get("action"), payload.get("reason")
+        )
+        return JSONResponse(body, status_code=status_code)
 
     @app.post("/api/workbench/tasks")
     async def create_task(request: Request) -> JSONResponse:

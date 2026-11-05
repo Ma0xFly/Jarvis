@@ -152,6 +152,74 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
 上游 `recompute_ready`（parent 完成自动提升）和原生 9119 dashboard 不经过本服务，
 **不在闸门范围内**，属已知限制。
 
+## 验收 inbox / verify / sweep
+
+验收队列只含上游 `review` 卡。所有端点只读写上游公开 REST，不碰 `kanban.db`。
+
+```bash
+# 右上角计数：只读 /board，不拉每张卡详情（短缓存 + in-flight 合并）
+curl -s http://127.0.0.1:8787/api/workbench/inbox/count
+# 200 {"ok":true,"count":3,"review_ttl_seconds":172800}
+
+# 完整验收队列：pure read，不自动收；详情并行读取，单张失败只跳过
+curl -s http://127.0.0.1:8787/api/workbench/inbox
+# 200 {"ok":true,"count":3,"review_ttl_seconds":172800,
+#      "tasks":[{"id":"t_…","title":"…","status":"review",
+#                "metadata":{"contract":{"accept":"…","input":"…"}},
+#                "result":null,"latest_summary":"…",
+#                "review_requested_at":1730000000,"review_age_seconds":120,
+#                "auto_collect_due":false,"auto_collect_error":null}, …],
+#      "failed_ids":[]}
+# 502 upstream_unavailable / 503 metadata_unavailable
+
+# 显式触发 48h 自动收（POST 受同源 + JSON Content-Type 守卫）
+curl -s -X POST http://127.0.0.1:8787/api/workbench/reviews/sweep \
+  -H 'content-type: application/json' -d '{}'
+# 200 {"ok":true,"collected":1,"failed":0,"skipped":2,
+#      "collected_ids":["t_…"],"failed_ids":[]}
+# 502 upstream_unavailable（/board 不可读）
+
+# 验收动作：accept | reject | skip
+curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
+  -H 'content-type: application/json' -d '{"action":"accept"}'
+# 200 {"ok":true,"action":"accept","status":"done","comment_written":false}
+# reject 必填 reason（trim 后 1–2000 字）：
+#   {"action":"reject","reason":"没跑测试"}
+#   200 {"ok":true,"action":"reject","status":"triage","comment_written":true}
+#   400 reason_required / reason_too_long / invalid_action
+#   404 not_found（带 comment_written）
+#   409 not_in_review（重读后卡已离开 review）
+#   502 upstream_unavailable（重读后卡仍在 review；带 comment_written）
+```
+
+规则：
+
+- `accept` = `PATCH status=done` + summary「验收通过」；`reject` = 先写理由
+  comment、再 `PATCH status=triage`（comment 失败绝不改状态）；`skip` 不改上游，
+  仅在本批前进。所有动作都在 verify 端点内完成，前端不直接 PATCH。
+- reject 在同一 review 轮次内按「author=workbench + 同理由 + comment 时间不早于
+  最近 `review_requested`」去重；重试不会重复写 comment。
+- PATCH 非 200 或 200 但落点不对时会重读卡：仍在 `review` → 502
+  `upstream_unavailable`（卡留在队列）；已离开 review → 409 `not_in_review`。
+  每个响应都带 `comment_written`。
+- 48h 自动收：时长取**最近一次** `review_requested` 事件（新事件重置时钟）；
+  没有该事件的卡永不自动收。后台 sweeper 默认每 5 分钟跑一次，前端进入验收时
+  还会显式调用一次 sweep 端点；轮询/读取本身不写卡。
+- 自动收顺序：先 `PATCH status=done`（尽量带原 worker summary，避免覆盖
+  `latest_summary`；上游要求 summary 时回退到带审计文案的 summary），落点确认
+  `done` 后才写 `48h 自动收（review:<event id>）` 记录 comment。标记按 review
+  轮次隔离，二次 review 超时会写新的记录，不会误判为已收。
+- 自动收失败（PATCH/重读失败）会记录 `auto_collect_error` 并进入退避窗口；
+  窗口内 sweeper 不再重试，inbox item 暴露 `auto_collect_due` 与
+  `auto_collect_error:{message,attempts,retry_in_seconds}`。
+- 队列顺序：最早进入 review 的在前；无 `review_requested` 的卡排在最后。
+- 环境变量覆盖（均为有限正数，非法值回落默认）：
+  - `WORKBENCH_REVIEW_TTL_SECONDS` 自动收窗口，默认 `172800`（48h）
+  - `WORKBENCH_REVIEW_SWEEP_SECONDS` 后台扫描间隔，默认 `300`；`0`/非法值关闭
+  - `WORKBENCH_REVIEW_BACKOFF_SECONDS` 失败退避，默认 `300`
+  - `WORKBENCH_INBOX_CACHE_SECONDS` count/inbox 的 /board 短缓存，默认 `1`；
+    `0` 关闭缓存（仍保留 in-flight 合并），测试用
+
 ## 界面
 
 - **待办**（独立版默认 tab）：三列「流水线（302px 凹槽）/ 今日 / 长期」。
@@ -166,6 +234,13 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
   5s 轮询按 `/board` 顺序重算的实时值，刷新后只保留行内位次、不显示 ETA。
   ETA 是队列槽位近似：位次 1 = 7 分钟，不扣除卡已运行时间。底部输入框回车
   建卡，今日/长期可切换（默认今日），不自动派发。
+- **验收**（独立版全屏覆盖层，不是 tab）：右上角「验收 N」与流水线「待收」
+  段/行进入。一张一屏显示验收标准、输入、worker 自述、`result`、附件
+  （文本/图片内联）与本轮运行信息（profile/状态/耗时/自述/错误）；顶栏
+  `1/N`、进度与后端 `review_ttl_seconds` 倒计时。`A` 收、`R` 不收（理由必填，
+  Ctrl/Cmd+Enter 提交）、`S` 跳过、`Esc` 退出；清空后展示本批统计并约 3 秒
+  自动返回。队列 5s 轮询，跳过卡不会被重新加回；新 review 卡会自动追加。
+  `initialTaskId` 不在队列时给出提示而不是静默换卡；2.3 会话入口仅占位。
 - **看板**：8 列 `待整理 / 待执行 / 已排期 / 就绪 / 运行中 / 待拍板 / 待验收 / 已完成`。
   独立版把卡拖到「就绪」会走 `dispatchTask`（写快照、算位次、过验收闸门），
   其他列仍是原生 PATCH；闸门拒绝显示中文提示（空验收 / parent / 不可派发）。
@@ -189,6 +264,7 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
 | `workbench.db` | 运行期生成的工作台 metadata 库（已 gitignore） |
 | `tests/test_dispatch.py` | 派发/闸门/metadata 的可重复集成测试（临时库，不碰真实数据） |
 | `tests/test_todo.py` | 待办建卡 / metadata 写端点的可重复集成测试 |
+| `tests/test_verify.py` | inbox / count / sweep / verify / 48h 自动收与退避的可重复集成测试 |
 | `web/index.js` / `web/style.css` | `workbench-ui` 的构建产物（禁止手改） |
 | `web/index.html` / `web/icon.svg` / `web/theme.css` | 独立版页面骨架与主题 |
 | `install.sh` | 用户级 systemd 服务 + 桌面入口 |

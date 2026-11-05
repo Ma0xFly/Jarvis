@@ -10,7 +10,8 @@
     "build:standalone": "vite build --mode standalone",
     "build": "npm run typecheck && npm run build:plugin && npm run build:standalone && node scripts/distribute.mjs",
     "probe:todo": "node scripts/todo-probe.mjs",
-    "verify": "npm run build && npm run probe:todo"
+    "probe:verify": "node scripts/verify-probe.mjs",
+    "verify": "npm run build && npm run probe:todo && npm run probe:verify"
   },
   "dependencies": {
     "react": "^18.3.1",
