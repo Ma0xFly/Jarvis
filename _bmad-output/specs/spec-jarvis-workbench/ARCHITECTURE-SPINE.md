@@ -94,7 +94,7 @@ export const api = sdk ? sdk.fetchJSON : plainFetch
 |---|---|---|---|
 | GET | `/board` | — | 当前 board 全量（列 + 卡） |
 | GET | `/tasks/{id}` | — | 单卡全量：task / comments / events / attachments / links / runs |
-| POST | `/tasks` | `title` `body` `assignee` `priority` `metadata` | 建卡 |
+| POST | `/tasks` | `title` `body` `assignee` `priority` `triage` `idempotency_key` | 建卡；workbench 建卡固定 `triage=true` 并用 `idempotency_key` 去重（同一 key 返回已有未归档卡） |
 | PATCH | `/tasks/{id}` | `status` `assignee` `priority` `title` `body` `result` `summary` `metadata` `block_reason` | 改卡；`metadata` 可整块写 |
 | POST | `/tasks/{id}/comments` | `body` | 加评论（结构化提问走 ```` ```ask ```` 块） |
 | POST | `/tasks/bulk` | `ids` `status` `metadata` … | 批量改 |
@@ -102,8 +102,8 @@ export const api = sdk ? sdk.fetchJSON : plainFetch
 | GET | `/stats` · `/assignees` · `/diagnostics` | — | 统计/可派工 profile/自检 |
 | GET | `/runs/{run_id}` · `/runs/{run_id}/inspect` | — | 单轮详情与 transcript |
 
-工作台**只依赖** `GET /board`、`GET /tasks/{id}`、`PATCH /tasks/{id}` 三条公开 REST；
-`server.py` 不 import `kanban_db` / `kanban_db_connect`，不依赖私有函数。
+工作台**只依赖** `GET /board`、`GET /tasks/{id}`、`PATCH /tasks/{id}`、`POST /tasks`
+四条公开 REST；`server.py` 不 import `kanban_db` / `kanban_db_connect`，不依赖私有函数。
 
 **ready 闸门覆盖的入口**（都在 workbench 中间件里）：
 
@@ -131,8 +131,17 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
 工作台契约字段存 **`workbench-app/workbench.db`** 的
 `task_metadata(task_id TEXT PRIMARY KEY, metadata TEXT NOT NULL, updated_at INTEGER NOT NULL, write_token TEXT)`；
 不写共享 `kanban.db`。读取走 `GET /api/workbench/metadata?ids=a,b`（无记录省略该 id，
-`write_token` 是内部列，不进入响应）。1.2 只有读端点与派发快照；`contract` / `bucket`
-的写端点属 Story 1.3。
+`write_token` 是内部列，不进入响应）。1.2 提供读端点与派发快照；1.3 已实现写端点：
+
+- `POST /api/workbench/tasks` —— 上游 `POST /tasks`（`triage=true`，可带
+  `idempotency_key`）建卡，再写默认 `bucket` + 空 `contract`；metadata 失败返回
+  503 + `task_id`，同 key 重试不会重复建卡。
+- `PATCH /api/workbench/metadata/{task_id}` —— 先 GET 上游任务（不存在 404），
+  再按 key 合并 `bucket` / `contract`；`contract_defaults` 与未知键不可写。
+- 写端点只接受 `application/json`（64KB 上限）；带 `Origin` 时必须与 Host 同源，
+  否则 403。`accept` ≤2000、`input` ≤4000、`deny_paths` 1–100 个非空字符串。
+- 同一 task 的 dispatch（闸门读取→PATCH）与 metadata 写共用一把 per-task 锁，
+  避免验收在派发中途被清空；落点 ready 后再读一次验收作为兜底。
 
 | 键 | 存储 | 写方 | 结构 |
 |---|---|---|---|
@@ -166,6 +175,11 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
      409 并补偿本次快照。
    - `GET /api/workbench/metadata?ids=a,b` —— 读 `workbench.db`，无记录省略，
      `write_token` 不进入响应；单请求最多 200 个 id。
+   - `POST /api/workbench/tasks` —— 建待办卡：上游 `POST /tasks`（`triage=true`，
+     可选 `idempotency_key`）→ GET 校验 `status=="triage"` → 写 `bucket` + 空
+     `contract`；metadata 失败返回 503 + `task_id` 供同 key 重试。
+   - `PATCH /api/workbench/metadata/{task_id}` —— 先 GET 上游任务（404 不 upsert），
+     再 JSON1 `json_patch` 合并 `bucket` / `contract`；`contract_defaults` 不可写。
    - ready 中间件 —— 覆盖 PATCH ready、非 triage 建卡、bulk ready、reclaim；
      与 dispatch 共用验收检查，空验收 400 不转发。
    - `GET /api/workbench/inbox` —— 聚合 `review` 卡 + P0 blocked 卡（后续故事）。
@@ -175,6 +189,7 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
 
 2. **前端**只改 `workbench-ui/src/`，经 `npm run build` 分发到插件与独立版；
    `sync-ui.sh` 已作废。`workbench-ui/src/api/workbench.ts` 负责 dispatch/metadata 调用与错误码。
+   插件宿主没有 `/api/workbench/*`，只渲染看板 tab；待办三区仅独立版 8787 提供。
 
 3. **规则与固化物**落 `~/Projects/Jarvis/routing.json`（1.2 不读取，deferred）。
 4. **执行器适配器**：`bin/executor-run` + `executors.json`。适配器只做翻译（统一参数 → 各家 CLI，各家输出 → 统一 JSON），不放业务逻辑、不读 `kanban.db`（见 PLAN §6.3）。
@@ -216,8 +231,15 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/dispatch/<id> \
 # 读 workbench metadata
 curl -s 'http://127.0.0.1:8787/api/workbench/metadata?ids=<id>'
 
+# 建待办卡（可带 idempotency_key；metadata 失败时用同 key 重试）
+curl -s -X POST http://127.0.0.1:8787/api/workbench/tasks \
+  -H 'content-type: application/json' \
+  -d '{"title":"一句话","bucket":"today","idempotency_key":"<uuid>"}'
+
 # 可重复测试（临时 HERMES_KANBAN_HOME / WORKBENCH_DB，不碰真实库）
 python3 workbench-app/tests/test_dispatch.py -v
+python3 workbench-app/tests/test_todo.py -v
+cd workbench-ui && npm run verify   # build + headless 三区探针
 ```
 
 运行 Python：`~/.hermes/tools/python-3.14*/bin/python3`（`run.sh` 自动找），依赖由 `hermes_bootstrap` 注入，**不要**自建 venv。
@@ -226,8 +248,9 @@ python3 workbench-app/tests/test_dispatch.py -v
 
 - 固定单一 board，不做多 board 切换；workbench metadata 只按 `task_id` 键（多 board deferred）。
 - 5 秒轮询，不是 WebSocket。
-- 「今日/长期」归属以 `metadata.bucket`（workbench.db）为准；`localStorage` 只存排序与主题等
-  纯 UI 偏好（`wb.repoOrder.v1` / `wb.theme`），跨浏览器不同步。
+- 「今日/长期」归属以 `metadata.bucket`（workbench.db）为准；今日/长期固定
+  `created_at` 倒序，不做栏内拖动或排序持久化。当前 React UI 不写 `localStorage`；
+  明暗主题由宿主 `data-theme` / `theme.css` token 驱动。
 - 上游 `recompute_ready`（parent 完成自动提升）和原生 9119 dashboard 不经过本服务的 ready
   闸门；不额外加 watcher，属已知限制。
 - 1.2 不实现 provenance / `contract.ready` 语义；契约只有 `input` / `accept` / `budget` 被使用。
@@ -236,7 +259,8 @@ python3 workbench-app/tests/test_dispatch.py -v
 - 已跟踪的 `workbench-app/web/*.bak-*` 与旧 `web/app.js` / `sync-ui.sh` 清理是 deferred；
   本次不删除任何已跟踪文件。
 - 无登录，只监听回环；远程走 Tailscale。
-- 插件形态没有后端，只能做前端与 kanban REST；需要自定义端点时只能走独立版 8787。
+- 插件形态没有后端（没有 `/api/workbench/*`），所以插件宿主只显示看板 tab；
+  待办三区只在独立版 8787 提供（界面会提示）。
 
 ## 10. 版本基线
 

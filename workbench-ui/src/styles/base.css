@@ -13,6 +13,11 @@
   --wb-danger: var(--color-destructive, var(--destructive, #ef4444));
   --wb-ok: var(--color-success, #22c55e);
   --wb-warn: var(--color-warning, #d9a520);
+  /* 页面底色 token：独立版取 --bg，宿主取 shadcn background，取不到回退卡片色 */
+  --wb-page: var(--color-background, var(--background, var(--bg, var(--wb-card))));
+  /* 凹槽底色：卡片色向页面底色压一档，明暗主题都成立，无字面色值 */
+  --wb-sunken: var(--wb-card);
+  --wb-sunken: color-mix(in srgb, var(--wb-card) 78%, var(--wb-page) 22%);
 
   padding: 18px 22px 40px;
   color: var(--wb-fg);
@@ -29,6 +34,22 @@
   align-items: center;
   gap: 14px;
   margin-bottom: 14px;
+}
+.wb-notice {
+  margin-left: auto;
+  color: var(--wb-muted);
+  font-size: 11.5px;
+}
+
+/* 面板保持挂载，隐藏时只切 display，不动内部状态 */
+.wb-pane {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+.wb-pane-hidden {
+  display: none;
 }
 .wb-tabs {
   display: flex;

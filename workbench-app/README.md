@@ -85,6 +85,22 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/dispatch/<task_id> \
 
 # 批量读 workbench metadata（无记录的 id 省略）
 curl -s 'http://127.0.0.1:8787/api/workbench/metadata?ids=<task_id>,<task_id>'
+
+# 建卡：走上游 POST /tasks（triage=true），默认 bucket=today，不自动派发
+# idempotency_key 可选（≤128）；同一 key 重试返回同一张卡，metadata 失败重试不重复建卡
+curl -s -X POST http://127.0.0.1:8787/api/workbench/tasks \
+  -H 'content-type: application/json' \
+  -d '{"title":"一句话","bucket":"today","idempotency_key":"<uuid>"}'
+# 200 {"ok":true,"task":{...},"metadata":{"bucket":"today","contract":{"input":"","accept":"","ready":false}}}
+# 400 invalid_title / invalid_bucket / invalid_request；413 payload_too_large
+# 502 upstream_unavailable（非 triage 落点会带 status）；503 metadata_unavailable + task_id
+
+# 写 metadata：bucket 只允许 today|long；contract 按 key 合并
+# 任务必须已存在（上游 404 → 404 not_found），不会为任意 id 建孤儿 metadata
+curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
+  -H 'content-type: application/json' -d '{"contract":{"accept":"跑通测试"}}'
+# 200 {"ok":true,"metadata":{...}}；404 not_found
+# 400 invalid_metadata / invalid_bucket / invalid_contract / invalid_request
 ```
 
 规则：
@@ -101,6 +117,18 @@ curl -s 'http://127.0.0.1:8787/api/workbench/metadata?ids=<task_id>,<task_id>'
   确实是 `ready` 才读 `/board` 算位次（board 未命中会重读一次，仍不命中返回 502）。
 - 已 `ready` 再派发是幂等的：返回 200，按当前 ready 队列重算位次，
   不覆盖已有快照。
+- metadata 写端点只接受 `bucket` 与 `contract`，`bucket` 只允许
+  `today|long`；用 JSON1 `json_patch` 按 key 合并，派发快照
+  `contract_defaults` 不会被客户端覆盖。未知键、空 patch、非法 contract
+  一律 400；建卡 `title` 与 `accept` 落库前都会 trim。
+- 校验上限：`accept` ≤2000、`input` ≤4000、`deny_paths` 1–100 个非空字符串、
+  请求体 ≤64KB。POST/PATCH 必须 `Content-Type: application/json`（否则 415）；
+  带 `Origin` 时必须与 Host 同源（否则 403）。
+- 建卡先上游后 metadata，非单事务：metadata 写失败返回 503 + `task_id`；客户端
+  用同一 `idempotency_key` 重试即可补齐 metadata，不会建出第二张卡。上游 4xx
+  映射为 400（带 `detail`/`upstream_status`），5xx/不可达映射为 502。
+- 同一 task 的 dispatch 与 metadata 写共用 per-task 锁，验收不会在派发中途被清空；
+  落点 ready 后会再读一次验收作为兜底。
 - 位次按 `/board` 的 `ready` 列 1-based 顺序；`eta = now + minutes_per_task × 位次`。
   位次 1 表示第一个 7 分钟槽。
 - `running` 卡重派返回 `{position:0,status:"running"}`，不 PATCH；done/archived
@@ -116,11 +144,17 @@ curl -s 'http://127.0.0.1:8787/api/workbench/metadata?ids=<task_id>,<task_id>'
 
 ## 界面
 
+- **待办**（独立版默认 tab）：三列「流水线（302px 凹槽）/ 今日 / 长期」。
+  今日/长期只显示 `triage` 且 `metadata.bucket` 匹配的卡，仓库卡只有标题 +
+  验收一行；验收在卡上就地编辑（失败保留输入）。拖进流水线调用 1.2 的
+  `dispatchTask`；验收为空时回原位、抖动 300ms、红字提示且不发请求。底部
+  输入框回车建卡，今日/长期可切换（默认今日），不自动派发。
 - **看板**：8 列 `待整理 / 待执行 / 已排期 / 就绪 / 运行中 / 待拍板 / 待验收 / 已完成`
-- 明暗主题：右上角 ☾/☀，记住在 `localStorage["wb.theme"]`
+- 明暗主题由宿主 `data-theme` / `theme.css` token 驱动；当前 React UI 不写
+  `localStorage`。
 - 5 秒轮询 `/api/plugins/kanban/board`，不是 WebSocket
-
-待办三区与拖拽派发属于 Story 1.3；契约/bucket 的写端点也留给 1.3。
+- **插件宿主**没有 `/api/workbench/*`，只显示看板 tab，并提示待办请用独立版
+  8787；待办只在独立版提供。
 
 ## 文件
 
@@ -130,6 +164,7 @@ curl -s 'http://127.0.0.1:8787/api/workbench/metadata?ids=<task_id>,<task_id>'
 | `defaults.json` | 预算与队列估算的唯一全局默认源 |
 | `workbench.db` | 运行期生成的工作台 metadata 库（已 gitignore） |
 | `tests/test_dispatch.py` | 派发/闸门/metadata 的可重复集成测试（临时库，不碰真实数据） |
+| `tests/test_todo.py` | 待办建卡 / metadata 写端点的可重复集成测试 |
 | `web/index.js` / `web/style.css` | `workbench-ui` 的构建产物（禁止手改） |
 | `web/index.html` / `web/icon.svg` / `web/theme.css` | 独立版页面骨架与主题 |
 | `install.sh` | 用户级 systemd 服务 + 桌面入口 |
@@ -153,27 +188,46 @@ systemctl --user restart jarvis-workbench
 
 ```bash
 python3 workbench-app/tests/test_dispatch.py -v
+python3 workbench-app/tests/test_todo.py -v
+cd workbench-ui && npm run probe:todo   # headless 三区/拖拽/建卡/验收探针
 ```
 
-测试会为每个套件创建临时 `HERMES_KANBAN_HOME` 与 `WORKBENCH_DB`，并用
+后端测试会为每个套件创建临时 `HERMES_KANBAN_HOME` 与 `WORKBENCH_DB`，并用
 `~/.hermes/tools/python-3.14*/bin/python3`（或 `WORKBENCH_PYTHON` 指定）启动
 隔离服务。覆盖：验收闸门（PATCH/create/bulk/reclaim）、404 透传、parent 停卡、
 review/todo 落点、落地 GET、`/board` 失败与重读、幂等重派、快照 `write_token`
 归属、done/archived、running、非法 defaults 与卡覆盖、201-id 分块、上游挂起超时、
-PATCH 404、metadata 库故障、并发派发与共享 `kanban.db` 无 workbench 对象。
+PATCH 404、metadata 库故障、并发派发与共享 `kanban.db` 无 workbench 对象；
+待办写端点覆盖建卡默认值/校验、bucket/contract 合并、`contract_defaults`
+不被覆盖、验收落库与派发联动。
+
+`npm run probe:todo` 会自起隔离服务与 headless Chrome（无新增 npm 依赖），
+断言三列顺序/计数、仓库卡静态内容、空验收抖动与零请求、验收就地编辑、
+有验收派发、新建卡落今日/长期、外部轮询、created_at 排序、409 parent 提示、
+明暗 token、窄视口与双 tab 状态保持。`npm run verify` = `build + probe:todo`。
+
+探针前置条件：Node ≥22（内置 `WebSocket`/`fetch`）、本机 Chrome/Chromium
+（自动找 `google-chrome` / Playwright 缓存，找不到时用 `CHROME_BIN` 指定）、
+Python 运行时（同后端测试，可用 `WORKBENCH_PYTHON` 覆盖）。
 
 ## 已知限制
 
 - 固定当前 board，不切换多 board；metadata 只按 `task_id` 键（多 board 支持 deferred）
-- 1.2 只提供 metadata 读端点与派发快照；建卡/编辑契约的写端点属 Story 1.3
-- 待办三区与拖拽 UI 属 Story 1.3
-- 1.2 不实现 provenance / `contract.ready` 语义；只使用 `contract.input/accept/budget`
+- 待办不做长期→今日自动倒流、栏内拖动排序与排序持久化
+- 不实现 provenance / `contract.ready` 语义；只使用 `contract.input/accept/budget`
+- 建卡与 metadata 写入跨上游 REST + 本地库，非单事务；metadata 失败时返回 503，
+  客户端需用同一 `idempotency_key` 重试
+- 插件宿主只能看看板；待办依赖 `/api/workbench/*`，仅独立版 8787 提供
+- 非工作台建的 `triage` 卡没有 `bucket`，不会出现在今日/长期（需先写 metadata）
+- `contract.budget` 只能合并/覆盖键，暂不支持清空单个 budget 键
+- 待办/看板的轮询与拖拽逻辑目前各自实现，尚未抽共享 hook
+- 1.4 派发回执（位次/预计开始时间）尚未实现，现在成功只提示「已派发」
 - 上游 `recompute_ready` 与原生 9119 dashboard 不经过 ready 闸门；不额外加 watcher
 - 自调用仍是独立 `urllib` 请求（dispatch 在线程池执行），不共享连接池
 - 已跟踪的 `web/*.bak-*` 与旧 `web/app.js` / `sync-ui.sh` 清理 deferred；本次不删已跟踪文件
 - 没有任务详情抽屉（看详情仍可用 dashboard 的 Kanban 页）
 - 5 秒轮询，不是 WebSocket
-- 「今日/长期」归属以 `metadata.bucket` 为准；`localStorage` 只存排序与主题等 UI 偏好
+- 「今日/长期」归属以 `metadata.bucket` 为准；列表固定 `created_at` 倒序，不做栏内拖动或排序持久化
 - 无登录，仅限本机 / Tailscale
 
 ## 卸载

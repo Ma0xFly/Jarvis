@@ -66,14 +66,14 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def http_json(method: str, url: str, payload=None, timeout: float = 10.0):
-    headers = {"Accept": "application/json"}
+def http_json(method: str, url: str, payload=None, timeout: float = 10.0, headers=None):
+    request_headers = {"Accept": "application/json", **(headers or {})}
     data = None
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+        request_headers.setdefault("Content-Type", "application/json")
     opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
-    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+    req = urlrequest.Request(url, data=data, headers=request_headers, method=method)
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
@@ -263,6 +263,13 @@ class WorkbenchServer:
     def get_metadata(self, ids: list[str]):
         query = urlparse.quote(",".join(ids), safe="")
         return http_json("GET", self.base + "/api/workbench/metadata?ids=" + query)
+
+    def patch_metadata(self, task_id: str, patch: dict):
+        return http_json(
+            "PATCH",
+            self.base + "/api/workbench/metadata/" + urlparse.quote(task_id, safe=""),
+            patch,
+        )
 
     # -- direct DB manipulation (only for states upstream REST cannot set) --
 

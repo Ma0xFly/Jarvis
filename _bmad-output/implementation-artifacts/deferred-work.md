@@ -31,16 +31,12 @@
   evidence: （BH2）上游支持多 board，workbench 目前只用当前 board；切 board 时同 id 的 metadata 可能串。需要 board 维度后再引入。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-contract-gate.md`
-  summary: Story 1.3 提供 `contract`/`bucket` 的 workbench metadata 写端点，并接线 `mergeTaskMetadata`。
-  evidence: （BH8）1.2 只提供读端点与快照；建卡/编辑契约属于 1.3，当前只能直接操作 workbench.db 测试。
-
-- source_spec: `_bmad-output/implementation-artifacts/spec-1-2-contract-gate.md`
   summary: 处理 dispatch 的 done→ready TOCTOU：GET 与 PATCH 之间卡被完成时可能被重新打开。
   evidence: （EC9）上游 PATCH 无 compare-and-swap；窗口极小，但理论上可复活已完成卡。需要上游支持条件更新或客户端二次确认。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-contract-gate.md`
-  summary: 实现 provenance / `contract.ready` 语义；1.2 只使用 `contract.input` / `accept` / `budget`。
-  evidence: （二次审查 13）现有契约字段不参与派发决策；`contract.ready` 与 provenance 留给后续验收故事，1.2 不猜测语义。
+  summary: 实现 provenance / `contract.ready` 语义；1.2/1.3 只使用 `contract.input` / `accept` / `budget`。
+  evidence: （二次审查 13）现有契约字段不参与派发决策；`contract.ready` 与 provenance 留给后续验收故事。1.3 只在建卡时写入空 `ready` 占位，仍未定义其闸门语义。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-contract-gate.md`
   summary: 给上游 `recompute_ready`（parent 完成自动提升）与原生 9119 dashboard 补闸门，或加 watcher。
@@ -49,3 +45,23 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-2-contract-gate.md`
   summary: 清理已跟踪的 `workbench-app/web/*.bak-*` 与旧 `web/app.js` / `boot.js` / `sdk-shim.js` / `sync-ui.sh`。
   evidence: （二次审查 11）本次只把新 `.bak-*` 加入 `.gitignore`，不删除任何已跟踪文件；旧文件清理仍是独立任务（见 1.1 的 BH-7/BH-2 条目）。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
+  summary: 在真实插件宿主里运行待办三区（或给插件宿主提供 `/api/workbench/*` 代理/后端）。
+  evidence: 插件宿主没有 workbench 后端，当前只显示看板并提示使用独立版 8787；`dist/plugin` 只做了产物字节一致性检查，未在 Hermes dashboard 里跑待办运行时。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
+  summary: 处理没有 `bucket` 的 triage 卡：原生 dashboard/CLI 建的卡不会出现在今日/长期。
+  evidence: 待办只渲染 `status=triage` 且 `metadata.bucket` 为 `today|long` 的卡；仓库外建卡没有 metadata 写入口，目前不可见，需要 triage 收件箱或回填规则。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
+  summary: 支持清空 `contract.budget` 的单个键（或整体清空）。
+  evidence: metadata 写端点用 JSON1 `json_patch` 做合并，校验层不接受 null/空 budget；预算覆盖只能设置或覆盖，不能删除。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
+  summary: 抽取 Board / TodoPage 共享的轮询、toast、拖拽与 loading hook。
+  evidence: `Board.tsx` 与 `TodoPage.tsx` 各自实现 5s 轮询、toast 定时器与 HTML5 拖拽；行为已出现重复维护点（如拖拽高亮/清理），后续做详情抽屉或多视图时应先抽 hook。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
+  summary: Story 1.4 派发回执：派发后显示「已入队 · 第 N 位 · 预计 HH:MM」。
+  evidence: 1.3 成功派发只提示「已派发」并刷新；dispatch API 已返回 `position`/`eta`，但回执 UI、刷新后位次重算与失败重试文案属于 1.4。

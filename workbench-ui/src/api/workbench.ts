@@ -31,7 +31,7 @@ export interface ContractDefaults {
 
 /** workbench.db 中按 task_id 存的一份 metadata（不会出现在上游 /board 卡上） */
 export interface TaskMetadata {
-  bucket?: "today" | "long" | string;
+  bucket?: Bucket;
   contract?: WorkbenchContract;
   contract_defaults?: ContractDefaults;
   [key: string]: unknown;
@@ -44,9 +44,19 @@ export type WorkbenchErrorCode =
   | "not_dispatchable"
   | "not_found"
   | "invalid_defaults"
+  | "invalid_title"
+  | "invalid_bucket"
+  | "invalid_metadata"
+  | "invalid_contract"
+  | "invalid_request"
+  | "unsupported_media_type"
+  | "forbidden_origin"
+  | "payload_too_large"
   | "metadata_unavailable"
   | "upstream_unavailable"
-  | "dispatch_failed";
+  | "dispatch_failed"
+  | "create_failed"
+  | "metadata_failed";
 
 const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "missing_acceptance",
@@ -55,9 +65,19 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "not_dispatchable",
   "not_found",
   "invalid_defaults",
+  "invalid_title",
+  "invalid_bucket",
+  "invalid_metadata",
+  "invalid_contract",
+  "invalid_request",
+  "unsupported_media_type",
+  "forbidden_origin",
+  "payload_too_large",
   "metadata_unavailable",
   "upstream_unavailable",
   "dispatch_failed",
+  "create_failed",
+  "metadata_failed",
 ];
 
 /** 后端错误码优先；宿主 SDK 只给 message 时按文本兜底，最后按 HTTP 状态兜底 */
@@ -82,6 +102,28 @@ export interface DispatchResult {
   status: string;
 }
 
+/** 仓库卡归属：只允许 today / long，不占用 todo */
+export type Bucket = "today" | "long";
+
+export interface CreatedTask {
+  id: string;
+  title: string;
+  status: string;
+  created_at?: number | null;
+  [key: string]: unknown;
+}
+
+export interface CreateTaskResult {
+  ok: true;
+  task: CreatedTask;
+  metadata: TaskMetadata;
+}
+
+export interface TaskMetadataPatch {
+  bucket?: Bucket;
+  contract?: WorkbenchContract;
+}
+
 interface ApiErrorLike extends Error {
   code?: unknown;
   status?: unknown;
@@ -91,24 +133,38 @@ function isWorkbenchCode(value: unknown): value is WorkbenchErrorCode {
   return typeof value === "string" && (ERROR_CODES as readonly string[]).includes(value);
 }
 
-function fallbackCode(status?: number): WorkbenchErrorCode {
+type ErrorContext = "dispatch" | "create" | "metadata";
+
+/**
+ * HTTP 状态兜底只在没有后端 error 码时使用。400 的含义随调用而变：
+ * 只有 dispatch 是 missing_acceptance，create/save 一律按 invalid_* 处理。
+ */
+function fallbackCode(status: number | undefined, context: ErrorContext): WorkbenchErrorCode {
   switch (status) {
     case 400:
-      return "missing_acceptance";
+      return context === "dispatch" ? "missing_acceptance" : "invalid_request";
     case 404:
       return "not_found";
     case 500:
-      return "invalid_defaults";
+      return context === "dispatch"
+        ? "invalid_defaults"
+        : context === "create"
+          ? "create_failed"
+          : "metadata_failed";
     case 502:
       return "upstream_unavailable";
     case 503:
       return "metadata_unavailable";
     default:
-      return "dispatch_failed";
+      return context === "dispatch"
+        ? "dispatch_failed"
+        : context === "create"
+          ? "create_failed"
+          : "metadata_failed";
   }
 }
 
-function toWorkbenchError(error: unknown): WorkbenchError {
+function toWorkbenchError(error: unknown, context: ErrorContext = "dispatch"): WorkbenchError {
   if (error instanceof WorkbenchError) return error;
   const err = (error instanceof Error ? error : new Error(String(error))) as ApiErrorLike;
   const status = typeof err.status === "number" ? err.status : undefined;
@@ -116,7 +172,7 @@ function toWorkbenchError(error: unknown): WorkbenchError {
     return new WorkbenchError(err.code, err.message, status);
   }
   const code = ERROR_CODES.find((candidate) => err.message.includes(candidate));
-  return new WorkbenchError(code ?? fallbackCode(status), err.message, status);
+  return new WorkbenchError(code ?? fallbackCode(status, context), err.message, status);
 }
 
 /**
@@ -143,7 +199,67 @@ export async function dispatchTask(taskId: string): Promise<DispatchResult> {
       status: typeof data.status === "string" ? data.status : "ready",
     };
   } catch (error) {
-    throw toWorkbenchError(error);
+    throw toWorkbenchError(error, "dispatch");
+  }
+}
+
+/**
+ * 建一张待办卡：后端先走上游 `POST /tasks`（triage=true，1.2 闸门放行），
+ * 再写 workbench metadata（bucket + 空 contract）。不自动派发。
+ * `idempotencyKey` 由 UI 每次草稿尝试生成并在失败重试时复用；上游按 key
+ * 去重，metadata 失败后的重试不会建出第二张卡。
+ */
+export async function createTask(
+  title: string,
+  bucket: Bucket = "today",
+  idempotencyKey?: string,
+): Promise<CreateTaskResult> {
+  const trimmed = title.trim();
+  if (!trimmed) {
+    throw new WorkbenchError("invalid_title", "先写一句要做什么");
+  }
+  const payload: Record<string, unknown> = { title: trimmed, bucket };
+  if (idempotencyKey) payload.idempotency_key = idempotencyKey;
+  try {
+    const data = (await api(WORKBENCH + "/tasks", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    })) as Partial<CreateTaskResult> | null;
+    if (!data || data.ok !== true || !data.task || typeof data.task.id !== "string") {
+      throw new WorkbenchError("create_failed", "建卡响应格式不正确", 200);
+    }
+    const metadata =
+      data.metadata && typeof data.metadata === "object" ? data.metadata : { bucket };
+    return { ok: true, task: data.task, metadata };
+  } catch (error) {
+    throw toWorkbenchError(error, "create");
+  }
+}
+
+/**
+ * 就地写 workbench metadata（目前是 bucket / contract）。后端按 key 合并，
+ * 不会覆盖派发瞬间的 contract_defaults。
+ */
+export async function updateTaskMetadata(
+  taskId: string,
+  patch: TaskMetadataPatch,
+): Promise<TaskMetadata> {
+  if (!taskId || !taskId.trim()) {
+    throw new WorkbenchError("metadata_failed", "缺少任务 id");
+  }
+  try {
+    const data = (await api(WORKBENCH + "/metadata/" + encodeURIComponent(taskId), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })) as { ok?: unknown; metadata?: unknown } | null;
+    if (!data || data.ok !== true || !data.metadata || typeof data.metadata !== "object") {
+      throw new WorkbenchError("metadata_failed", "metadata 响应格式不正确", 200);
+    }
+    return data.metadata as TaskMetadata;
+  } catch (error) {
+    throw toWorkbenchError(error, "metadata");
   }
 }
 
@@ -183,7 +299,7 @@ export async function getTaskMetadata(ids: string[]): Promise<Record<string, Tas
     }
     return merged;
   } catch (error) {
-    throw toWorkbenchError(error);
+    throw toWorkbenchError(error, "metadata");
   }
 }
 

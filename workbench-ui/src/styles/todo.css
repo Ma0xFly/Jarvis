@@ -1,0 +1,265 @@
+/* 待办三区：流水线（302px 凹槽）/ 今日 / 长期（平面）。
+   仓库卡只承载标题 + 验收一行；hover 只换背景，不做边框/状态装饰。 */
+
+.wb-todo-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  gap: 10px;
+}
+
+.wb-todo-grid {
+  display: grid;
+  /* 仓库列给最小宽度：窄视口横向滚动，而不是把两列挤没 */
+  grid-template-columns: 302px minmax(220px, 1fr) minmax(220px, 1fr);
+  gap: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow-x: auto;
+}
+
+.wb-todo-col {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  border-radius: 10px;
+  padding: 8px;
+}
+
+/* 流水线是凹槽（比仓库深一档）；今日/长期是平面 */
+.wb-todo-flow {
+  background: var(--wb-sunken);
+  border: 1px solid var(--wb-border);
+}
+.wb-todo-flow.drop {
+  border-color: var(--wb-accent);
+  background: var(--wb-hover);
+  box-shadow: inset 0 0 0 1px var(--wb-accent);
+}
+.wb-todo-plane {
+  background: transparent;
+  padding: 6px 2px;
+}
+/* 平面列没有底色，sticky 头会透出滚动卡片；让它随列表滚走 */
+.wb-todo-plane .wb-todo-chead {
+  position: static;
+}
+
+.wb-todo-chead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--wb-fg);
+  padding: 2px 2px 4px;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: inherit;
+}
+.wb-todo-count {
+  margin-left: auto;
+  color: var(--wb-muted);
+  font-weight: 500;
+}
+
+.wb-todo-seg {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wb-todo-seghead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 3px 0;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  color: var(--wb-muted);
+}
+
+.wb-todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.wb-todo-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  background: var(--wb-card);
+}
+.wb-todo-repo-card {
+  border: 0;
+  cursor: grab;
+}
+.wb-todo-repo-card:hover {
+  /* 只换背景，不改边框/状态装饰 */
+  background: var(--wb-hover);
+}
+.wb-todo-repo-card:active {
+  cursor: grabbing;
+}
+.wb-todo-card.saving {
+  opacity: 0.65;
+}
+
+.wb-todo-title {
+  font-size: 12.5px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.wb-todo-accept {
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--wb-muted);
+  word-break: break-word;
+  cursor: text;
+  border-radius: 4px;
+  padding: 1px 2px;
+  margin: -1px -2px;
+}
+.wb-todo-accept:hover {
+  background: var(--wb-hover);
+}
+.wb-todo-accept.empty {
+  color: var(--wb-warn);
+  font-style: italic;
+}
+.wb-todo-flow-card {
+  cursor: default;
+}
+.wb-todo-flow-card .wb-todo-accept {
+  cursor: default;
+}
+.wb-todo-flow-card .wb-todo-accept:hover {
+  background: transparent;
+}
+
+.wb-todo-accept-input {
+  width: 100%;
+  font: inherit;
+  font-size: 11.5px;
+  color: var(--wb-fg);
+  background: var(--wb-card);
+  border: 1px solid var(--wb-accent);
+  border-radius: 4px;
+  padding: 2px 5px;
+  outline: none;
+}
+
+.wb-todo-warn {
+  font-size: 11px;
+  color: var(--wb-danger);
+}
+
+@keyframes wb-todo-shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-5px);
+  }
+  40% {
+    transform: translateX(5px);
+  }
+  60% {
+    transform: translateX(-4px);
+  }
+  80% {
+    transform: translateX(3px);
+  }
+}
+.wb-todo-shake {
+  animation: wb-todo-shake 300ms ease-in-out;
+}
+
+.wb-todo-dropempty,
+.wb-todo-empty {
+  border: 1px dashed var(--wb-border);
+  border-radius: 7px;
+  padding: 14px 8px;
+  text-align: center;
+  color: var(--wb-muted);
+  font-size: 11px;
+  opacity: 0.7;
+}
+.wb-todo-plane .wb-todo-empty {
+  border: 0;
+  padding: 18px 4px;
+  opacity: 0.55;
+}
+
+.wb-todo-composer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+.wb-todo-composer-label {
+  flex: 0 0 auto;
+  color: var(--wb-muted);
+  font-size: 11.5px;
+}
+.wb-todo-buckets {
+  display: flex;
+  gap: 2px;
+  flex: 0 0 auto;
+  padding: 2px;
+  border: 1px solid var(--wb-border);
+  border-radius: 8px;
+  background: var(--wb-card);
+}
+.wb-todo-bucket {
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--wb-muted);
+  font: inherit;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.wb-todo-bucket:hover {
+  background: var(--wb-hover);
+}
+.wb-todo-bucket.on {
+  background: var(--wb-hover);
+  color: var(--wb-fg);
+  font-weight: 600;
+}
+.wb-todo-bucket:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.wb-todo-composer input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--wb-fg);
+  background: var(--wb-card);
+  border: 1px solid var(--wb-border);
+  border-radius: 8px;
+  padding: 8px 11px;
+  outline: none;
+}
+.wb-todo-composer input::placeholder {
+  color: var(--wb-muted);
+}
+.wb-todo-composer input:focus {
+  border-color: var(--wb-accent);
+}
+.wb-todo-composer input:disabled {
+  opacity: 0.6;
+}
