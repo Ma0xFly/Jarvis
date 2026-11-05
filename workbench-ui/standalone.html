@@ -1,14 +1,37 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0b1110" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#ececea" />
     <title>Jarvis 工作台</title>
     <link rel="icon" href="/static/icon.svg" type="image/svg+xml" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="apple-touch-icon" href="/static/icon-192.png" />
+    <!-- 首屏前定主题：localStorage 优先，其次系统；避免刷新闪一下。
+         这里的 #ececea / #070809 是 theme.css `--canvas` 的 bootstrap 副本：
+         CSS 尚未加载，只能内联；改 token 时必须同步这里。 -->
+    <script>
+      (function () {
+        var theme = null;
+        try {
+          var stored = window.localStorage.getItem("wb-theme");
+          if (stored === "light" || stored === "dark") theme = stored;
+        } catch (error) {
+          // localStorage 被禁用时跟随系统。
+        }
+        if (!theme) {
+          theme =
+            window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches
+              ? "dark"
+              : "light";
+        }
+        document.documentElement.setAttribute("data-theme", theme);
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute("content", theme === "dark" ? "#070809" : "#ececea");
+      })();
+    </script>
     <link rel="stylesheet" href="/static/theme.css" />
     <link rel="stylesheet" href="/static/style.css" />
   </head>

@@ -3215,8 +3215,8 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
                 "description": "待办 / 看板 / 已完成：任务读写本机 kanban.db，契约存工作台自有库",
                 "start_url": "/",
                 "display": "standalone",
-                "background_color": "#0b1110",
-                "theme_color": "#0b1110",
+                "background_color": "#ececea",
+                "theme_color": "#ececea",
                 "icons": [
                     {"src": "/static/icon.svg", "sizes": "any", "type": "image/svg+xml"},
                     {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},

@@ -28,14 +28,15 @@ export interface Column {
 
 /** 唯一的列定义：顺序即原生顺序 */
 export const COLUMNS: readonly Column[] = [
-  { key: "triage", label: "待整理", color: "var(--wb-muted)" },
-  { key: "todo", label: "待执行", color: "var(--wb-warn)" },
-  { key: "scheduled", label: "已排期", color: "var(--wb-warn)" },
+  /* 列头点是装饰而非正文：用 raw 007 色，避免为对比度调深后的正文色。 */
+  { key: "triage", label: "待整理", color: "var(--wb-muted-raw)" },
+  { key: "todo", label: "待执行", color: "var(--wb-wait-raw)" },
+  { key: "scheduled", label: "已排期", color: "var(--wb-wait-raw)" },
   { key: "ready", label: "就绪", color: "var(--wb-accent)" },
-  { key: "running", label: "运行中", color: "var(--wb-ok)" },
-  { key: "blocked", label: "待拍板", color: "var(--wb-danger)" },
-  { key: "review", label: "待验收", color: "#8b5cf6" },
-  { key: "done", label: "已完成", color: "var(--wb-muted)" },
+  { key: "running", label: "运行中", color: "var(--wb-run-raw)" },
+  { key: "blocked", label: "待拍板", color: "var(--wb-block-raw)" },
+  { key: "review", label: "待验收", color: "var(--wb-rev-raw)" },
+  { key: "done", label: "已完成", color: "var(--wb-muted-raw)" },
 ] as const;
 
 /** 由 COLUMNS 派生的查找表（不是第二份定义） */

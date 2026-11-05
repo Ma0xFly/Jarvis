@@ -1,4 +1,4 @@
-/* 看板：8 列横排 + 横向滚动。
+/* 看板：8 列横排 + 横向滚动（007 列/卡片视觉，不采用 007 的 5 列 IA）。
    列的 key / label / 顺序由 src/board/columns.ts 的 COLUMNS 决定，这里只管外观。 */
 
 .wb-board-wrap {
@@ -7,6 +7,7 @@
   flex: 1;
   min-height: 0;
   gap: 10px;
+  padding: 14px;
 }
 
 .wb-stats {
@@ -14,21 +15,23 @@
   align-items: center;
   gap: 16px;
   color: var(--wb-muted);
-  font-size: 12px;
+  font-size: 11.5px;
   flex: 0 0 auto;
 }
 .wb-stats b {
-  color: var(--wb-fg);
+  color: var(--wb-text2);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 .wb-hint {
   margin-left: auto;
-  opacity: 0.8;
+  color: var(--wb-faint);
+  font-size: 10.5px;
 }
 
 .wb-board {
   display: flex;
-  gap: 9px;
+  gap: 10px;
   flex: 1;
   min-height: 0;
   overflow-x: auto;
@@ -44,57 +47,59 @@
   min-width: 168px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  background: var(--wb-card);
-  border: 1px solid var(--wb-border);
-  border-radius: 9px;
+  gap: 5px;
+  background: var(--wb-col);
+  border: 1px solid var(--wb-hair);
+  border-radius: 10px;
   padding: 8px;
   min-height: 0;
   overflow-y: auto;
 }
 .wb-col.drop {
   border-color: var(--wb-accent);
-  background: var(--wb-hover);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wb-accent) 12%, transparent);
 }
 
 .wb-chead {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 12px;
+  font-size: 11px;
   color: var(--wb-muted);
-  padding: 2px 2px 4px;
+  padding: 1px 2px 4px;
   position: sticky;
   top: 0;
-  background: inherit;
+  z-index: 1;
+  background: var(--wb-col);
 }
 .wb-cname {
-  color: var(--wb-fg);
+  color: var(--wb-text2);
   font-weight: 600;
 }
 .wb-ccount {
   margin-left: auto;
-  opacity: 0.7;
+  color: var(--wb-faint);
+  font-variant-numeric: tabular-nums;
 }
 .wb-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
+  width: 6px;
+  height: 6px;
+  border-radius: 2px;
   flex: 0 0 auto;
 }
 
 .wb-card {
   background: var(--wb-card);
   border: 1px solid var(--wb-border);
-  border-radius: 8px;
-  padding: 8px 9px;
+  border-radius: 6px;
+  padding: 7px 8px;
   cursor: grab;
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
 }
 .wb-card:hover {
-  border-color: var(--wb-accent);
+  background: var(--wb-hover);
 }
 .wb-card:active {
   cursor: grabbing;
@@ -103,8 +108,8 @@
   opacity: 0.72;
 }
 .wb-card .ct {
-  font-size: 12.5px;
-  line-height: 1.4;
+  font-size: 11.5px;
+  line-height: 1.45;
   word-break: break-word;
 }
 .wb-card .cm {
@@ -112,8 +117,8 @@
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
-  font-size: 11px;
-  color: var(--wb-muted);
+  font-size: 10.5px;
+  color: var(--wb-faint);
 }
 .wb-card .cid {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -123,18 +128,18 @@
   border: 1px solid var(--wb-border);
   border-radius: 4px;
   padding: 0 4px;
-  font-size: 10px;
+  font-size: 9.5px;
 }
 .wb-block {
   border: 1px solid var(--wb-danger);
   color: var(--wb-danger);
   border-radius: 4px;
   padding: 0 4px;
-  font-size: 10px;
+  font-size: 9.5px;
 }
 .wb-time {
   margin-left: auto;
-  opacity: 0.8;
+  color: var(--wb-faint);
 }
 /* 已完成卡的会话入口：拖拽卡片不受影响（按钮自己不是拖拽源）。 */
 .wb-card-session {
@@ -142,25 +147,24 @@
   background: var(--wb-card);
   color: var(--wb-muted);
   font: inherit;
-  font-size: 10.5px;
+  font-size: 10px;
   line-height: 1.5;
   padding: 0 6px;
+  min-height: 24px;
   border-radius: 5px;
   cursor: pointer;
 }
 .wb-card-session:hover {
-  background: var(--wb-hover);
-  border-color: var(--wb-accent);
-  color: var(--wb-fg);
+  border-color: var(--wb-accent-border);
+  color: var(--wb-accent);
 }
 .wb-card-session:focus-visible {
   outline: 2px solid var(--wb-accent);
   outline-offset: 1px;
 }
 .wb-sum {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--wb-muted);
-  opacity: 0.9;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
@@ -168,17 +172,16 @@
 }
 .wb-tag {
   border-radius: 4px;
-  background: var(--wb-hover);
+  background: var(--wb-chip);
   padding: 0 5px;
-  font-size: 10px;
+  font-size: 9.5px;
 }
 
 .wb-dropempty {
   border: 1px dashed var(--wb-border);
   border-radius: 7px;
-  padding: 14px 8px;
+  padding: 10px 8px;
   text-align: center;
-  color: var(--wb-muted);
-  font-size: 11px;
-  opacity: 0.7;
+  color: var(--wb-faint);
+  font-size: 10.5px;
 }

@@ -67,9 +67,17 @@ function newIdempotencyKey(): string {
 interface TodoPageProps {
   /** 独立版入口：打开全屏验收；带 taskId 时先看这张卡。 */
   onVerify?: (taskId?: string) => void;
+  /** 外壳侧栏计数：今日 + 长期仓库卡数量。 */
+  onCounts?: (counts: { today: number; long: number }) => void;
+  /** 每次自增表示「切到待办并聚焦 composer」；0 表示首屏不抢焦点。 */
+  focusComposer?: number;
 }
 
-export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElement {
+export default function TodoPage({
+  onVerify,
+  onCounts,
+  focusComposer,
+}: TodoPageProps): React.ReactElement {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [metadataById, setMetadataById] = useState<Record<string, TaskMetadata>>({});
   const [err, setErr] = useState("");
@@ -88,6 +96,7 @@ export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElemen
   const [draftBucket, setDraftBucket] = useState<Bucket>("today");
   const [creating, setCreating] = useState(false);
 
+  const composerRef = useRef<HTMLInputElement | null>(null);
   const toastTimer = useRef<number | null>(null);
   const shakeTimer = useRef<number | null>(null);
   const warnTimer = useRef<number | null>(null);
@@ -218,6 +227,17 @@ export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElemen
 
   const today = useMemo(() => repoCards(tasks, "today"), [tasks]);
   const long = useMemo(() => repoCards(tasks, "long"), [tasks]);
+
+  useEffect(() => {
+    onCounts?.({ today: today.length, long: long.length });
+  }, [today.length, long.length, onCounts]);
+
+  // 新建按钮只切 tab + 自增信号；composer 挂载（loaded）且不在建卡中才聚焦。
+  useEffect(() => {
+    if (!focusComposer || !loaded || creating) return;
+    const frame = window.requestAnimationFrame(() => composerRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [focusComposer, loaded, creating]);
 
   const flowLists = FLOW_SEGMENTS.map((segment) => ({
     ...segment,
@@ -422,7 +442,14 @@ export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElemen
               }
             }}
           >
-            {accept || "补一句怎样算做完"}
+            {accept ? (
+              <>
+                <span className="wb-todo-accept-lab">验收 · </span>
+                {accept}
+              </>
+            ) : (
+              "补一句怎样算做完"
+            )}
           </div>
         )}
         {warnId === task.id ? (
@@ -459,89 +486,121 @@ export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElemen
           <div className="wb-todo-chead">
             <span className="wb-todo-cname">流水线</span>
             <span className="wb-todo-count">{flowCount}</span>
+            <span className="wb-todo-hint">拖进来才算派发</span>
           </div>
 
-          {flowLists.map((segment) => {
-            const openVerify = segment.key === "review" ? onVerify : undefined;
-            return (
-              <div className="wb-todo-seg" key={segment.key}>
-                <div className="wb-todo-seghead">
-                  {openVerify ? (
-                    <button
-                      className="wb-todo-seghead-open"
-                      type="button"
-                      onClick={() => openVerify()}
-                      title="进入全屏验收"
-                    >
-                      {segment.label}
-                    </button>
-                  ) : (
-                    <span>{segment.label}</span>
-                  )}
-                  <span>{segment.cards.length}</span>
-                </div>
-                {segment.cards.map((task, index) => {
-                  const accept = acceptText(task);
-                  // 位次是派生值：ready 段内按 /board 顺序 1-based，每次渲染重算。
-                  const position = segment.key === "ready" ? index + 1 : 0;
-                  const openThis = openVerify ? () => openVerify(task.id) : undefined;
-                  return (
-                    <div
-                      className={"wb-todo-card wb-todo-flow-card" + (openThis ? " clickable" : "")}
-                      key={task.id}
-                      role={openThis ? "button" : undefined}
-                      tabIndex={openThis ? 0 : undefined}
-                      title={openThis ? "打开验收" : task.title}
-                      onClick={openThis}
-                      onKeyDown={
-                        openThis
-                          ? (event) => {
-                              if (event.key === "Enter" || event.key === " ") {
-                                event.preventDefault();
-                                openThis();
+          <div className="wb-todo-body">
+            {flowLists.map((segment) => {
+              const openVerify = segment.key === "review" ? onVerify : undefined;
+              return (
+                <div className="wb-todo-seg" key={segment.key}>
+                  <div className="wb-todo-seghead">
+                    {openVerify ? (
+                      <button
+                        className="wb-todo-seghead-open"
+                        type="button"
+                        onClick={() => openVerify()}
+                        title="进入全屏验收"
+                      >
+                        {segment.label}
+                      </button>
+                    ) : (
+                      <span>{segment.label}</span>
+                    )}
+                    <span className="wb-todo-segline" />
+                    <b className="wb-todo-segcount">{segment.cards.length}</b>
+                  </div>
+                  {segment.cards.map((task, index) => {
+                    const accept = acceptText(task);
+                    // 位次是派生值：ready 段内按 /board 顺序 1-based，每次渲染重算。
+                    const position = segment.key === "ready" ? index + 1 : 0;
+                    const openThis = openVerify ? () => openVerify(task.id) : undefined;
+                    return (
+                      <div
+                        className={
+                          "wb-todo-card wb-todo-flow-card" + (openThis ? " clickable" : "")
+                        }
+                        key={task.id}
+                        role={openThis ? "button" : undefined}
+                        tabIndex={openThis ? 0 : undefined}
+                        title={openThis ? "打开验收" : task.title}
+                        onClick={openThis}
+                        onKeyDown={
+                          openThis
+                            ? (event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  openThis();
+                                }
                               }
-                            }
-                          : undefined
-                      }
-                    >
-                      <div className="wb-todo-flow-head">
-                        <span className="wb-todo-title">{task.title}</span>
-                        <PositionBadge status={task.status} position={position} />
+                            : undefined
+                        }
+                      >
+                        <div className="wb-todo-flow-head">
+                          <span className="wb-todo-title">{task.title}</span>
+                          <PositionBadge status={task.status} position={position} />
+                        </div>
+                        <div className={"wb-todo-accept" + (accept ? "" : " empty")}>
+                          {accept ? (
+                            <>
+                              <span className="wb-todo-accept-lab">验收 · </span>
+                              {accept}
+                            </>
+                          ) : (
+                            "未写验收"
+                          )}
+                        </div>
                       </div>
-                      <div className={"wb-todo-accept" + (accept ? "" : " empty")}>
-                        {accept || "未写验收"}
-                      </div>
+                    );
+                  })}
+                  {segment.cards.length === 0 ? (
+                    <div className="wb-todo-empty">
+                      {segment.key === "ready"
+                        ? "队列空"
+                        : segment.key === "running"
+                          ? "没有在跑的"
+                          : "没有待收的"}
                     </div>
-                  );
-                })}
-              </div>
-            );
-          })}
+                  ) : null}
+                </div>
+              );
+            })}
 
-          {flowCount === 0 ? <div className="wb-todo-dropempty">拖到这里派发</div> : null}
+            <div className="wb-todo-dropempty">拖卡片到这里 = 派发</div>
+          </div>
         </section>
 
         <section className="wb-todo-col wb-todo-plane">
           <div className="wb-todo-chead">
             <span className="wb-todo-cname">今日</span>
             <span className="wb-todo-count">{today.length}</span>
+            <span className="wb-todo-hint">只存信息 · 无状态</span>
           </div>
-          <div className="wb-todo-list">{today.map(renderRepoCard)}</div>
-          {today.length === 0 ? <div className="wb-todo-empty">还没有今日卡</div> : null}
+          <div className="wb-todo-body">
+            <div className="wb-todo-list">{today.map(renderRepoCard)}</div>
+            {today.length === 0 ? (
+              <div className="wb-todo-empty">还没有今日卡</div>
+            ) : null}
+          </div>
         </section>
 
         <section className="wb-todo-col wb-todo-plane">
           <div className="wb-todo-chead">
             <span className="wb-todo-cname">长期</span>
             <span className="wb-todo-count">{long.length}</span>
+            <span className="wb-todo-hint">冷存储 · 想不起就别做</span>
           </div>
-          <div className="wb-todo-list">{long.map(renderRepoCard)}</div>
-          {long.length === 0 ? <div className="wb-todo-empty">还没有长期卡</div> : null}
+          <div className="wb-todo-body">
+            <div className="wb-todo-list">{long.map(renderRepoCard)}</div>
+            {long.length === 0 ? <div className="wb-todo-empty">还没有长期卡</div> : null}
+          </div>
         </section>
       </div>
 
       <div className="wb-todo-composer">
-        <span className="wb-todo-composer-label">新建到</span>
+        <span className="wb-todo-composer-icon" aria-hidden="true">
+          ✎
+        </span>
         <div className="wb-todo-buckets" role="group" aria-label="新建卡归属">
           <button
             type="button"
@@ -561,6 +620,7 @@ export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElemen
           </button>
         </div>
         <input
+          ref={composerRef}
           value={draft}
           disabled={creating}
           placeholder="一句话记下来，回车新建"
@@ -571,6 +631,9 @@ export default function TodoPage({ onVerify }: TodoPageProps): React.ReactElemen
             void submitDraft();
           }}
         />
+        <span className="wb-todo-composer-hint">
+          默认落{draftBucket === "today" ? "今日" : "长期"} <kbd>↵</kbd>
+        </span>
       </div>
 
       {toast ? <div className="wb-toast">{toast}</div> : null}

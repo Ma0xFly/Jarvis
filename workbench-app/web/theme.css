@@ -1,98 +1,125 @@
 /* Standalone shell + theme tokens for the workbench.
-   The plugin CSS consumes these tokens; everything else is page chrome. */
+   Visual reference: sketches/007-dispatch-pipeline (light/dark token pair).
+   The plugin CSS consumes the --color-* mapping below; the raw tokens are for
+   the standalone app frame and any 007-style surface. */
 
-:root,
+:root {
+  --canvas: #ececea;
+  --app: #fbfbfa;
+  --side: #f7f7f5;
+  --card: #ffffff;
+  --text: #1b1b19;
+  --text2: #4a4a45;
+  /* 文本色按 WCAG 4.5:1 调深；raw 版本只给点/装饰用。 */
+  --muted: #5f5f58;
+  --faint: #6b6b63;
+  --border: #e5e5df;
+  --hair: #efefea;
+  --hover: #f5f5f1;
+  --col: #f4f4f0;
+  --accent: #5e6ad2;
+  --accent-2: #4f5ac0;
+  --accent-weak: #ececf9;
+  --accent-border: #d8d8f2;
+  --accent-ink: #ffffff;
+  --chip: #f2f2ee;
+  --chip-border: #e4e4df;
+  --run: #15803d;
+  --wait: #92400e;
+  --block: #b91c1c;
+  --rev: #6d28d9;
+  --muted-raw: #8c8c84;
+  --run-raw: #22c55e;
+  --wait-raw: #d9a520;
+  --block-raw: #ef4444;
+  --rev-raw: #8b5cf6;
+  --shadow: 0 12px 40px rgba(0, 0, 0, 0.08);
+  --overlay: rgba(20, 20, 18, 0.32);
+
+  /* Existing views consume --color-*; keep them working by mapping 007 tokens. */
+  --bg: var(--canvas);
+  --color-background: var(--app);
+  --color-card: var(--card);
+  --color-card-foreground: var(--text);
+  --color-popover-foreground: var(--text);
+  --color-muted-foreground: var(--muted);
+  --color-border: var(--border);
+  --color-primary: var(--accent);
+  --color-primary-foreground: var(--accent-ink);
+  --color-accent: var(--hover);
+  --color-destructive: var(--block);
+  --color-success: var(--run);
+  --color-warning: var(--wait);
+
+  color-scheme: light;
+}
+
 :root[data-theme="dark"] {
-  --bg: #0b1110;
-  --bg-image: radial-gradient(1100px 520px at 18% -12%, #17231f 0%, #0b1110 62%);
-  --color-card: #121a17;
-  --color-card-foreground: #f0e6d6;
-  --color-popover-foreground: #f0e6d6;
-  --color-muted-foreground: #94a29c;
-  --color-border: rgba(240, 230, 214, 0.13);
-  --color-primary: #eadfc9;
-  --color-primary-foreground: #0b1110;
-  --color-accent: rgba(240, 230, 214, 0.07);
-  --color-destructive: #e0716f;
-  --color-success: #74c69d;
-  --color-warning: #d9a441;
-  --bar-bg: rgba(11, 17, 16, 0.82);
-  --shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  --canvas: #070809;
+  --app: #0b0d10;
+  --side: #0d1014;
+  --card: #101318;
+  --text: #d7dade;
+  --text2: #aab1b8;
+  --muted: #7b838c;
+  --faint: #8b959f;
+  --border: #1d2229;
+  --hair: #1a1e24;
+  --hover: #12161c;
+  --col: #0f1216;
+  --accent: #8b93f0;
+  --accent-2: #a5abf5;
+  --accent-weak: #181c30;
+  --accent-border: #2a3260;
+  --accent-ink: #0b0d10;
+  --chip: #161a20;
+  --chip-border: #232a33;
+  --run: #34d399;
+  --wait: #fbbf24;
+  --block: #f87171;
+  --rev: #a78bfa;
+  --muted-raw: #7b838c;
+  --run-raw: #34d399;
+  --wait-raw: #fbbf24;
+  --block-raw: #f87171;
+  --rev-raw: #a78bfa;
+  --shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  --overlay: rgba(0, 0, 0, 0.55);
+
+  color-scheme: dark;
 }
 
-:root[data-theme="light"] {
-  --bg: #f5f3ed;
-  --bg-image: radial-gradient(1100px 520px at 18% -12%, #ffffff 0%, #f5f3ed 62%);
-  --color-card: #ffffff;
-  --color-card-foreground: #1b2320;
-  --color-popover-foreground: #1b2320;
-  --color-muted-foreground: #6b7772;
-  --color-border: rgba(27, 35, 32, 0.13);
-  --color-primary: #1f6f5f;
-  --color-primary-foreground: #ffffff;
-  --color-accent: rgba(31, 111, 95, 0.08);
-  --color-destructive: #c0392b;
-  --color-success: #2e7d5b;
-  --color-warning: #a97412;
-  --bar-bg: rgba(245, 243, 237, 0.86);
-  --shadow: 0 8px 30px rgba(27, 35, 32, 0.10);
+* {
+  box-sizing: border-box;
 }
 
-* { box-sizing: border-box; }
-html, body { height: 100%; }
+html,
+body {
+  height: 100%;
+}
+
 body {
   margin: 0;
-  background: var(--bg-image), var(--bg);
+  background: var(--canvas);
   color: var(--color-card-foreground);
-  font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
   -webkit-font-smoothing: antialiased;
+  line-height: 1.5;
   overflow: hidden;
 }
 
-#shell { height: 100%; display: flex; flex-direction: column; }
-
-#appbar {
-  flex: 0 0 44px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 0 14px;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--bar-bg);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  user-select: none;
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
 }
-#appbar .logo {
-  width: 18px; height: 18px; border-radius: 5px;
-  background: var(--color-primary);
-  display: grid; place-items: center;
-  color: var(--color-primary-foreground);
-  font-size: 11px; font-weight: 800;
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 8px;
 }
-#appbar .brand { font-size: 12.5px; font-weight: 650; letter-spacing: .2px; }
-#appbar .sub { font-size: 10.5px; color: var(--color-muted-foreground); margin-left: 2px; }
-#appbar .spacer { flex: 1; }
-#appbar .conn {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 10.5px; color: var(--color-muted-foreground);
-  padding: 4px 9px; border: 1px solid var(--color-border); border-radius: 999px;
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-muted-foreground);
 }
-#appbar .conn .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--color-warning); }
-#appbar .conn.on .dot { background: var(--color-success); }
-#appbar .conn.off .dot { background: var(--color-destructive); }
-#appbar button {
-  border: 1px solid var(--color-border);
-  background: transparent; color: var(--color-card-foreground);
-  width: 30px; height: 28px; border-radius: 7px; cursor: pointer;
-  font-size: 13px; line-height: 1;
+::-webkit-scrollbar-track {
+  background: transparent;
 }
-#appbar button:hover { background: var(--color-accent); }
-
-#app { flex: 1 1 auto; min-height: 0; }
-#app > .wb-root { height: 100%; }
-
-::-webkit-scrollbar { width: 9px; height: 9px; }
-::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 8px; }
-::-webkit-scrollbar-thumb:hover { background: var(--color-muted-foreground); }
-::-webkit-scrollbar-track { background: transparent; }

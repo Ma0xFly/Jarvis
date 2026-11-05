@@ -81,3 +81,23 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-2-2-p0-notifications.md`
   summary: 补一条通知 sweep 与 accept/reject 并发的 guard 测试（board 读取窗口内完成动作）。
   evidence: （VG6）`server.py` 的 `notification_lock` 已把 board 读取 + collect 与动作串行化，但测试只顺序调用 sweep/action；重叠窗口为一次 board 读取，下一轮 sweep 会自愈。可仿照 `tests/test_dispatch.py:1598` 的 GateLockTests 构造阻塞 board 读取。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-visual-align-007.md`
+  summary: 窄视口（<=900px）侧栏隐藏后，给「新建待办」提供一个顶栏入口或把侧栏做成抽屉。
+  evidence: （BH11）007 的「＋ 新建待办」只在侧栏；`<=900px` 隐藏侧栏后只剩待办 tab 内的 composer，创建入口不再显式可见。属于响应式增强，不改 007 桌面外壳。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-visual-align-007.md`
+  summary: 给 Board / TodoPage / DonePage 的 5s 轮询抽共享的 sequence guard（或共享 hook），避免慢响应乱序覆盖新数据。
+  evidence: （EC2）三处都用 `setInterval` + 无请求序号；DonePage 本次新增，Board/Todo 是既有模式。只修 DonePage 会留下不一致，应在共享轮询 hook 里一次修三处。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-visual-align-007.md`
+  summary: 为 PWA manifest 的 `theme_color/background_color` 补回归断言，并决定暗色安装时的单色启动画面策略。
+  evidence: （VG7/BH2）manifest 是静态单色（当前 `#ececea`），浏览器只在安装/启动读取；四个探针与 `workbench-app/tests` 都没有 fetch `/manifest.webmanifest`。动态 manifest 或按主题生成是后续 PWA 工作。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-visual-align-007.md`
+  summary: 已完成视图在轮询失败后保留旧数据时，显示最后更新时间/陈旧标识。
+  evidence: （BH23）`DonePage` 出错时保留上一次 `board`，只显示 `.wb-done-error`；没有 `last_updated`/stale 提示，用户无法判断列表是新的还是旧的。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-visual-align-007.md`
+  summary: 把已完成视图的 `/board` 读取、列 key 与完成日分组并入共享 board 数据层。
+  evidence: （BH9）`Board` 在 standalone 常驻并 5s 轮询，`DonePage` 打开时再起一份 5s `/board`；两处各自定义 `BoardData/BoardColumn`，`DonePage` 用字面量 `"done"` 匹配列。spec 明确 DonePage 只在激活时挂载，故本次按设计实现，共享数据层留后续。

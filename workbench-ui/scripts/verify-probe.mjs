@@ -560,6 +560,19 @@ async function main() {
       verifyTheme.light !== verifyTheme.dark && verifyTheme.lightFg !== verifyTheme.darkFg,
       JSON.stringify(verifyTheme),
     );
+    const verifyLayout = await evaluate(`(() => {
+      const top = document.querySelector('.wb-verify-top');
+      const body = document.querySelector('.wb-verify-body');
+      return {
+        topHeight: top?.getBoundingClientRect().height ?? 0,
+        grid: body ? getComputedStyle(body).gridTemplateColumns : '',
+      };
+    })()`);
+    check(
+      "验收 007 布局：48px 顶栏 + 396px 右栏",
+      Math.round(verifyLayout.topHeight) === 48 && verifyLayout.grid.includes("396px"),
+      JSON.stringify(verifyLayout),
+    );
 
     // Key repeat must not accept twice / at all.
     await pressKey("a", { repeat: true });
@@ -723,6 +736,76 @@ async function main() {
       "无验收标准警示",
     );
     check("无验收标准时显示警示", (await verifyCount()) === "1/1");
+
+    const warnContrast = await evaluate(`(() => {
+      const parse = (value) => {
+        const rgba = value.match(/^rgba?\\(([^)]+)\\)$/);
+        if (rgba) {
+          const parts = rgba[1].split(/[ ,\\/]+/).filter(Boolean).map(Number);
+          return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
+        }
+        const srgb = value.match(/^color\\(srgb ([^)]+)\\)$/);
+        if (srgb) {
+          const parts = srgb[1].split(/[ \\/]+/).filter(Boolean).map(Number);
+          return {
+            r: parts[0] * 255,
+            g: parts[1] * 255,
+            b: parts[2] * 255,
+            a: parts.length > 3 ? parts[3] : 1,
+          };
+        }
+        return null;
+      };
+      const over = (top, bottom) => ({
+        r: top.r * top.a + bottom.r * (1 - top.a),
+        g: top.g * top.a + bottom.g * (1 - top.a),
+        b: top.b * top.a + bottom.b * (1 - top.a),
+        a: 1,
+      });
+      const lum = (color) => {
+        const channel = (value) => {
+          const n = value / 255;
+          return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+      };
+      const ratio = (a, b) => {
+        const l1 = lum(a);
+        const l2 = lum(b);
+        return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+      };
+      const backdrop = (node) => {
+        const layers = [];
+        for (let cur = node; cur; cur = cur.parentElement) {
+          const bg = parse(getComputedStyle(cur).backgroundColor);
+          if (bg && bg.a > 0) layers.push(bg);
+          if (bg && bg.a >= 1) break;
+        }
+        let result = { r: 255, g: 255, b: 255, a: 1 };
+        for (let index = layers.length - 1; index >= 0; index -= 1) {
+          result = over(layers[index], result);
+        }
+        return result;
+      };
+      const node = [...document.querySelectorAll('.wb-verify-note.warn')].find(
+        (candidate) => candidate.textContent.includes('没有写验收标准'),
+      );
+      const root = document.documentElement;
+      const result = {};
+      for (const theme of ['light', 'dark']) {
+        root.dataset.theme = theme;
+        const text = parse(getComputedStyle(node).color);
+        const bg = backdrop(node);
+        result[theme] = ratio(text, bg);
+      }
+      root.dataset.theme = 'dark';
+      return result;
+    })()`);
+    check(
+      "验收警示文本明暗主题对比度 >= 4.5",
+      warnContrast.light >= 4.5 && warnContrast.dark >= 4.5,
+      JSON.stringify(warnContrast),
+    );
 
     // A new review card appears while the overlay is open: the 5s poll must
     // append it to the queue and keep the countdown working.

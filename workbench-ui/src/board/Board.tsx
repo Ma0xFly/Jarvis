@@ -39,12 +39,12 @@ export interface Task {
   completed_at?: number | null;
 }
 
-interface BoardCol {
+export interface BoardCol {
   name: string;
   tasks: Task[];
 }
 
-interface BoardData {
+export interface BoardData {
   columns: BoardCol[];
 }
 
@@ -53,6 +53,8 @@ const POLL_MS = 5000;
 interface BoardProps {
   /** 独立版：打开已完成卡本轮执行会话（插件宿主不传）。 */
   onOpenSession?: (taskId: string, title?: string) => void;
+  /** 独立版外壳计数：运行中 / 已完成。插件宿主不传。 */
+  onStats?: (stats: { running: number; done: number }) => void;
 }
 
 /** 相对时间，与原生卡片上的 "4h ago" 同义 */
@@ -75,7 +77,7 @@ function dayKey(ts?: number | null): string {
   return "earlier";
 }
 
-export default function Board({ onOpenSession }: BoardProps): React.ReactElement {
+export default function Board({ onOpenSession, onStats }: BoardProps): React.ReactElement {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [err, setErr] = useState<string>("");
   const [dropCol, setDropCol] = useState<string | null>(null);
@@ -128,6 +130,11 @@ export default function Board({ onOpenSession }: BoardProps): React.ReactElement
 
   const runningCount = byCol["running"] ? byCol["running"].length : 0;
   const doneTasks = byCol["done"] || [];
+
+  // 外壳计数由看板这一份轮询数据提供，不新增端点。
+  useEffect(() => {
+    onStats?.({ running: runningCount, done: doneTasks.length });
+  }, [runningCount, doneTasks.length, onStats]);
 
   /** 拖拽落列：就绪走 dispatch（快照/位次），其余走原生 PATCH 状态机 */
   const flowDrop = useCallback(

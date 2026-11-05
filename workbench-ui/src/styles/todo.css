@@ -1,4 +1,4 @@
-/* 待办三列：流水线（302px 凹槽）/ 今日 / 长期（平面）。
+/* 待办三列：流水线（302px 凹槽）/ 今日 / 长期（007 面板）。
    仓库卡只承载标题 + 验收一行；hover 只换背景，不做边框/状态装饰。 */
 
 .wb-todo-wrap {
@@ -6,7 +6,7 @@
   flex-direction: column;
   flex: 1;
   min-height: 0;
-  gap: 10px;
+  padding: 14px 14px 0;
 }
 
 .wb-todo-grid {
@@ -19,68 +19,89 @@
   overflow-x: auto;
 }
 
+/* 007 panel：卡面 + 细边框 + 圆角；表头固定，正文滚动 */
 .wb-todo-col {
   display: flex;
   flex-direction: column;
-  gap: 7px;
   min-width: 0;
   min-height: 0;
-  overflow-y: auto;
-  border-radius: 10px;
-  padding: 8px;
-}
-
-/* 流水线是凹槽（比仓库深一档）；今日/长期是平面 */
-.wb-todo-flow {
-  background: var(--wb-sunken);
+  overflow: hidden;
+  border-radius: 11px;
+  background: var(--wb-card);
   border: 1px solid var(--wb-border);
+}
+/* 流水线是凹槽（比仓库深一档），机器自己的视觉重量 */
+.wb-todo-flow {
+  background: var(--wb-col);
 }
 .wb-todo-flow.drop {
   border-color: var(--wb-accent);
-  background: var(--wb-hover);
-  box-shadow: inset 0 0 0 1px var(--wb-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--wb-accent) 12%, transparent);
 }
 .wb-todo-plane {
-  background: transparent;
-  padding: 6px 2px;
+  background: var(--wb-card);
 }
-/* 平面列没有底色，sticky 头会透出滚动卡片；让它随列表滚走 */
-.wb-todo-plane .wb-todo-chead {
-  position: static;
+
+.wb-todo-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px 9px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .wb-todo-chead {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
-  font-size: 12px;
-  font-weight: 600;
+  padding: 11px 13px 9px;
+  border-bottom: 1px solid var(--wb-hair);
+  flex: 0 0 auto;
+}
+.wb-todo-cname {
+  font-size: 12.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
   color: var(--wb-fg);
-  padding: 2px 2px 4px;
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: inherit;
 }
 .wb-todo-count {
-  margin-left: auto;
-  color: var(--wb-muted);
+  color: var(--wb-faint);
   font-weight: 500;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.wb-todo-hint {
+  margin-left: auto;
+  color: var(--wb-faint);
+  font-size: 10.5px;
+  white-space: nowrap;
 }
 
 .wb-todo-seg {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
 }
 .wb-todo-seghead {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 2px 3px 0;
+  gap: 7px;
+  padding: 6px 3px 5px;
   font-size: 10.5px;
   letter-spacing: 0.04em;
   color: var(--wb-muted);
+}
+.wb-todo-segline {
+  flex: 1;
+  height: 1px;
+  background: var(--wb-hair);
+}
+.wb-todo-segcount {
+  color: var(--wb-text2);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .wb-todo-list {
@@ -95,14 +116,14 @@
   gap: 4px;
   padding: 8px 9px;
   border-radius: 8px;
-  background: var(--wb-card);
 }
+/* 仓库卡刻意"轻"：无边框、无底色，hover 只换背景 */
 .wb-todo-repo-card {
+  background: transparent;
   border: 0;
   cursor: grab;
 }
 .wb-todo-repo-card:hover {
-  /* 只换背景，不改边框/状态装饰 */
   background: var(--wb-hover);
 }
 .wb-todo-repo-card:active {
@@ -114,13 +135,13 @@
 
 .wb-todo-title {
   font-size: 12.5px;
-  line-height: 1.4;
+  line-height: 1.45;
   word-break: break-word;
 }
 
 .wb-todo-accept {
-  font-size: 11.5px;
-  line-height: 1.35;
+  font-size: 11px;
+  line-height: 1.45;
   color: var(--wb-muted);
   word-break: break-word;
   cursor: text;
@@ -128,14 +149,19 @@
   padding: 1px 2px;
   margin: -1px -2px;
 }
+.wb-todo-accept-lab {
+  color: var(--wb-faint);
+}
 .wb-todo-accept:hover {
   background: var(--wb-hover);
 }
 .wb-todo-accept.empty {
-  color: var(--wb-warn);
+  color: var(--wb-wait);
   font-style: italic;
 }
 .wb-todo-flow-card {
+  background: var(--wb-card);
+  border: 1px solid var(--wb-border);
   cursor: default;
 }
 .wb-todo-flow-card .wb-todo-accept {
@@ -173,6 +199,7 @@
   position: relative;
   flex: 0 0 auto;
   height: 32px;
+  margin-bottom: 8px;
 }
 /* 回执条：常驻 live region，只换文本；只展示 dispatch 返回值，不做进度条。 */
 .wb-todo-receipt {
@@ -220,7 +247,7 @@
   background: var(--wb-accent);
 }
 .wb-todo-receipt.running .wb-todo-receipt-dot {
-  background: var(--wb-ok);
+  background: var(--wb-run-raw);
 }
 .wb-todo-receipt-dismiss {
   flex: 0 0 auto;
@@ -272,7 +299,8 @@
   white-space: nowrap;
 }
 .wb-todo-badge.running {
-  color: color-mix(in srgb, var(--wb-ok) 70%, var(--wb-fg));
+  /* 007 的 run 绿在浅色下偏亮：与前景色多混一点，保持 4.5:1 */
+  color: color-mix(in srgb, var(--wb-ok) 55%, var(--wb-fg));
   background: color-mix(in srgb, var(--wb-ok) 14%, transparent);
 }
 
@@ -315,45 +343,57 @@
   animation: wb-todo-shake 300ms ease-in-out;
 }
 
+/* 007 empty / dropzone */
 .wb-todo-dropempty,
 .wb-todo-empty {
   border: 1px dashed var(--wb-border);
-  border-radius: 7px;
-  padding: 14px 8px;
+  border-radius: 8px;
+  padding: 10px;
   text-align: center;
-  color: var(--wb-muted);
-  font-size: 11px;
-  opacity: 0.7;
+  color: var(--wb-faint);
+  font-size: 10.5px;
+  line-height: 1.7;
+}
+.wb-todo-dropempty {
+  margin-top: auto;
+}
+/* 分段空态是提示文字，不是投放目标：只有底部 dropzone 用虚线 */
+.wb-todo-seg > .wb-todo-empty {
+  border: 0;
+  padding: 12px 6px;
 }
 .wb-todo-plane .wb-todo-empty {
   border: 0;
-  padding: 18px 4px;
-  opacity: 0.55;
+  padding: 18px 10px;
 }
 
+/* 007 capture：底部一条输入，无边框输入框 + 归属开关 */
 .wb-todo-composer {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 9px;
   flex: 0 0 auto;
+  margin: 0 -14px;
+  padding: 9px 14px;
+  border-top: 1px solid var(--wb-hair);
 }
-.wb-todo-composer-label {
+.wb-todo-composer-icon {
+  color: var(--wb-faint);
+  font-size: 13px;
   flex: 0 0 auto;
-  color: var(--wb-muted);
-  font-size: 11.5px;
 }
 .wb-todo-buckets {
   display: flex;
   gap: 2px;
   flex: 0 0 auto;
   padding: 2px;
-  border: 1px solid var(--wb-border);
-  border-radius: 8px;
-  background: var(--wb-card);
+  border: 1px solid var(--wb-chip-border);
+  border-radius: 7px;
+  background: var(--wb-chip);
 }
 .wb-todo-bucket {
   border: 0;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--wb-muted);
   font: inherit;
@@ -365,7 +405,7 @@
   background: var(--wb-hover);
 }
 .wb-todo-bucket.on {
-  background: var(--wb-hover);
+  background: var(--wb-card);
   color: var(--wb-fg);
   font-weight: 600;
 }
@@ -377,20 +417,27 @@
   flex: 1;
   min-width: 0;
   font: inherit;
-  font-size: 12.5px;
+  font-size: 13px;
   color: var(--wb-fg);
-  background: var(--wb-card);
-  border: 1px solid var(--wb-border);
-  border-radius: 8px;
-  padding: 8px 11px;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  padding: 7px 2px;
   outline: none;
 }
 .wb-todo-composer input::placeholder {
-  color: var(--wb-muted);
+  color: var(--wb-faint);
 }
-.wb-todo-composer input:focus {
-  border-color: var(--wb-accent);
+.wb-todo-composer input:focus-visible {
+  outline: 2px solid var(--wb-accent);
+  outline-offset: 1px;
 }
 .wb-todo-composer input:disabled {
   opacity: 0.6;
+}
+.wb-todo-composer-hint {
+  flex: 0 0 auto;
+  color: var(--wb-faint);
+  font-size: 10.5px;
+  white-space: nowrap;
 }

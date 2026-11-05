@@ -28,6 +28,14 @@
  *   - badge contrast >= 4.5:1 in both themes
  *   - new card lands in today, triage, empty acceptance, not auto-dispatched
  *   - 409 parent: toast「已转为 todo，等 parent 完成」and card leaves repository
+ *   - 007 shell: 24px canvas + 12px app frame, 224px sidebar, 50px topbar,
+ *     three real nav entries (no 活动/统计), tabs + 待你处理 + theme toggle
+ *   - theme: inline first-paint script before stylesheet, toggle updates
+ *     data-theme / localStorage / theme-color, reload keeps the theme
+ *   - 已完成: empty text, done column grouped by local completed_at day
+ *     (今天 → 昨天), completed time + session entry, missing session prompt
+ *   - board: 8 columns keep the native names/order (no 007 five-column IA)
+ *   - plugin host: board only, no sidebar / todo / done / theme toggle
  *
  * Usage: node scripts/todo-probe.mjs
  *   CHROME_BIN, WORKBENCH_PYTHON override auto-discovery.
@@ -332,6 +340,21 @@ async function main() {
       bundle.includes("wb-todo-cname") && bundle.includes("wb-todo-flow"),
       "先运行 npm run build",
     );
+    check(
+      "独立版产物包含 007 外壳与已完成视图",
+      ["wb-shell", "wb-sidebar", "wb-topbar", "wb-theme-toggle", "wb-done-wrap", "wb-done-session"].every(
+        (name) => bundle.includes(name),
+      ),
+      "先运行 npm run build",
+    );
+    const standaloneHtml = await fetch(`${base}/`).then((response) => response.text());
+    check(
+      "首屏内联脚本先于样式表定主题（无闪烁）",
+      standaloneHtml.includes("wb-theme") &&
+        standaloneHtml.indexOf("wb-theme") <
+          standaloneHtml.indexOf('<link rel="stylesheet" href="/static/theme.css"'),
+      "standalone.html 的 inline theme 必须在 theme.css 之前",
+    );
 
     // ---- seed through public REST -------------------------------------
     const createUpstream = async (title, parents = []) => {
@@ -373,6 +396,11 @@ async function main() {
     const parent = await createUpstream("未完成 parent");
     const blockedChild = await createUpstream("等 parent 卡", [parent]);
     await setMetadata(blockedChild, { bucket: "today", contract: { accept: "子任务标准" } });
+
+    // 只进看板、不进仓库：给对比度矩阵提供一个 .wb-block 样本。
+    const blockTagCard = await createUpstream("看板阻塞标签卡");
+    updateKanban("UPDATE tasks SET status=? WHERE id=?", blockTagCard, "blocked");
+    updateKanban("UPDATE tasks SET block_kind=? WHERE id=?", blockTagCard, "needs_input");
 
     // ---- launch headless Chrome --------------------------------------
     const debugPort = await freePort();
@@ -460,6 +488,89 @@ async function main() {
       })()`);
 
     const readReadyBadges = () => readFlowSegment("队列");
+
+    /** 在明暗两套 token 下量一组选择器的文本对比度（含透明背景向上合成）。 */
+    const contrastMatrix = (selectors, { forceActiveReview = false } = {}) =>
+      evaluate(`(() => {
+        const parse = (value) => {
+          const rgba = value.match(/^rgba?\\(([^)]+)\\)$/);
+          if (rgba) {
+            const parts = rgba[1].split(/[ ,\\/]+/).filter(Boolean).map(Number);
+            return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
+          }
+          const srgb = value.match(/^color\\(srgb ([^)]+)\\)$/);
+          if (srgb) {
+            const parts = srgb[1].split(/[ \\/]+/).filter(Boolean).map(Number);
+            return {
+              r: parts[0] * 255,
+              g: parts[1] * 255,
+              b: parts[2] * 255,
+              a: parts.length > 3 ? parts[3] : 1,
+            };
+          }
+          return null;
+        };
+        const over = (top, bottom) => ({
+          r: top.r * top.a + bottom.r * (1 - top.a),
+          g: top.g * top.a + bottom.g * (1 - top.a),
+          b: top.b * top.a + bottom.b * (1 - top.a),
+          a: 1,
+        });
+        const lum = (color) => {
+          const channel = (value) => {
+            const n = value / 255;
+            return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
+          };
+          return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+        };
+        const ratio = (a, b) => {
+          const l1 = lum(a);
+          const l2 = lum(b);
+          return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+        };
+        const backdrop = (node) => {
+          const layers = [];
+          for (let cur = node; cur; cur = cur.parentElement) {
+            const bg = parse(getComputedStyle(cur).backgroundColor);
+            if (bg && bg.a > 0) layers.push(bg);
+            if (bg && bg.a >= 1) break;
+          }
+          let result = { r: 255, g: 255, b: 255, a: 1 };
+          for (let index = layers.length - 1; index >= 0; index -= 1) {
+            result = over(layers[index], result);
+          }
+          return result;
+        };
+        const contrastOf = (selector) => {
+          const node = document.querySelector(selector);
+          if (!node) return null;
+          const text = parse(getComputedStyle(node).color);
+          if (!text) return null;
+          const bg = backdrop(node);
+          return ratio(text.a < 1 ? over(text, bg) : text, bg);
+        };
+        const root = document.documentElement;
+        // 背景 token 有 250ms 过渡：测量时禁掉，避免读到切换中途的颜色。
+        const freeze = document.createElement('style');
+        freeze.textContent = '*,*::before,*::after{transition:none !important;animation:none !important}';
+        document.head.appendChild(freeze);
+        const reviewNode = document.querySelector('.wb-review-entry');
+        const reviewWasActive = reviewNode?.classList.contains('active') ?? false;
+        ${forceActiveReview ? "reviewNode?.classList.add('active');" : ""}
+        const selectors = ${JSON.stringify(selectors)};
+        const result = {};
+        for (const theme of ['light', 'dark']) {
+          root.dataset.theme = theme;
+          result[theme] = {};
+          for (const key of Object.keys(selectors)) {
+            result[theme][key] = contrastOf(selectors[key]);
+          }
+        }
+        root.dataset.theme = 'dark';
+        if (reviewNode && !reviewWasActive) reviewNode.classList.remove('active');
+        freeze.remove();
+        return result;
+      })()`);
 
     // Must match the exact query the UI polls (no include_archived).
     const boardReadyTasks = async () => {
@@ -567,6 +678,177 @@ async function main() {
       "document.querySelectorAll('.wb-todo-col').length === 3 && document.querySelectorAll('.wb-todo-repo-card').length === 4",
       15000,
       "待办三列与仓库卡渲染",
+    );
+
+    // 007 待办视觉：面板有底色/边框，仓库卡无边框透明底，流水线是凹槽。
+    const todoVisual = await evaluate(`(() => {
+      const plane = document.querySelector('.wb-todo-plane');
+      const repo = document.querySelector('.wb-todo-repo-card');
+      const flow = document.querySelector('.wb-todo-flow');
+      return {
+        planeBg: getComputedStyle(plane).backgroundColor,
+        planeBorder: getComputedStyle(plane).borderTopWidth,
+        repoBorder: getComputedStyle(repo).borderTopWidth,
+        repoBg: getComputedStyle(repo).backgroundColor,
+        flowBg: getComputedStyle(flow).backgroundColor,
+      };
+    })()`);
+    check(
+      "待办 007 面板 / 轻卡片 / 凹槽流水线",
+      todoVisual.planeBorder === "1px" &&
+        todoVisual.planeBg !== "rgba(0, 0, 0, 0)" &&
+        todoVisual.repoBorder === "0px" &&
+        todoVisual.repoBg === "rgba(0, 0, 0, 0)" &&
+        todoVisual.flowBg !== todoVisual.planeBg,
+      JSON.stringify(todoVisual),
+    );
+
+    // ---- 首屏主题：index.js 未运行时就已把 dark 写进 DOM ----
+    await evaluate("window.localStorage.removeItem('wb-theme'); true");
+    await cdp.send("Network.enable");
+    // SW 是 network-first，但断网时回退缓存；先绕过它再屏蔽 bundle。
+    await cdp.send("Network.setBypassServiceWorker", { bypass: true });
+    await cdp.send("Network.setBlockedURLs", { urls: ["*index.js*"] });
+    await cdp.send("Emulation.setEmulatedMedia", {
+      media: "",
+      features: [{ name: "prefers-color-scheme", value: "dark" }],
+    });
+    await cdp.send("Page.reload", { ignoreCache: true });
+    await waitForEval("document.readyState === 'complete'", 10000, "首屏 bootstrap 文档");
+    const firstPaint = await evaluate(`(() => ({
+      theme: document.documentElement.dataset.theme || '',
+      bodyBg: getComputedStyle(document.body).backgroundColor,
+      bundleMounted: Boolean(document.querySelector('.wb-root')) || Boolean(window.__wbProbe),
+    }))()`);
+    check(
+      "首屏 bundle 前已定 dark（无 localStorage、系统 dark）",
+      firstPaint.theme === "dark" &&
+        firstPaint.bodyBg === "rgb(7, 8, 9)" &&
+        firstPaint.bundleMounted === false,
+      JSON.stringify(firstPaint),
+    );
+    await cdp.send("Network.setBlockedURLs", { urls: [] });
+    await cdp.send("Network.setBypassServiceWorker", { bypass: false });
+    await cdp.send("Emulation.setEmulatedMedia", { media: "", features: [] });
+    await cdp.send("Page.reload", { ignoreCache: true });
+    await waitForEval(
+      "document.querySelectorAll('.wb-todo-col').length === 3",
+      15000,
+      "首屏测试后恢复待办",
+    );
+
+    // ---- 0. 007 shell: canvas frame + 224px sidebar + 50px topbar ----
+    const shellState = await evaluate(`(() => {
+      const root = document.querySelector('.wb-root');
+      const shell = document.querySelector('.wb-shell');
+      const sidebar = document.querySelector('.wb-sidebar');
+      const topbar = document.querySelector('.wb-topbar');
+      const views = document.querySelector('.wb-views');
+      const nav = [...document.querySelectorAll('.wb-nav-btn')];
+      return {
+        rootPadding: getComputedStyle(root).padding,
+        shellBorderRadius: getComputedStyle(shell).borderTopLeftRadius,
+        shellBorderWidth: getComputedStyle(shell).borderTopWidth,
+        sidebarWidth: sidebar.getBoundingClientRect().width,
+        topbarHeight: topbar.getBoundingClientRect().height,
+        views: Boolean(views),
+        navLabels: nav.map((node) => node.querySelector('span')?.textContent || ''),
+        navCounts: nav.map((node) => node.querySelector('.wb-nav-count')?.textContent || ''),
+        tabs: [...document.querySelectorAll('.wb-tab-label')].map((node) => node.textContent),
+        themeToggle: Boolean(document.querySelector('.wb-theme-toggle')),
+        reviewEntry: document.querySelector('.wb-review-entry')?.textContent.replace(/\\s+/g, ' ').trim() || '',
+        hasOldNav: ['活动', '统计'].some((label) => nav.some((node) => node.textContent.includes(label))),
+      };
+    })()`);
+    check(
+      "standalone 画布 24px + 圆角 app 框",
+      shellState.rootPadding === '24px' &&
+        shellState.shellBorderRadius === '12px' &&
+        shellState.shellBorderWidth === '1px',
+      JSON.stringify(shellState),
+    );
+    check(
+      "侧栏 224px、顶栏 50px、视图容器存在",
+      Math.round(shellState.sidebarWidth) === 224 &&
+        Math.round(shellState.topbarHeight) === 50 &&
+        shellState.views === true,
+      JSON.stringify(shellState),
+    );
+    check(
+      "侧栏只有待办/看板/已完成三个真实入口",
+      JSON.stringify(shellState.navLabels) === JSON.stringify(["待办", "看板", "已完成"]) &&
+        shellState.hasOldNav === false,
+      JSON.stringify(shellState),
+    );
+    check(
+      "侧栏计数 = 可见数据（4 待办 / 0 运行 / 0 已完成）",
+      JSON.stringify(shellState.navCounts) === JSON.stringify(["4", "0 运行", "0"]),
+      JSON.stringify(shellState.navCounts),
+    );
+    check(
+      "顶栏三个 tab + 待你处理 + 主题切换",
+      JSON.stringify(shellState.tabs) === JSON.stringify(["待办", "看板", "已完成"]) &&
+        shellState.reviewEntry.includes("待你处理") &&
+        shellState.themeToggle === true,
+      JSON.stringify(shellState),
+    );
+
+    // 侧栏三个入口各点一次：对应面板必须成为唯一可见 pane。
+    const navViews = [];
+    for (const label of ["待办", "看板", "已完成"]) {
+      const clicked = await evaluate(`(() => {
+        const button = [...document.querySelectorAll('.wb-nav-btn')].find(
+          (node) => node.querySelector('span')?.textContent === ${JSON.stringify(label)},
+        );
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`);
+      await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+      const pane = await evaluate(`(() => {
+        const visible = document.querySelector('.wb-pane:not(.wb-pane-hidden)');
+        return {
+          todo: Boolean(visible?.querySelector('.wb-todo-wrap')),
+          board: Boolean(visible?.querySelector('.wb-board-wrap')),
+          done: Boolean(visible?.querySelector('.wb-done-wrap')),
+          current: visible?.querySelector('[aria-current="page"]')?.textContent || '',
+        };
+      })()`);
+      navViews.push({ label, clicked, ...pane });
+    }
+    check(
+      "侧栏入口切到对应 pane",
+      navViews.every(
+        (view) =>
+          view.clicked === true &&
+          ((view.label === "待办" && view.todo && !view.board && !view.done) ||
+            (view.label === "看板" && view.board && !view.todo && !view.done) ||
+            (view.label === "已完成" && view.done && !view.todo && !view.board)),
+      ),
+      JSON.stringify(navViews),
+    );
+
+    // 从看板点「新建待办」：切回待办并聚焦 composer。
+    await evaluate(`(() => {
+      const button = [...document.querySelectorAll('.wb-nav-btn')].find(
+        (node) => node.querySelector('span')?.textContent === '看板',
+      );
+      button?.click();
+      return true;
+    })()`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+    await evaluate("document.querySelector('.wb-newbtn').click(); true");
+    await waitForEval(
+      "document.querySelector('.wb-pane:not(.wb-pane-hidden) .wb-todo-wrap') !== null && document.activeElement === document.querySelector('.wb-todo-composer input')",
+      5000,
+      "新建待办聚焦 composer",
+    );
+    check("新建待办切到待办并聚焦 composer", true);
+    check(
+      "新建待办后待办入口为 aria-current",
+      (await evaluate(
+        "document.querySelector('.wb-nav-btn[aria-current=\"page\"]')?.querySelector('span')?.textContent || ''",
+      )) === "待办",
     );
 
     // Instrument the workbench calls made after this point.
@@ -1297,89 +1579,36 @@ async function main() {
     const theme = await evaluate(`(async () => {
       const root = document.documentElement;
       const flow = document.querySelector('.wb-todo-flow');
-      const before = getComputedStyle(flow).backgroundColor;
+      root.dataset.theme = 'dark';
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+      const dark = getComputedStyle(flow).backgroundColor;
       root.dataset.theme = 'light';
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-      const after = getComputedStyle(flow).backgroundColor;
-      root.dataset.theme = 'dark';
-      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-      return { before, after };
+      const light = getComputedStyle(flow).backgroundColor;
+      return { dark, light };
     })()`);
-    check("明暗主题走 base.css token", theme.before !== theme.after, JSON.stringify(theme));
+    check("明暗主题走 base.css token", theme.dark !== theme.light, JSON.stringify(theme));
 
     // Badge is 10.5px text and the receipt is 12px: require WCAG AA 4.5:1.
-    const themeContrast = await evaluate(`(() => {
-      const parse = (value) => {
-        const rgba = value.match(/^rgba?\\(([^)]+)\\)$/);
-        if (rgba) {
-          const parts = rgba[1].split(/[ ,\\/]+/).filter(Boolean).map(Number);
-          return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
-        }
-        const srgb = value.match(/^color\\(srgb ([^)]+)\\)$/);
-        if (srgb) {
-          const parts = srgb[1].split(/[ \\/]+/).filter(Boolean).map(Number);
-          return {
-            r: parts[0] * 255,
-            g: parts[1] * 255,
-            b: parts[2] * 255,
-            a: parts.length > 3 ? parts[3] : 1,
-          };
-        }
-        return null;
-      };
-      const over = (top, bottom) => ({
-        r: top.r * top.a + bottom.r * (1 - top.a),
-        g: top.g * top.a + bottom.g * (1 - top.a),
-        b: top.b * top.a + bottom.b * (1 - top.a),
-        a: 1,
-      });
-      const lum = (color) => {
-        const channel = (value) => {
-          const n = value / 255;
-          return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
-        };
-        return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
-      };
-      const ratio = (a, b) => {
-        const l1 = lum(a);
-        const l2 = lum(b);
-        return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
-      };
-      const contrastFor = (selector) => {
-        const badge = document.querySelector(selector);
-        if (!badge) return null;
-        const style = getComputedStyle(badge);
-        const text = parse(style.color);
-        const layer = parse(style.backgroundColor);
-        let base = parse(getComputedStyle(badge.closest('.wb-todo-card')).backgroundColor);
-        const page = parse(getComputedStyle(document.body).backgroundColor);
-        if (!text || !layer || !base || !page) return null;
-        if (base.a < 1) base = over(base, page);
-        return ratio(text, over(layer, base));
-      };
-      const contrastOnPage = (selector) => {
-        const node = document.querySelector(selector);
-        if (!node) return null;
-        const style = getComputedStyle(node);
-        const text = parse(style.color);
-        const layer = parse(style.backgroundColor);
-        const page = parse(getComputedStyle(document.body).backgroundColor);
-        if (!text || !layer || !page) return null;
-        return ratio(text, over(layer, page));
-      };
-      const root = document.documentElement;
-      const result = {};
-      for (const theme of ['light', 'dark']) {
-        root.dataset.theme = theme;
-        result[theme] = {
-          ready: contrastFor('.wb-todo-badge:not(.running)'),
-          running: contrastFor('.wb-todo-badge.running'),
-          receipt: contrastOnPage('.wb-todo-receipt'),
-        };
-      }
-      root.dataset.theme = 'dark';
-      return result;
-    })()`);
+    const themeContrast = await contrastMatrix(
+      {
+        ready: ".wb-todo-badge:not(.running)",
+        running: ".wb-todo-badge.running",
+        receipt: ".wb-todo-receipt",
+        navCountActive: ".wb-nav-btn.on .wb-nav-count",
+        navCountIdle: ".wb-nav-btn:not(.on) .wb-nav-count",
+        navActive: ".wb-nav-btn.on",
+        tabLabelActive: ".wb-tab.on .wb-tab-label",
+        tabLabelIdle: ".wb-tab:not(.on) .wb-tab-label",
+        tabActive: ".wb-tab.on",
+        reviewActive: ".wb-review-entry",
+        acceptEmpty: ".wb-todo-accept.empty",
+        block: ".wb-block",
+      },
+      { forceActiveReview: true },
+    );
+    const contrastOk = (entry) =>
+      Object.values(entry || {}).every((value) => typeof value === "number" && value >= 4.5);
     check(
       "ready 徽标明暗主题对比度 >= 4.5",
       themeContrast?.light?.ready >= 4.5 && themeContrast?.dark?.ready >= 4.5,
@@ -1393,6 +1622,11 @@ async function main() {
     check(
       "回执条明暗主题对比度 >= 4.5",
       themeContrast?.light?.receipt >= 4.5 && themeContrast?.dark?.receipt >= 4.5,
+      JSON.stringify(themeContrast),
+    );
+    check(
+      "外壳/待办文本明暗主题对比度 >= 4.5",
+      contrastOk(themeContrast?.light) && contrastOk(themeContrast?.dark),
       JSON.stringify(themeContrast),
     );
 
@@ -1424,6 +1658,20 @@ async function main() {
       "窄视口整栏横向滚动",
       narrow.overflowX === "auto" && narrow.columns === 3 && narrow.scrollWidth > narrow.width,
       `${narrow.scrollWidth} > ${narrow.width}`,
+    );
+    const narrowShell = await evaluate(`(() => ({
+      sidebar: getComputedStyle(document.querySelector('.wb-sidebar')).display,
+      topbar: getComputedStyle(document.querySelector('.wb-topbar')).display,
+      tabs: [...document.querySelectorAll('.wb-tab-label')].map((node) => node.textContent),
+      docOverflow: document.documentElement.scrollWidth - window.innerWidth,
+    }))()`);
+    check(
+      "窄视口侧栏隐藏、顶栏 tabs 可用、页面不横向溢出",
+      narrowShell.sidebar === "none" &&
+        narrowShell.topbar !== "none" &&
+        JSON.stringify(narrowShell.tabs) === JSON.stringify(["待办", "看板", "已完成"]) &&
+        narrowShell.docOverflow <= 0,
+      JSON.stringify(narrowShell),
     );
     await cdp.send("Emulation.clearDeviceMetricsOverride");
 
@@ -1537,11 +1785,11 @@ async function main() {
       return true;
     })()`);
     const tabLabels = await evaluate(
-      "[...document.querySelectorAll('.wb-tab')].map((node) => node.textContent)",
+      "[...document.querySelectorAll('.wb-tab')].map((node) => node.querySelector('.wb-tab-label')?.textContent || node.textContent)",
     );
     check(
-      "待办 / 看板两个 tab",
-      JSON.stringify(tabLabels) === JSON.stringify(["待办", "看板"]),
+      "待办 / 看板 / 已完成三个 tab",
+      JSON.stringify(tabLabels) === JSON.stringify(["待办", "看板", "已完成"]),
       JSON.stringify(tabLabels),
     );
     await evaluate("document.querySelectorAll('.wb-tab')[1].click()");
@@ -1551,9 +1799,35 @@ async function main() {
       return {
         displays: panes.map((node) => getComputedStyle(node).display),
         columns: document.querySelectorAll('.wb-board .wb-col').length,
+        names: [...document.querySelectorAll('.wb-board .wb-col .wb-cname')].map(
+          (node) => node.textContent,
+        ),
       };
     })()`);
     check("看板 8 列正常", flowView.columns === 8, String(flowView.columns));
+    check(
+      "看板 8 列名称/顺序不变（无 007 的 5 列）",
+      JSON.stringify(flowView.names) ===
+        JSON.stringify(["待整理", "待执行", "已排期", "就绪", "运行中", "待拍板", "待验收", "已完成"]),
+      JSON.stringify(flowView.names),
+    );
+    const boardVisual = await evaluate(`(() => {
+      const col = document.querySelector('.wb-board .wb-col');
+      const card = document.querySelector('.wb-board .wb-card');
+      return {
+        radius: getComputedStyle(col).borderTopLeftRadius,
+        colBg: getComputedStyle(col).backgroundColor,
+        cardBg: card ? getComputedStyle(card).backgroundColor : null,
+      };
+    })()`);
+    check(
+      "看板 007 列/卡片视觉（10px 凹槽列 + 卡片底色）",
+      boardVisual.radius === "10px" &&
+        boardVisual.colBg !== "rgba(0, 0, 0, 0)" &&
+        boardVisual.cardBg !== null &&
+        boardVisual.cardBg !== boardVisual.colBg,
+      JSON.stringify(boardVisual),
+    );
     check(
       "切到看板只显示看板面板",
       flowView.displays.length === 2 &&
@@ -1739,7 +2013,187 @@ async function main() {
     );
     check("超时后 in-flight 串行锁已释放", true);
 
-    // ---- 17. plugin host: ready drop blocked, other columns work ------
+    // ---- 17. 已完成（只读、按天分组）+ 主题持久化 -------------------
+    await cdp.send("Page.reload");
+    await waitForEval(
+      "Boolean(document.querySelector('.wb-shell')) && document.querySelectorAll('.wb-todo-col').length === 3",
+      15000,
+      "重载后外壳与待办",
+    );
+    await evaluate(`(() => {
+      const tab = [...document.querySelectorAll('.wb-tab')].find(
+        (node) => node.querySelector('.wb-tab-label')?.textContent === '已完成',
+      );
+      if (!tab) return false;
+      tab.click();
+      return true;
+    })()`);
+    await waitForEval("Boolean(document.querySelector('.wb-done-wrap'))", 5000, "已完成视图挂载");
+    await waitForEval(
+      "document.querySelector('.wb-done-empty')?.textContent.includes('还没有已完成的卡') === true",
+      8000,
+      "已完成空态",
+    );
+    const emptyDone = await evaluate("document.querySelector('.wb-done-empty')?.textContent || ''");
+    check("已完成空态文案", emptyDone.includes("还没有已完成的卡"), emptyDone);
+
+    const doneTodayCard = await createUpstream("已完成今天卡");
+    const doneYesterdayCard = await createUpstream("已完成昨天卡");
+    // 锚定本地正午，避免 23:59 跑探针时「今天」跨到明天。
+    const noon = new Date();
+    noon.setHours(12, 0, 0, 0);
+    const noonSeconds = Math.floor(noon.getTime() / 1000);
+    // 直接写 throwaway kanban.db：完成列与 completed_at 是上游内核态，
+    // 这里只为了让已完成视图拿到两个已知本地日与一条 run 摘要。
+    const markDone = (taskId, completedAt, summary) => {
+      updateKanban("UPDATE tasks SET status=? WHERE id=?", taskId, "done");
+      updateKanban("UPDATE tasks SET completed_at=? WHERE id=?", taskId, completedAt);
+      updateKanban(
+        "INSERT INTO task_runs (summary, task_id, status, started_at, ended_at) VALUES (?, ?, 'done', 0, 0)",
+        taskId,
+        summary,
+      );
+    };
+    markDone(doneTodayCard, noonSeconds, "今天的完成摘要");
+    markDone(doneYesterdayCard, noonSeconds - 86400, "昨天的完成摘要");
+
+    await waitForEval(
+      "document.querySelectorAll('.wb-done-row').length === 2",
+      12000,
+      "已完成两行渲染",
+    );
+    const doneState = await evaluate(`(() => ({
+      groups: [...document.querySelectorAll('.wb-done-day > span:first-child')].map(
+        (node) => node.textContent,
+      ),
+      titles: [...document.querySelectorAll('.wb-done-title')].map((node) => node.textContent),
+      times: [...document.querySelectorAll('.wb-done-time')].map((node) => node.textContent),
+      summaries: [...document.querySelectorAll('.wb-done-summary')].map((node) => node.textContent),
+      sessions: document.querySelectorAll('.wb-done-session').length,
+    }))()`);
+    check(
+      "已完成按本地日倒序分组（今天 → 昨天）",
+      JSON.stringify(doneState.groups) === JSON.stringify(["今天", "昨天"]),
+      JSON.stringify(doneState.groups),
+    );
+    check(
+      "已完成行按 completed_at 倒序且展示摘要/时间",
+      JSON.stringify(doneState.titles) === JSON.stringify(["已完成今天卡", "已完成昨天卡"]) &&
+        doneState.summaries.includes("今天的完成摘要") &&
+        doneState.times.every((text) => /^\d{2}:\d{2}$/.test(text)),
+      JSON.stringify(doneState),
+    );
+    check("已完成行有会话入口", doneState.sessions === 2, String(doneState.sessions));
+
+    const doneTextContrast = await contrastMatrix({
+      title: ".wb-done-title",
+      summary: ".wb-done-summary",
+      time: ".wb-done-time",
+    });
+    check(
+      "已完成行文本明暗主题对比度 >= 4.5",
+      Object.values(doneTextContrast.light).every((value) => value >= 4.5) &&
+        Object.values(doneTextContrast.dark).every((value) => value >= 4.5),
+      JSON.stringify(doneTextContrast),
+    );
+
+    const openedDoneSession = await evaluate(`(() => {
+      const button = [...document.querySelectorAll('.wb-done-session')].find(
+        (node) => node.dataset.taskId === ${JSON.stringify(doneTodayCard)},
+      );
+      if (!button) return false;
+      button.click();
+      return true;
+    })()`);
+    check("点击已完成行会话入口", openedDoneSession === true);
+    await waitForEval("Boolean(document.querySelector('.wb-session-drawer'))", 8000, "已完成会话抽屉");
+    await waitForEval("Boolean(document.querySelector('.wb-session-error'))", 8000, "会话缺失提示");
+    const doneSession = await evaluate(`(() => ({
+      title: document.querySelector('.wb-session-title')?.textContent || '',
+      id: document.querySelector('.wb-session-sub')?.textContent || '',
+      error: document.querySelector('.wb-session-error')?.textContent || '',
+    }))()`);
+    check(
+      "会话缺失由查看器提示（标题/task id/no_session 文案）",
+      doneSession.title === "已完成今天卡" &&
+        doneSession.id === doneTodayCard &&
+        doneSession.error.includes("没有执行会话"),
+      JSON.stringify(doneSession),
+    );
+    await evaluate(`(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'Escape', bubbles: true, cancelable: true,
+      }));
+      return true;
+    })()`);
+    await waitForEval(
+      "!Boolean(document.querySelector('.wb-session-drawer'))",
+      5000,
+      "已完成会话抽屉关闭",
+    );
+
+    // 对比度矩阵直接改过 dataset；重载让 React 的 theme state 与 DOM 重新对齐。
+    await cdp.send("Page.reload");
+    await waitForEval(
+      "Boolean(document.querySelector('.wb-shell'))",
+      15000,
+      "主题切换前重载",
+    );
+    const themeBefore = await evaluate(
+      "document.documentElement.getAttribute('data-theme')",
+    );
+    const expectedTheme = themeBefore === "dark" ? "light" : "dark";
+    const expectedColor = expectedTheme === "dark" ? "#070809" : "#ececea";
+    await evaluate("document.querySelector('.wb-theme-toggle').click(); true");
+    // 可见 root 有 250ms 背景过渡：等过渡结束再断言 canvas 色。
+    await new Promise((resolveWait) => setTimeout(resolveWait, 400));
+    const themeAfter = await evaluate(`(() => ({
+      theme: document.documentElement.getAttribute('data-theme'),
+      stored: window.localStorage.getItem('wb-theme'),
+      meta: document.querySelector('meta[name="theme-color"]')?.getAttribute('content'),
+      rootBg: getComputedStyle(document.querySelector('.wb-root')).backgroundColor,
+      shellBg: getComputedStyle(document.querySelector('.wb-shell')).backgroundColor,
+    }))()`);
+    check(
+      "主题切换：data-theme / localStorage / theme-color 同步",
+      themeAfter.theme === expectedTheme &&
+        themeAfter.stored === expectedTheme &&
+        themeAfter.meta === expectedColor,
+      JSON.stringify({ before: themeBefore, after: themeAfter }),
+    );
+    check(
+      "主题切换后可见 root/shell 背景跟随 token",
+      themeAfter.rootBg ===
+        (expectedTheme === "dark" ? "rgb(7, 8, 9)" : "rgb(236, 236, 234)") &&
+        themeAfter.shellBg ===
+          (expectedTheme === "dark" ? "rgb(11, 13, 16)" : "rgb(251, 251, 250)"),
+      JSON.stringify({ rootBg: themeAfter.rootBg, shellBg: themeAfter.shellBg }),
+    );
+
+    await cdp.send("Page.reload");
+    await waitForEval(
+      "Boolean(document.querySelector('.wb-shell'))",
+      15000,
+      "主题持久化重载",
+    );
+    const persistedTheme = await evaluate(`(() => ({
+      theme: document.documentElement.getAttribute('data-theme'),
+      stored: window.localStorage.getItem('wb-theme'),
+      rootBg: getComputedStyle(document.querySelector('.wb-root')).backgroundColor,
+      shellBg: getComputedStyle(document.querySelector('.wb-shell')).backgroundColor,
+    }))()`);
+    check(
+      "刷新后主题保持（首屏脚本先于样式）",
+      persistedTheme.theme === expectedTheme &&
+        persistedTheme.stored === expectedTheme &&
+        persistedTheme.rootBg ===
+          (expectedTheme === "dark" ? "rgb(7, 8, 9)" : "rgb(236, 236, 234)") &&
+        persistedTheme.shellBg ===
+          (expectedTheme === "dark" ? "rgb(11, 13, 16)" : "rgb(251, 251, 250)"),
+      JSON.stringify(persistedTheme),
+    );
+
+    // ---- 18. plugin host: ready drop blocked, other columns work ------
     const reactUmd = readFileSync(
       join(uiRoot, "node_modules/react/umd/react.production.min.js"),
       "utf8",
@@ -1850,12 +2304,20 @@ async function main() {
       notice: document.querySelector('.wb-notice')?.textContent || '',
       hint: document.querySelector('.wb-board-wrap .wb-hint')?.textContent || '',
       todoMounted: Boolean(document.querySelector('.wb-todo-wrap')),
+      sidebarMounted: Boolean(document.querySelector('.wb-sidebar')),
+      shellMounted: Boolean(document.querySelector('.wb-shell')),
+      doneMounted: Boolean(document.querySelector('.wb-done-wrap')),
+      themeToggle: Boolean(document.querySelector('.wb-theme-toggle')),
     }))()`);
     check(
-      "插件宿主只注册看板且无待办",
+      "插件宿主只注册看板且无侧栏/待办/已完成",
       pluginHostState.registered === "workbench" &&
         JSON.stringify(pluginHostState.tabs) === JSON.stringify(["看板"]) &&
-        pluginHostState.todoMounted === false,
+        pluginHostState.todoMounted === false &&
+        pluginHostState.sidebarMounted === false &&
+        pluginHostState.shellMounted === false &&
+        pluginHostState.doneMounted === false &&
+        pluginHostState.themeToggle === false,
       JSON.stringify(pluginHostState),
     );
     check(

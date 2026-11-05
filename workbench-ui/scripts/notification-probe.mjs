@@ -505,6 +505,7 @@ async function main() {
       const panel = document.querySelector('.wb-notify-panel');
       return {
         position: getComputedStyle(center).position,
+        top: getComputedStyle(center).top,
         right: getComputedStyle(center).right,
         pinnedFirst: Boolean(pinned) && (
           pinned.compareDocumentPosition(panel) & Node.DOCUMENT_POSITION_FOLLOWING
@@ -529,6 +530,34 @@ async function main() {
         layout.p0Text.includes("有未完成子卡，下游被堵"),
       JSON.stringify(layout),
     );
+    check(
+      "通知中心在 app 框内右对齐（007 外壳偏移）",
+      layout.right === "38px",
+      layout.right,
+    );
+    check("桌面通知中心 top 84px（顶栏下方）", layout.top === "84px", layout.top);
+
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width: 420,
+      height: 900,
+      deviceScaleFactor: 1,
+      mobile: false,
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 120));
+    const narrowPanel = await evaluate(`(() => {
+      const center = document.querySelector('.wb-notify-center');
+      const topbar = document.querySelector('.wb-topbar');
+      return {
+        top: parseFloat(getComputedStyle(center).top),
+        topbarBottom: topbar ? topbar.getBoundingClientRect().bottom : 0,
+      };
+    })()`);
+    check(
+      "窄屏通知面板不压住顶栏（top >= 63）",
+      narrowPanel.top >= 63 && narrowPanel.top >= narrowPanel.topbarBottom,
+      JSON.stringify(narrowPanel),
+    );
+    await cdp.send("Emulation.clearDeviceMetricsOverride");
     check(
       "P1 面板展示 dependency 阻塞",
       layout.p1Text.includes("等依赖的卡"),

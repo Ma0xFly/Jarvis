@@ -585,7 +585,9 @@ print(rows)`,
     // ---- 1. board entries + done session ------------------------------
     await waitForEval("document.querySelectorAll('.wb-tab').length > 0", 20000, "工作台外壳渲染");
     const switched = await evaluate(`(() => {
-      const tab = [...document.querySelectorAll('.wb-tab')].find((node) => node.textContent.trim() === '看板');
+      const tab = [...document.querySelectorAll('.wb-tab')].find(
+        (node) => node.querySelector('.wb-tab-label')?.textContent.trim() === '看板',
+      );
       if (!tab) return false;
       tab.click();
       return true;
@@ -626,8 +628,8 @@ print(rows)`,
         scrollHeight: wrap?.scrollHeight ?? 0,
         clientHeight: wrap?.clientHeight ?? 0,
         bodyOverflow: document.body.style.overflow,
-        headInert: document.querySelector('.wb-root > .wb-head')?.inert === true,
-        headAria: document.querySelector('.wb-root > .wb-head')?.getAttribute('aria-hidden'),
+        headInert: document.querySelector('.wb-root > .wb-shell')?.inert === true,
+        headAria: document.querySelector('.wb-root > .wb-shell')?.getAttribute('aria-hidden'),
         text: document.querySelector('.wb-session-drawer')?.textContent || '',
       };
     })()`);
@@ -723,7 +725,7 @@ print(rows)`,
     check(
       "关闭后恢复 body 滚动与背景属性",
       (await evaluate("document.body.style.overflow")) === "" &&
-        (await evaluate("document.querySelector('.wb-root > .wb-head')?.inert === false")) === true,
+        (await evaluate("document.querySelector('.wb-root > .wb-shell')?.inert === false")) === true,
     );
 
     // ---- 2. task.session_id fallback label ----------------------------

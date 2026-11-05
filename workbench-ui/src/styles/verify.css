@@ -1,40 +1,5 @@
-/* 全屏验收：顶栏 1/N + 进度，左产出物 / 右验收标准，底部键位。
+/* 全屏验收：007 overlay / 顶栏进度 / 左产出物（凹槽）/ 右验收标准（面板）。
    颜色全部走 base.css 的 --wb-* token，明暗主题共用一套布局。 */
-
-.wb-review-entry {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid var(--wb-border);
-  background: var(--wb-card);
-  color: var(--wb-muted);
-  font: inherit;
-  font-size: 12px;
-  padding: 5px 11px;
-  border-radius: 8px;
-  cursor: pointer;
-}
-.wb-review-entry:hover {
-  background: var(--wb-hover);
-  color: var(--wb-fg);
-}
-.wb-review-entry.active {
-  color: var(--wb-fg);
-  border-color: color-mix(in srgb, var(--wb-accent) 46%, var(--wb-border));
-  background: color-mix(in srgb, var(--wb-accent) 12%, var(--wb-card));
-}
-.wb-review-entry-count {
-  min-width: 17px;
-  padding: 0 5px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.55;
-  text-align: center;
-  color: color-mix(in srgb, var(--wb-accent) 72%, var(--wb-fg));
-  background: color-mix(in srgb, var(--wb-accent) 16%, transparent);
-}
 
 .wb-verify-overlay {
   position: fixed;
@@ -42,12 +7,21 @@
   z-index: 100;
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 16px 22px 18px;
-  background: var(--wb-page, var(--wb-card));
+  gap: 0;
+  padding: 0;
+  background: var(--wb-app);
   color: var(--wb-fg);
   font-size: 13px;
   line-height: 1.5;
+  animation: wb-verify-slide 120ms ease-out;
+}
+@keyframes wb-verify-slide {
+  from {
+    transform: translateY(5px);
+  }
+  to {
+    transform: translateY(0);
+  }
 }
 /* 对话框容器只用于接住初始焦点，不画焦点环 */
 .wb-verify-overlay:focus {
@@ -65,29 +39,33 @@
   border-color: var(--wb-accent);
 }
 
+/* 007 rv-top：48px，标题 + 进度 + 退出 */
 .wb-verify-top {
+  height: 48px;
+  flex: 0 0 48px;
   display: flex;
   align-items: center;
   gap: 12px;
-  flex: 0 0 auto;
-  min-height: 32px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--wb-hair);
 }
 .wb-verify-brand {
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  font-size: 12.5px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
 }
 .wb-verify-count {
   font-variant-numeric: tabular-nums;
-  font-weight: 600;
-  color: var(--wb-muted);
+  font-size: 11px;
+  color: var(--wb-faint);
 }
 .wb-verify-progress {
-  flex: 0 1 220px;
-  height: 6px;
-  border: 1px solid var(--wb-border);
-  border-radius: 999px;
-  background: var(--wb-sunken);
+  flex: 1;
+  max-width: 280px;
+  height: 3px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--wb-hair);
   overflow: hidden;
 }
 .wb-verify-progress > span {
@@ -95,11 +73,11 @@
   height: 100%;
   border-radius: inherit;
   background: var(--wb-accent);
-  transition: width 180ms ease;
+  transition: width 200ms ease;
 }
 .wb-verify-countdown {
-  font-size: 11.5px;
-  color: var(--wb-muted);
+  font-size: 11px;
+  color: var(--wb-faint);
   white-space: nowrap;
 }
 .wb-verify-top-spacer {
@@ -108,22 +86,14 @@
 .wb-verify-close {
   flex: 0 0 auto;
 }
-.wb-verify-overlay kbd {
-  font: inherit;
-  font-size: 10.5px;
-  color: var(--wb-muted);
-  padding: 0 4px;
-  border: 1px solid var(--wb-border);
-  border-radius: 4px;
-  background: var(--wb-sunken);
-}
 
+/* 007 rv-main：左舞台 + 396px 右侧栏 */
 .wb-verify-body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 1fr);
-  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) 396px;
+  gap: 0;
 }
 
 .wb-verify-pane {
@@ -131,39 +101,41 @@
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 16px 18px;
-  border: 1px solid var(--wb-border);
-  border-radius: 12px;
-  background: var(--wb-card);
+  gap: 16px;
+  border: 0;
+  border-radius: 0;
 }
 .wb-verify-produce {
-  background: var(--wb-sunken);
+  background: var(--wb-col);
+  padding: 26px;
 }
 .wb-verify-accept {
-  background: var(--wb-card);
+  background: var(--wb-app);
+  border-left: 1px solid var(--wb-hair);
+  padding: 18px;
 }
 
 .wb-verify-heading {
   display: flex;
   flex-direction: column;
   gap: 5px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid var(--wb-border);
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--wb-hair);
 }
 .wb-verify-title {
   margin: 0;
-  font-size: 18px;
+  font-size: 16px;
   line-height: 1.35;
   font-weight: 650;
+  letter-spacing: -0.01em;
   word-break: break-word;
 }
 .wb-verify-sub {
   display: flex;
   align-items: center;
   gap: 10px;
-  color: var(--wb-muted);
-  font-size: 11px;
+  color: var(--wb-faint);
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -174,20 +146,21 @@
 }
 .wb-verify-section h2 {
   margin: 0;
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  color: var(--wb-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--wb-faint);
   text-transform: uppercase;
 }
+/* 007 crit：左侧一道 accent 线，不填充整块背景 */
 .wb-verify-standard {
   margin: 0;
-  padding: 10px 12px;
-  border-left: 3px solid var(--wb-accent);
-  border-radius: 0 8px 8px 0;
-  background: color-mix(in srgb, var(--wb-accent) 9%, transparent);
-  font-size: 13.5px;
-  line-height: 1.55;
+  padding: 2px 0 2px 11px;
+  border-left: 2px solid var(--wb-accent);
+  border-radius: 0;
+  background: transparent;
+  font-size: 12.5px;
+  line-height: 1.65;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -203,7 +176,7 @@
   padding: 11px 13px;
   border: 1px solid var(--wb-border);
   border-radius: 8px;
-  background: var(--wb-page, var(--wb-card));
+  background: var(--wb-card);
   color: var(--wb-fg);
   font: inherit;
   font-size: 12.5px;
@@ -218,7 +191,7 @@
   font-size: 12px;
 }
 .wb-verify-note.warn {
-  color: var(--wb-warn);
+  color: var(--wb-wait);
 }
 
 .wb-verify-attachments {
@@ -241,8 +214,8 @@
   background: var(--wb-card);
 }
 .wb-verify-figure figcaption {
-  color: var(--wb-muted);
-  font-size: 11px;
+  color: var(--wb-faint);
+  font-size: 10.5px;
 }
 .wb-verify-file {
   display: flex;
@@ -251,6 +224,7 @@
   padding: 7px 10px;
   border: 1px solid var(--wb-border);
   border-radius: 8px;
+  background: var(--wb-card);
   color: var(--wb-fg);
   text-decoration: none;
   font-size: 12px;
@@ -267,8 +241,8 @@
 }
 .wb-verify-file-meta {
   flex: 0 0 auto;
-  color: var(--wb-muted);
-  font-size: 11px;
+  color: var(--wb-faint);
+  font-size: 10.5px;
 }
 
 .wb-verify-run {
@@ -279,7 +253,7 @@
   font-size: 12px;
 }
 .wb-verify-run dt {
-  color: var(--wb-muted);
+  color: var(--wb-faint);
 }
 .wb-verify-run dd {
   margin: 0;
@@ -294,8 +268,8 @@
   white-space: pre-wrap;
 }
 .wb-verify-review-at {
-  color: var(--wb-muted);
-  font-size: 11.5px;
+  color: var(--wb-faint);
+  font-size: 10.5px;
 }
 .wb-verify-session-slot {
   margin-top: 2px;
@@ -310,13 +284,16 @@
   padding: 3px 10px;
 }
 
+/* 007 rv-actions：底部键位 */
 .wb-verify-foot {
   flex: 0 0 auto;
+  border-top: 1px solid var(--wb-hair);
+  padding: 12px 18px;
 }
 .wb-verify-keys {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   flex-wrap: wrap;
 }
 .wb-verify-key {
@@ -324,33 +301,54 @@
   align-items: center;
   gap: 7px;
   border: 1px solid var(--wb-border);
-  border-radius: 9px;
+  border-radius: 8px;
   background: var(--wb-card);
-  color: var(--wb-fg);
+  color: var(--wb-text2);
   font: inherit;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 600;
-  padding: 7px 14px;
+  padding: 8px 16px;
   cursor: pointer;
 }
 .wb-verify-key:hover:not(:disabled) {
-  background: var(--wb-hover);
+  border-color: var(--wb-accent-border);
+  color: var(--wb-accent);
 }
 .wb-verify-key.accept {
-  border-color: color-mix(in srgb, var(--wb-ok) 46%, var(--wb-border));
-  background: color-mix(in srgb, var(--wb-ok) 10%, var(--wb-card));
+  border-color: var(--wb-accent);
+  background: var(--wb-accent);
+  color: var(--wb-accent-fg);
 }
-.wb-verify-key.reject {
-  border-color: color-mix(in srgb, var(--wb-danger) 42%, var(--wb-border));
-  background: color-mix(in srgb, var(--wb-danger) 8%, var(--wb-card));
+.wb-verify-key.accept:hover:not(:disabled) {
+  background: var(--wb-accent-2);
+  border-color: var(--wb-accent-2);
+  color: var(--wb-accent-fg);
+}
+.wb-verify-key.reject:hover:not(:disabled) {
+  border-color: var(--wb-block);
+  color: var(--wb-block);
 }
 .wb-verify-key:disabled {
   opacity: 0.55;
   cursor: default;
 }
 .wb-verify-key-hint {
+  color: var(--wb-faint);
+  font-size: 10.5px;
+}
+.wb-verify-overlay kbd {
+  font: inherit;
+  font-size: 10.5px;
   color: var(--wb-muted);
-  font-size: 11.5px;
+  padding: 0 4px;
+  border: 1px solid var(--wb-border);
+  border-radius: 4px;
+  background: var(--wb-card);
+}
+.wb-verify-key.accept kbd {
+  color: inherit;
+  background: color-mix(in srgb, var(--wb-accent-fg) 14%, transparent);
+  border-color: color-mix(in srgb, var(--wb-accent-fg) 24%, transparent);
 }
 
 .wb-verify-reason {
@@ -375,7 +373,7 @@
   font-size: 12.5px;
   line-height: 1.5;
   color: var(--wb-fg);
-  background: var(--wb-page, var(--wb-card));
+  background: var(--wb-app);
   border: 1px solid var(--wb-border);
   border-radius: 8px;
   padding: 8px 10px;
@@ -391,18 +389,25 @@
 .wb-verify-reason-count {
   align-self: flex-end;
   margin-top: -4px;
-  color: var(--wb-muted);
-  font-size: 11px;
+  color: var(--wb-faint);
+  font-size: 10.5px;
   font-variant-numeric: tabular-nums;
 }
 .wb-verify-primary {
-  border-color: color-mix(in srgb, var(--wb-accent) 55%, var(--wb-border));
-  background: color-mix(in srgb, var(--wb-accent) 20%, var(--wb-card));
+  border-color: var(--wb-accent);
+  background: var(--wb-accent);
+  color: var(--wb-accent-fg);
   font-weight: 600;
+}
+.wb-verify-primary:hover:not(:disabled) {
+  background: var(--wb-accent-2);
+  border-color: var(--wb-accent-2);
+  color: var(--wb-accent-fg);
 }
 
 .wb-verify-notice {
   flex: 0 0 auto;
+  margin: 8px 18px 0;
   padding: 7px 12px;
   border: 1px solid var(--wb-border);
   border-radius: 8px;
@@ -413,6 +418,7 @@
 
 .wb-verify-error {
   flex: 0 0 auto;
+  margin: 8px 18px 0;
   padding: 8px 12px;
   border: 1px solid color-mix(in srgb, var(--wb-danger) 46%, var(--wb-border));
   border-radius: 9px;
@@ -443,21 +449,21 @@
   text-align: center;
 }
 .wb-verify-finish-title {
-  font-size: 20px;
-  font-weight: 700;
+  font-size: 15px;
+  font-weight: 600;
 }
 .wb-verify-stats {
   display: flex;
   gap: 12px;
 }
 .wb-verify-stat {
-  min-width: 104px;
+  min-width: 96px;
   display: flex;
   flex-direction: column;
   gap: 3px;
   padding: 12px 14px;
   border: 1px solid var(--wb-border);
-  border-radius: 10px;
+  border-radius: 9px;
   background: var(--wb-card);
 }
 .wb-verify-stat b {
@@ -492,10 +498,20 @@
   .wb-verify-pane {
     overflow: visible;
   }
+  .wb-verify-produce {
+    padding: 18px;
+  }
+  .wb-verify-accept {
+    border-left: 0;
+    border-top: 1px solid var(--wb-hair);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .wb-verify-progress > span {
     transition: none;
+  }
+  .wb-verify-overlay {
+    animation: none;
   }
 }
