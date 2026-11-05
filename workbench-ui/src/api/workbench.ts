@@ -52,9 +52,12 @@ export type WorkbenchErrorCode =
   | "unsupported_media_type"
   | "forbidden_origin"
   | "payload_too_large"
+  | "too_many_ids"
+  | "gate_unavailable"
   | "metadata_unavailable"
   | "upstream_unavailable"
   | "dispatch_failed"
+  | "dispatch_timeout"
   | "create_failed"
   | "metadata_failed";
 
@@ -73,9 +76,12 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "unsupported_media_type",
   "forbidden_origin",
   "payload_too_large",
+  "too_many_ids",
+  "gate_unavailable",
   "metadata_unavailable",
   "upstream_unavailable",
   "dispatch_failed",
+  "dispatch_timeout",
   "create_failed",
   "metadata_failed",
 ];
@@ -175,20 +181,46 @@ function toWorkbenchError(error: unknown, context: ErrorContext = "dispatch"): W
   return new WorkbenchError(code ?? fallbackCode(status, context), err.message, status);
 }
 
+/** 派发请求的最长等待时间；超时后放弃并让调用方清理 pending 状态。 */
+const DISPATCH_TIMEOUT_MS = 5000;
+
+function isAbortError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { name?: unknown }).name === "AbortError"
+  );
+}
+
 /**
  * 派发一张卡。前端不做预算计算；只把卡 id 交给后端闸门。
- * 明确函数签名保留 taskId，方便 1.3 在拖拽落列时直接调用。
+ * 请求最多等 5s：后端预算 <3s，超出即视为挂起并 abort，避免待办页
+ * 永久卡在「正在派发」与 in-flight 串行锁里。
  */
 export async function dispatchTask(taskId: string): Promise<DispatchResult> {
   if (!taskId || !taskId.trim()) {
     throw new WorkbenchError("dispatch_failed", "缺少任务 id");
   }
+  const controller = new AbortController();
+  let timer: number | undefined;
+  // Race explicitly: an SDK fetchJSON may ignore AbortSignal, so the timer
+  // itself must reject to keep the wait bounded.
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      controller.abort();
+      reject(new WorkbenchError("dispatch_timeout", "派发超时，请刷新后重试"));
+    }, DISPATCH_TIMEOUT_MS);
+  });
   try {
-    const data = (await api(WORKBENCH + "/dispatch/" + encodeURIComponent(taskId), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: "{}",
-    })) as Partial<DispatchResult> | null;
+    const data = (await Promise.race([
+      api(WORKBENCH + "/dispatch/" + encodeURIComponent(taskId), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: controller.signal,
+      }),
+      timeout,
+    ])) as Partial<DispatchResult> | null;
     if (!data || data.ok !== true || typeof data.position !== "number") {
       throw new WorkbenchError("dispatch_failed", "派发响应格式不正确", 200);
     }
@@ -199,7 +231,13 @@ export async function dispatchTask(taskId: string): Promise<DispatchResult> {
       status: typeof data.status === "string" ? data.status : "ready",
     };
   } catch (error) {
+    if (error instanceof WorkbenchError) throw error;
+    if (isAbortError(error)) {
+      throw new WorkbenchError("dispatch_timeout", "派发超时，请刷新后重试");
+    }
     throw toWorkbenchError(error, "dispatch");
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
   }
 }
 

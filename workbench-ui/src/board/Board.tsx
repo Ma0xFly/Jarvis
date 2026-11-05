@@ -1,6 +1,31 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, KANBAN } from "../platform";
+import { api, isPluginHost, KANBAN } from "../platform";
+import { dispatchTask, WorkbenchError } from "../api/workbench";
 import { COLUMNS, colLabel, ENTERABLE, enterHint, type ColKey } from "./columns";
+
+/** 插件宿主没有 /api/workbench/*：就绪列只读，派发必须在独立版 8787 完成。 */
+const PLUGIN_READONLY_NOTICE = "插件宿主只读；请在 127.0.0.1:8787 独立版派发";
+
+/** 把派发闸门码映射成与待办页一致的中文提示，不泄露英文 error 码。 */
+function gateMessage(error: unknown): string {
+  if (error instanceof WorkbenchError) {
+    switch (error.code) {
+      case "missing_acceptance":
+        return "先补一句怎样算做完";
+      case "blocked_by_parent":
+        return "已转为 todo，等 parent 完成";
+      case "not_dispatchable":
+        return "已完成或归档的卡不能派发";
+      case "not_ready":
+        return "卡没有进入队列，请刷新后重试";
+      case "dispatch_timeout":
+        return "派发超时，请刷新后重试";
+      default:
+        break;
+    }
+  }
+  return "派发失败：" + (error instanceof Error ? error.message : String(error));
+}
 
 export interface Task {
   id: string;
@@ -99,7 +124,7 @@ export default function Board(): React.ReactElement {
   const runningCount = byCol["running"] ? byCol["running"].length : 0;
   const doneTasks = byCol["done"] || [];
 
-  /** 拖拽落列 = PATCH status，走原生状态机 */
+  /** 拖拽落列：就绪走 dispatch（快照/位次），其余走原生 PATCH 状态机 */
   const flowDrop = useCallback(
     async (taskId: string, status: ColKey) => {
       const task = tasks.find((t) => t.id === taskId);
@@ -110,11 +135,28 @@ export default function Board(): React.ReactElement {
         showToast("运行中由调度器接管，不能手动设置");
         return;
       }
+      if (status === "ready" && isPluginHost) {
+        showToast(PLUGIN_READONLY_NOTICE);
+        return;
+      }
       if (cur === status) return;
 
       const from = ENTERABLE[status];
       if (cur && from && from.indexOf(cur) < 0) {
         showToast("不能从「" + colLabel(cur) + "」移到「" + colLabel(status) + "」：" + enterHint(status));
+        return;
+      }
+
+      // 独立版拖到就绪 = 派发：必须走 dispatchTask，才能写快照/位次并过闸门。
+      // 其他列仍是原生 PATCH 状态机。
+      if (status === "ready") {
+        try {
+          await dispatchTask(taskId);
+          showToast("已派发");
+          void load();
+        } catch (e) {
+          showToast(gateMessage(e));
+        }
         return;
       }
 
@@ -183,7 +225,9 @@ export default function Board(): React.ReactElement {
         <span>
           待启动 <b>{startCount}</b>
         </span>
-        <span className="wb-hint">看板是流程视图：拖拽卡片换列 = 改状态</span>
+        <span className="wb-hint">
+          {isPluginHost ? PLUGIN_READONLY_NOTICE : "看板是流程视图：拖拽卡片换列 = 改状态"}
+        </span>
         <button className="wb-btn" onClick={() => void load()} title="刷新">
           刷新
         </button>
@@ -198,7 +242,10 @@ export default function Board(): React.ReactElement {
             <div
               key={col.key}
               className={"wb-col" + (dropCol === col.key ? " drop" : "")}
+              title={isPluginHost && col.key === "ready" ? PLUGIN_READONLY_NOTICE : undefined}
               onDragOver={(e) => {
+                // 插件宿主就绪列不是投放目标：不 preventDefault 就不会触发 drop。
+                if (isPluginHost && col.key === "ready") return;
                 e.preventDefault();
                 setDropCol(col.key);
               }}

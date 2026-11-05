@@ -36,7 +36,7 @@ export default function App(): React.ReactElement {
           ))}
         </div>
         {isPluginHost ? (
-          <span className="wb-notice">待办请用 127.0.0.1:8787 独立版</span>
+          <span className="wb-notice">插件宿主只读；请在 127.0.0.1:8787 独立版派发</span>
         ) : null}
       </div>
 

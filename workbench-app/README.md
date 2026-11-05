@@ -107,16 +107,26 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
 
 - `metadata.contract.accept` 为空 → 400，卡状态不变、不入队。中间件同时拦住
   `PATCH status=ready`、无 `triage` 的建卡（1.2 统一要求建卡显式 triage，宁可多拦
-  也不留 ready 绕过）、`bulk status=ready` 和 `reclaim`。
+  也不留 ready 绕过）、`bulk status=ready`、`bulk assignee+reclaim_first`、
+  `reclaim`、`reassign` + `reclaim_first`，以及 `POST /runs/{run_id}/terminate`
+  （先经上游 `GET /runs/{run_id}` 解析 task 再拦）。任一 id 缺验收时整批拒绝。
+  `/runs/{run_id}/terminate` 解析不到 run→task 映射时**失败关闭**：返回
+  403 `gate_unavailable`，不转发未过闸门的 terminate。
   PATCH/reclaim 先 GET 卡，404 原样转发，不会误报 400；卡存在才检查验收。
+  闸门从读验收前就持有 per-task 锁，并保持到转发的状态变更完成；
+  `update_metadata` 无法在窗口内清空验收。
 - 预算生效值 = `defaults.json` 全局默认 + 卡上 `metadata.contract.budget`
   （routing 层 deferred）。派发瞬间把 `max_minutes` / `max_cost` /
   `deny_paths` 三键快照进 `metadata.contract_defaults`。
 - 有未完成 parent → 409 `blocked_by_parent`，卡落 `todo`，不重复入队。
 - `PATCH status=ready` 成功后会用 **GET `/tasks/{id}`** 读真实落点；只有落点
   确实是 `ready` 才读 `/board` 算位次（board 未命中会重读一次，仍不命中返回 502）。
-- 已 `ready` 再派发是幂等的：返回 200，按当前 ready 队列重算位次，
-  不覆盖已有快照。
+- 快照生命周期：从非 `ready`/非 `running` 状态发起的派发（含 rework 后再次
+  派发）会**重拍** `contract_defaults`（新值 + 新 `write_token`）；已 `ready`
+  再派发是幂等的，返回 200，按当前 ready 队列重算位次，不覆盖已有快照。
+  重拍后若 PATCH 失败，补偿会恢复上一份快照及其 token，不丢历史。
+- `GET /api/workbench/metadata` 单请求最多 200 个 id；超过返回
+  400 `too_many_ids`，不静默截断。前端按 100 个 id/请求分块，长列表仍完整。
 - metadata 写端点只接受 `bucket` 与 `contract`，`bucket` 只允许
   `today|long`；用 JSON1 `json_patch` 按 key 合并，派发快照
   `contract_defaults` 不会被客户端覆盖。未知键、空 patch、非法 contract
@@ -156,12 +166,19 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
   5s 轮询按 `/board` 顺序重算的实时值，刷新后只保留行内位次、不显示 ETA。
   ETA 是队列槽位近似：位次 1 = 7 分钟，不扣除卡已运行时间。底部输入框回车
   建卡，今日/长期可切换（默认今日），不自动派发。
-- **看板**：8 列 `待整理 / 待执行 / 已排期 / 就绪 / 运行中 / 待拍板 / 待验收 / 已完成`
+- **看板**：8 列 `待整理 / 待执行 / 已排期 / 就绪 / 运行中 / 待拍板 / 待验收 / 已完成`。
+  独立版把卡拖到「就绪」会走 `dispatchTask`（写快照、算位次、过验收闸门），
+  其他列仍是原生 PATCH；闸门拒绝显示中文提示（空验收 / parent / 不可派发）。
+- 派发请求客户端最多等 5 秒；超时 abort 并清空 pending 回执与 in-flight 串行锁，
+  显示「派发超时，请刷新后重试」。
 - 明暗主题由宿主 `data-theme` / `theme.css` token 驱动；当前 React UI 不写
   `localStorage`。
 - 5 秒轮询 `/api/plugins/kanban/board`，不是 WebSocket
-- **插件宿主**没有 `/api/workbench/*`，只显示看板 tab，并提示待办请用独立版
-  8787；待办只在独立版提供。
+- **插件宿主**没有 `/api/workbench/*`，只显示看板 tab；「就绪」列客户端只读
+  （不接受投放、不发 dispatch/PATCH），并显示「插件宿主只读；请在
+  127.0.0.1:8787 独立版派发」。其他状态列仍可拖拽。宿主检测统一为
+  `sdk && sdk.fetchJSON`；有 SDK 但没有 `fetchJSON` 时直接抛出明确错误，
+  不会降级渲染错 UI。
 
 ## 文件
 
@@ -201,12 +218,14 @@ cd workbench-ui && npm run probe:todo   # headless 三列/拖拽/建卡/验收/�
 
 后端测试会为每个套件创建临时 `HERMES_KANBAN_HOME` 与 `WORKBENCH_DB`，并用
 `~/.hermes/tools/python-3.14*/bin/python3`（或 `WORKBENCH_PYTHON` 指定）启动
-隔离服务。覆盖：验收闸门（PATCH/create/bulk/reclaim）、404 透传、parent 停卡、
-review/todo 落点、落地 GET、`/board` 失败与重读、幂等重派、快照 `write_token`
-归属、done/archived、running、非法 defaults 与卡覆盖、201-id 分块、上游挂起超时、
-PATCH 404、metadata 库故障、并发派发与共享 `kanban.db` 无 workbench 对象；
-待办写端点覆盖建卡默认值/校验、bucket/contract 合并、`contract_defaults`
-不被覆盖、验收落库与派发联动。
+隔离服务。覆盖：验收闸门（PATCH/create/bulk ready/bulk reclaim/reclaim/
+reassign+reclaim_first/run terminate）、run→task 映射失败关闭、404 透传、
+parent 停卡、review/todo 落点、落地 GET、`/board` 失败与重读、幂等重派、
+rework 重拍快照与失败恢复上一快照、快照 `write_token` 归属、闸门锁竞态、
+done/archived、running、非法 defaults 与卡覆盖、metadata 201-id 返回
+`too_many_ids`、上游挂起超时、PATCH 404、metadata 库故障、并发派发与共享
+`kanban.db` 无 workbench 对象；待办写端点覆盖建卡默认值/校验、bucket/contract
+合并、幂等重试保留用户契约、`contract_defaults` 不被覆盖、验收落库与派发联动。
 
 `npm run probe:todo` 会自起隔离服务与 headless Chrome（无新增 npm 依赖），
 断言三列顺序/计数、仓库卡静态内容、空验收抖动与零请求、验收就地编辑、
@@ -214,7 +233,10 @@ PATCH 404、metadata 库故障、并发派发与共享 `kanban.db` 无 workbench
 409/空验收拒绝清回执、关闭按钮与 6s 自动消失、ready 卡 1-based 位次、外部
 队列变化后轮询重算、刷新后位次重派生、running 回执/徽标（暂停轮询避免竞态）、
 新建卡落今日/长期、外部轮询、created_at 排序、409 parent 提示、明暗 token
-与回执/徽标对比度、窄视口与双 tab 状态保持。`npm run verify` = `build + probe:todo`。
+与回执/徽标对比度、窄视口与双 tab 状态保持；并覆盖看板拖到就绪走 dispatch
+（快照/位次/中文闸门提示）、dispatch 5s 超时清理 pending 与串行锁、插件宿主
+SDK stub（只读就绪列、其他列仍可 PATCH、缺少 `fetchJSON` 的宿主报错）。
+`npm run verify` = `build + probe:todo`。
 
 探针前置条件：Node ≥22（内置 `WebSocket`/`fetch`）、本机 Chrome/Chromium
 （自动找 `google-chrome` / Playwright 缓存，找不到时用 `CHROME_BIN` 指定）、
@@ -232,6 +254,8 @@ Python 运行时（同后端测试，可用 `WORKBENCH_PYTHON` 覆盖）。
 - `contract.budget` 只能合并/覆盖键，暂不支持清空单个 budget 键
 - 待办/看板的轮询与拖拽逻辑目前各自实现，尚未抽共享 hook
 - 上游 `recompute_ready` 与原生 9119 dashboard 不经过 ready 闸门；不额外加 watcher
+- 插件宿主「就绪列只读」是客户端拦截；绕过 UI 直接调用 9119 dashboard 的 kanban
+  API 仍不受本服务闸门约束（该宿主没有 `/api/workbench/*`）
 - 自调用仍是独立 `urllib` 请求（dispatch 在线程池执行），不共享连接池
 - 已跟踪的 `web/*.bak-*` 与旧 `web/app.js` / `sync-ui.sh` 清理 deferred；本次不删已跟踪文件
 - 没有任务详情抽屉（看详情仍可用 dashboard 的 Kanban 页）

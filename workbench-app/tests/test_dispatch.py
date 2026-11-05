@@ -293,6 +293,36 @@ class WorkbenchServer:
         finally:
             conn.close()
 
+    def start_run(self, task_id: str) -> int:
+        """Seed an active run + running/claimed task (REST cannot set running)."""
+        conn = sqlite3.connect(str(self.kanban_db), timeout=5)
+        try:
+            now = int(time.time())
+            cursor = conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, claim_lock, started_at) "
+                "VALUES (?, 'probe-worker', 'running', 'probe-lock', ?)",
+                (task_id, now),
+            )
+            run_id = int(cursor.lastrowid)
+            conn.execute(
+                "UPDATE tasks SET status = 'running', current_run_id = ?, claim_lock = ?, "
+                "claim_expires = ?, worker_pid = NULL WHERE id = ?",
+                (run_id, "probe-lock", now + 3600, task_id),
+            )
+            conn.commit()
+            return run_id
+        finally:
+            conn.close()
+
+    def run_row(self, run_id: int) -> dict | None:
+        conn = sqlite3.connect(str(self.kanban_db), timeout=5)
+        try:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
 
 class ServerTestCase(unittest.TestCase):
     """A class-level isolated server with valid defaults."""
@@ -449,11 +479,16 @@ class DispatchTests(ServerTestCase):
         for task_id in ids:
             self.server.seed_metadata(task_id, {"bucket": "today"})
 
-        # Server-side single-request cap remains 200 (first 200 ids kept).
-        code, rows = self.server.get_metadata(ids)
+        # A single request with 201 ids is rejected outright: never silently
+        # truncate (the caller would get an incomplete map with a 200).
+        code, body = self.server.get_metadata(ids)
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body, {"ok": False, "error": "too_many_ids"})
+
+        # 200 ids is still accepted.
+        code, rows = self.server.get_metadata(ids[:200])
         self.assertEqual(code, 200)
         self.assertEqual(len(rows), 200)
-        self.assertNotIn(ids[-1], rows)
 
         # The frontend sends 100-id chunks; merged result has all 201.
         merged: dict = {}
@@ -586,6 +621,147 @@ class DispatchTests(ServerTestCase):
         self.assertEqual(code, 200, body)
         self.assertEqual(body, {"ok": True, "task_id": card})
         self.assertNotEqual(self.server.status(card), "running")
+
+    def test_reassign_reclaim_first_gate(self):
+        card = self.server.create_task("reassign-gate", triage=True)
+
+        code, body = http_json(
+            "POST",
+            self.server.base + "/api/plugins/kanban/tasks/" + card + "/reassign",
+            {"profile": "worker-b", "reclaim_first": True},
+        )
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body, {"ok": False, "error": "missing_acceptance"})
+        self.assertIsNone(self.server.task(card).get("assignee"))
+
+        # reclaim_first=true as a string is coerced like the upstream pydantic
+        # model would coerce it.
+        code, body = http_json(
+            "POST",
+            self.server.base + "/api/plugins/kanban/tasks/" + card + "/reassign",
+            {"profile": "worker-b", "reclaim_first": "true"},
+        )
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body["error"], "missing_acceptance")
+
+        # Without reclaim_first the alias cannot land ready, so it is ungated.
+        code, body = http_json(
+            "POST",
+            self.server.base + "/api/plugins/kanban/tasks/" + card + "/reassign",
+            {"profile": "worker-b", "reclaim_first": False},
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.server.task(card).get("assignee"), "worker-b")
+
+        self.seed_accept(card)
+        code, body = http_json(
+            "POST",
+            self.server.base + "/api/plugins/kanban/tasks/" + card + "/reassign",
+            {"profile": "worker-c", "reclaim_first": True},
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.server.task(card).get("assignee"), "worker-c")
+
+    def test_bulk_reclaim_first_gate_rejects_whole_batch(self):
+        first = self.server.create_task("bulk-reclaim-first", triage=True)
+        second = self.server.create_task("bulk-reclaim-second", triage=True)
+        self.seed_accept(first)
+
+        payload = {"ids": [first, second], "assignee": "worker-b", "reclaim_first": True}
+        code, body = http_json(
+            "POST", self.server.base + "/api/plugins/kanban/tasks/bulk", payload
+        )
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body, {"ok": False, "error": "missing_acceptance"})
+        # The whole batch was rejected before forwarding.
+        self.assertIsNone(self.server.task(first).get("assignee"))
+        self.assertIsNone(self.server.task(second).get("assignee"))
+
+        self.seed_accept(second)
+        code, body = http_json(
+            "POST", self.server.base + "/api/plugins/kanban/tasks/bulk", payload
+        )
+        self.assertEqual(code, 200, body)
+        self.assertTrue(all(entry["ok"] for entry in body["results"]))
+        self.assertEqual(self.server.task(first).get("assignee"), "worker-b")
+        self.assertEqual(self.server.task(second).get("assignee"), "worker-b")
+
+        # reclaim_first without an assignee never reclaims upstream, so it is
+        # not a bypass and stays ungated (and cannot land ready).
+        third = self.server.create_task("bulk-reclaim-no-assignee", triage=True)
+        code, body = http_json(
+            "POST",
+            self.server.base + "/api/plugins/kanban/tasks/bulk",
+            {"ids": [third], "reclaim_first": True},
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.server.status(third), "triage")
+
+    def test_run_terminate_gate_and_fail_closed_mapping(self):
+        card = self.server.create_task("terminate-gate", triage=True)
+        run_id = self.server.start_run(card)
+
+        code, body = http_json(
+            "POST",
+            self.server.base + f"/api/plugins/kanban/runs/{run_id}/terminate",
+            {},
+        )
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body, {"ok": False, "error": "missing_acceptance"})
+        self.assertEqual(self.server.status(card), "running")
+        self.assertIsNone(self.server.run_row(run_id)["ended_at"])
+
+        self.seed_accept(card)
+        code, body = http_json(
+            "POST",
+            self.server.base + f"/api/plugins/kanban/runs/{run_id}/terminate",
+            {},
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["task_id"], card)
+        self.assertEqual(self.server.status(card), "ready")
+        self.assertIsNotNone(self.server.run_row(run_id)["ended_at"])
+
+        # Unknown run: the mapping is unavailable, so the gate fails closed and
+        # never forwards an ungated terminate.
+        code, body = http_json(
+            "POST", self.server.base + "/api/plugins/kanban/runs/999999/terminate", {}
+        )
+        self.assertEqual(code, 403, body)
+        self.assertEqual(body["error"], "gate_unavailable")
+
+    def test_rework_redispatch_resnapshots_defaults(self):
+        card = self.server.create_task("rework-snapshot", triage=True)
+        self.seed_accept(card)
+
+        code, body = self.server.dispatch(card)
+        self.assertEqual(code, 200, body)
+        first_snapshot = self.server.metadata_row(card)["contract_defaults"]
+        first_token = self.server.metadata_token(card)
+        self.assertTrue(first_token)
+
+        # Rework: the card leaves ready for todo, its budget override is edited,
+        # and it is dispatched again. This is a fresh dispatch, so the snapshot
+        # must be re-taken (new value + new ownership token).
+        self.server.set_kanban_status(card, "todo")
+        code, body = self.server.patch_metadata(
+            card, {"contract": {"budget": {"max_minutes": 45}}}
+        )
+        self.assertEqual(code, 200, body)
+        code, body = self.server.dispatch(card)
+        self.assertEqual(code, 200, body)
+
+        second_snapshot = self.server.metadata_row(card)["contract_defaults"]
+        second_token = self.server.metadata_token(card)
+        self.assertEqual(second_snapshot["max_minutes"], 45)
+        self.assertEqual(second_snapshot["max_cost"], first_snapshot["max_cost"])
+        self.assertNotEqual(second_token, first_token)
+
+        # A ready re-dispatch keeps the existing snapshot and token.
+        code, body = self.server.dispatch(card)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.server.metadata_row(card)["contract_defaults"], second_snapshot)
+        self.assertEqual(self.server.metadata_token(card), second_token)
 
     def test_blocked_by_parent_lands_todo(self):
         parent = self.server.create_task("blocking-parent", triage=True)
@@ -1119,6 +1295,33 @@ class UpstreamPatchFailureTests(unittest.TestCase):
         metadata = self.target.metadata_row(card)
         self.assertNotIn("contract_defaults", metadata or {})
 
+    def test_failed_rework_restores_the_previous_snapshot(self):
+        card = self.target.create_task("rework-patch-fail", triage=True)
+        self.target.seed_metadata(card, {"contract": {"accept": "ok"}})
+
+        # First dispatch succeeds directly against the target and records a
+        # snapshot with its ownership token.
+        code, body = self.target.dispatch(card)
+        self.assertEqual(code, 200, body)
+        original = self.target.metadata_row(card)["contract_defaults"]
+        original_token = self.target.metadata_token(card)
+        self.assertTrue(original_token)
+
+        # Rework to todo, change the card override, then re-dispatch through the
+        # failing proxy: the fresh snapshot is compensated back to the previous
+        # one instead of erasing contract history.
+        self.target.set_kanban_status(card, "todo")
+        self.assertEqual(
+            self.target.patch_metadata(
+                card, {"contract": {"budget": {"max_minutes": 45}}}
+            )[0],
+            200,
+        )
+        code, body = self.server.dispatch(card)
+        self.assertEqual(code, 502, body)
+        self.assertEqual(self.target.metadata_row(card)["contract_defaults"], original)
+        self.assertEqual(self.target.metadata_token(card), original_token)
+
 
 class TodoPatchFailureTests(unittest.TestCase):
     """The 409 blocked_by_parent flow must not fabricate a todo landing."""
@@ -1386,6 +1589,154 @@ class DeletedAfterGetTests(unittest.TestCase):
         self.assertEqual(body, {"ok": False, "error": "not_found"})
         metadata = self.target.metadata_row(card)
         self.assertNotIn("contract_defaults", metadata or {})
+
+
+class GateLockTests(unittest.TestCase):
+    """The gate lock spans the gate's metadata read and the forwarded PATCH.
+
+    The forwarded PATCH is handled by this same process (the kanban router is
+    mounted in-process), so it cannot be observed at the upstream proxy. The
+    test instead blocks the gate's upstream card read: while the gate holds the
+    per-task lock there, a metadata update for the same card must wait. If the
+    lock were taken only around the short metadata read (or not at all), the
+    update would finish during this window.
+    """
+
+    tmp: Path
+    defaults: Path
+    target: WorkbenchServer
+    proxy: ThreadingHTTPServer
+    server: WorkbenchServer
+    gate_seen: threading.Event
+    release_gate: threading.Event
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.tmp = Path(tempfile.mkdtemp(prefix="wb-gate-lock-"))
+        cls.defaults = cls.tmp / "defaults.json"
+        cls.defaults.write_text(json.dumps(VALID_DEFAULTS), encoding="utf-8")
+        cls.target = WorkbenchServer(cls.tmp / "target", cls.defaults).start()
+        target_base = cls.target.base
+        cls.gate_seen = threading.Event()
+        cls.release_gate = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _respond(self, status: int, raw: bytes) -> None:
+                try:
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def _handle(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else None
+                if self.command == "GET" and self.path.startswith(
+                    "/api/plugins/kanban/tasks/"
+                ):
+                    cls.gate_seen.set()
+                    cls.release_gate.wait(timeout=10)
+                request = urlrequest.Request(
+                    target_base + self.path,
+                    data=body,
+                    method=self.command,
+                    headers={
+                        "Content-Type": self.headers.get("Content-Type", "application/json"),
+                        "Accept": "application/json",
+                    },
+                )
+                opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+                try:
+                    with opener.open(request, timeout=5) as response:
+                        raw = response.read()
+                        status = int(response.status)
+                except urlerror.HTTPError as exc:
+                    try:
+                        raw = exc.read()
+                        status = int(exc.code)
+                    finally:
+                        exc.close()
+                self._respond(status, raw)
+
+            do_GET = _handle
+            do_PATCH = _handle
+
+            def log_message(self, *args) -> None:
+                pass
+
+        cls.proxy = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.proxy.serve_forever, daemon=True).start()
+        cls.server = WorkbenchServer(
+            cls.tmp / "dispatch",
+            cls.defaults,
+            env_extra={
+                "WORKBENCH_UPSTREAM_BASE": f"http://127.0.0.1:{cls.proxy.server_address[1]}",
+                "HERMES_KANBAN_HOME": str(cls.target.kanban_home),
+                "WORKBENCH_DB": str(cls.target.db_path),
+            },
+        ).start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.release_gate.set()
+        cls.server.stop()
+        cls.proxy.shutdown()
+        cls.proxy.server_close()
+        cls.target.stop()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_metadata_update_waits_for_gate_window(self):
+        card = self.target.create_task("gate-lock-card", triage=True)
+        self.target.seed_metadata(
+            card, {"bucket": "today", "contract": {"accept": "ok"}}
+        )
+        self.release_gate.clear()
+        self.gate_seen.clear()
+        results: dict[str, tuple[int, dict]] = {}
+
+        patcher = threading.Thread(
+            target=lambda: results.__setitem__(
+                "patch", self.server.patch_status(card, "ready")
+            )
+        )
+        patcher.start()
+        self.assertTrue(
+            self.gate_seen.wait(timeout=8), "gate never read the card upstream"
+        )
+
+        metadata_done = threading.Event()
+
+        def run_metadata() -> None:
+            results["metadata"] = self.server.patch_metadata(
+                card, {"contract": {"accept": ""}}
+            )
+            metadata_done.set()
+
+        metadata_thread = threading.Thread(target=run_metadata)
+        metadata_thread.start()
+        self.assertFalse(
+            metadata_done.wait(timeout=0.4),
+            "metadata update did not wait for the gate lock window",
+        )
+
+        self.release_gate.set()
+        patcher.join(timeout=10)
+        metadata_thread.join(timeout=10)
+        self.assertFalse(patcher.is_alive())
+        self.assertFalse(metadata_thread.is_alive())
+        self.assertEqual(results["patch"][0], 200, results["patch"])
+        self.assertEqual(results["metadata"][0], 200, results["metadata"])
+        self.assertEqual(self.target.status(card), "ready")
+        # The update ran after the gate/forward window, so it is the last
+        # write and wins (acceptance is cleared only after the card is ready).
+        self.assertEqual(
+            self.target.metadata_row(card)["contract"]["accept"], ""
+        )
 
 
 class SnapshotOwnershipTests(unittest.TestCase):

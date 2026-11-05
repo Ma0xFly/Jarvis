@@ -235,6 +235,77 @@ class CreateTaskTests(TodoBackendTestCase):
         )
         self.assertEqual(self.metadata(first["task"]["id"])["bucket"], "today")
 
+    def test_create_retry_preserves_existing_contract_edits(self):
+        code, first = self.create("重试保契约", idempotency_key="retry-contract-key")
+        self.assertEqual(code, 200, first)
+        task_id = first["task"]["id"]
+
+        code, body = self.patch_metadata(
+            task_id,
+            {
+                "contract": {
+                    "accept": "用户补的验收",
+                    "input": "需求单",
+                    "budget": {"max_minutes": 30},
+                }
+            },
+        )
+        self.assertEqual(code, 200, body)
+
+        # Same idempotency key: upstream returns the same card, and the
+        # workbench must only fill missing metadata keys — never reset the
+        # contract the user edited between attempts.
+        code, second = self.create("重试保契约", idempotency_key="retry-contract-key")
+        self.assertEqual(code, 200, second)
+        self.assertEqual(second["task"]["id"], task_id)
+        self.assertEqual(second["metadata"]["contract"]["accept"], "用户补的验收")
+        self.assertEqual(second["metadata"]["contract"]["input"], "需求单")
+        self.assertEqual(second["metadata"]["contract"]["budget"], {"max_minutes": 30})
+        self.assertEqual(second["metadata"]["bucket"], "today")
+
+        # An empty contract written by the first attempt is also left alone
+        # (it already has every key).
+        code, other = self.create("空契约重试", idempotency_key="retry-empty-key")
+        self.assertEqual(code, 200, other)
+        code, again = self.create("空契约重试", idempotency_key="retry-empty-key")
+        self.assertEqual(code, 200, again)
+        self.assertEqual(
+            again["metadata"]["contract"], {"input": "", "accept": "", "ready": False}
+        )
+
+    def test_create_retry_fills_only_missing_contract_keys(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            defaults = root / "defaults.json"
+            defaults.write_text(json.dumps(base.VALID_DEFAULTS), encoding="utf-8")
+            server = base.WorkbenchServer(root / "srv", defaults).start()
+            try:
+                # First attempt creates the card; then simulate a partial
+                # contract written by another client before the retry.
+                code, created = base.http_json(
+                    "POST",
+                    server.base + "/api/workbench/tasks",
+                    {"title": "缺键重试", "idempotency_key": "fill-keys"},
+                )
+                self.assertEqual(code, 200, created)
+                task_id = created["task"]["id"]
+
+                # Simulate a pre-existing partial contract (e.g. written by a
+                # future/older client): accept exists, input/ready do not.
+                server.seed_metadata(task_id, {"contract": {"accept": "保留"}})
+                code, retry = base.http_json(
+                    "POST",
+                    server.base + "/api/workbench/tasks",
+                    {"title": "缺键重试", "idempotency_key": "fill-keys"},
+                )
+                self.assertEqual(code, 200, retry)
+                self.assertEqual(retry["metadata"]["contract"]["accept"], "保留")
+                self.assertEqual(retry["metadata"]["contract"]["input"], "")
+                self.assertIs(retry["metadata"]["contract"]["ready"], False)
+                self.assertEqual(retry["metadata"]["bucket"], "today")
+            finally:
+                server.stop()
+
     def test_create_rejects_invalid_idempotency_keys(self):
         before = self.board_titles()
         for key in ["", "   ", 1, ["k"], "x" * 129]:

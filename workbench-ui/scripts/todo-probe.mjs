@@ -48,6 +48,10 @@ const defaultsPath = join(appDir, "defaults.json");
 
 /** 与 TodoPage 的 RECEIPT_MS 保持一致（回执自动消失时长）。 */
 const RECEIPT_MS = 6000;
+/** 与 api/workbench.ts 的 DISPATCH_TIMEOUT_MS 保持一致。 */
+const DISPATCH_TIMEOUT_MS = 5000;
+/** 派发快照必须与 defaults.json 的 budget 三键一致。 */
+const DEFAULTS = JSON.parse(readFileSync(defaultsPath, "utf8"));
 
 /**
  * Runs before app code on the reloaded document. Records the 5s board poll and
@@ -490,6 +494,26 @@ async function main() {
         return true;
       })()`);
 
+    /** 看板：把卡片拖到指定列，返回 dragover 是否被接收（preventDefault）。 */
+    const dragBoardCardToColumn = (title, columnLabel) =>
+      evaluate(`(async () => {
+        const card = [...document.querySelectorAll('.wb-card')]
+          .find((node) => node.textContent.includes(${JSON.stringify(title)}));
+        const column = [...document.querySelectorAll('.wb-col')]
+          .find((node) => node.querySelector('.wb-cname')?.textContent === ${JSON.stringify(columnLabel)});
+        if (!card || !column) return { ok: false };
+        const dataTransfer = new DataTransfer();
+        card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
+        const over = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer });
+        column.dispatchEvent(over);
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+        column.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+        return { ok: true, overPrevented: over.defaultPrevented };
+      })()`);
+
+    const boardToastText = () =>
+      evaluate("document.querySelector('.wb-board-wrap .wb-toast')?.textContent || ''");
+
     // Instrument workbench calls; also keeps the dispatch response so the probe
     // can compare the receipt text with what the backend actually returned.
     const installProbe = () =>
@@ -504,9 +528,15 @@ async function main() {
         const original = window.fetch.bind(window);
         window.fetch = (input, init) => {
           const url = typeof input === "string" ? input : (input && input.url) || "";
-          const promise = original(input, init);
           if (url.includes("/api/workbench/dispatch/")) {
             window.__wbProbe.dispatch += 1;
+            if (window.__wbProbe.hangDispatch) {
+              // Never settles: exercises the client-side dispatch timeout.
+              return new Promise(() => {});
+            }
+          }
+          const promise = original(input, init);
+          if (url.includes("/api/workbench/dispatch/")) {
             promise.then((response) => {
               response.clone().json()
                 .then((data) => { window.__wbProbe.lastDispatch = data; })
@@ -1562,6 +1592,334 @@ async function main() {
       ),
       JSON.stringify(finalCounts),
     );
+
+    // ---- 15. Board ready drop = dispatch (snapshot + position) --------
+    const boardDispatchCard = await createUpstream("看板派发卡");
+    await setMetadata(boardDispatchCard, {
+      bucket: "today",
+      contract: { accept: "看板派发验收" },
+    });
+    await evaluate("document.querySelectorAll('.wb-tab')[1].click()");
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-card')]
+        .some((node) => node.textContent.includes('看板派发卡'))`,
+      12000,
+      "看板派发卡渲染",
+    );
+    await evaluate(
+      "window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null;",
+    );
+    const boardReadyDrag = await dragBoardCardToColumn("看板派发卡", "就绪");
+    check(
+      "看板就绪列接受投放",
+      boardReadyDrag.ok === true && boardReadyDrag.overPrevented === true,
+      JSON.stringify(boardReadyDrag),
+    );
+    await waitForEval("window.__wbProbe.dispatch === 1", 5000, "看板派发请求");
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      5000,
+      "看板派发响应",
+    );
+    const boardDispatch = await evaluate("window.__wbProbe.lastDispatch");
+    check(
+      "看板拖到就绪走 dispatch（ready + 位次）",
+      boardDispatch.status === "ready" && boardDispatch.position >= 1,
+      JSON.stringify(boardDispatch),
+    );
+    const boardCardStatus = (
+      await httpJson("GET", `${base}/api/plugins/kanban/tasks/${boardDispatchCard}`)
+    ).data?.task?.status;
+    check("看板拖到就绪后上游状态 ready", boardCardStatus === "ready", String(boardCardStatus));
+    const boardMeta = (
+      await httpJson(
+        "GET",
+        `${base}/api/workbench/metadata?ids=${encodeURIComponent(boardDispatchCard)}`,
+      )
+    ).data?.[boardDispatchCard];
+    check(
+      "看板派发写入 contract_defaults 快照",
+      boardMeta?.contract_defaults?.max_minutes === DEFAULTS.budget.max_minutes &&
+        boardMeta?.contract_defaults?.max_cost === DEFAULTS.budget.max_cost &&
+        JSON.stringify(boardMeta?.contract_defaults?.deny_paths) ===
+          JSON.stringify(DEFAULTS.budget.deny_paths),
+      JSON.stringify(boardMeta?.contract_defaults),
+    );
+
+    const boardBlockedCard = await createUpstream("看板空验收卡");
+    await setMetadata(boardBlockedCard, {
+      bucket: "today",
+      contract: { input: "", accept: "", ready: false },
+    });
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-card')]
+        .some((node) => node.textContent.includes('看板空验收卡'))`,
+      12000,
+      "看板空验收卡渲染",
+    );
+    const dispatchBeforeBoardReject = await evaluate("window.__wbProbe.dispatch");
+    await dragBoardCardToColumn("看板空验收卡", "就绪");
+    await waitFor(
+      async () => (await boardToastText()) === "先补一句怎样算做完",
+      { timeout: 5000, interval: 50, label: "看板闸门中文提示" },
+    );
+    check("看板闸门提示为中文", true);
+    const boardRejected = await evaluate(
+      "window.__wbProbe.dispatch",
+    );
+    const boardBlockedStatus = (
+      await httpJson("GET", `${base}/api/plugins/kanban/tasks/${boardBlockedCard}`)
+    ).data?.task?.status;
+    check(
+      "看板空验收被闸门拦住（一次请求、状态不变）",
+      boardRejected === dispatchBeforeBoardReject + 1 && boardBlockedStatus === "triage",
+      JSON.stringify({ dispatch: boardRejected, status: boardBlockedStatus }),
+    );
+
+    // ---- 16. dispatch timeout clears receipt + in-flight guard --------
+    await evaluate("document.querySelectorAll('.wb-tab')[0].click()");
+    const timeoutCard = await createUpstream("超时卡");
+    await setMetadata(timeoutCard, { bucket: "today", contract: { accept: "超时验收" } });
+    const afterTimeoutCard = await createUpstream("超时后卡");
+    await setMetadata(afterTimeoutCard, {
+      bucket: "today",
+      contract: { accept: "超时后验收" },
+    });
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('超时卡')) &&
+       [...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('超时后卡'))`,
+      12000,
+      "超时测试卡渲染",
+    );
+    await evaluate(
+      "window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null; window.__wbProbe.hangDispatch = true;",
+    );
+    check("拖拽会挂起的卡", (await dragCardToFlow("超时卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === '正在派发…'",
+      1500,
+      "超时卡 pending 回执",
+    );
+    await waitFor(
+      async () =>
+        (await evaluate("document.querySelector('.wb-toast')?.textContent || ''")) ===
+        "派发超时，请刷新后重试",
+      {
+        timeout: DISPATCH_TIMEOUT_MS + 3000,
+        interval: 100,
+        label: "派发超时提示",
+      },
+    );
+    check("dispatch 超时显示错误提示", true);
+    const timeoutState = await evaluate(`(() => ({
+      receipt: document.querySelector('.wb-todo-receipt-text')?.textContent || '',
+      dispatch: window.__wbProbe.dispatch,
+      stillRepo: [...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('超时卡')),
+    }))()`);
+    check("超时后清空 pending 回执", timeoutState.receipt === "", JSON.stringify(timeoutState));
+    check("超时只发一次派发请求", timeoutState.dispatch === 1, String(timeoutState.dispatch));
+    check("超时卡留在仓库", timeoutState.stillRepo === true);
+
+    await evaluate(
+      "window.__wbProbe.hangDispatch = false; window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null;",
+    );
+    check("超时后拖拽下一张卡", (await dragCardToFlow("超时后卡")) === true);
+    await waitForEval("window.__wbProbe.dispatch === 1", 5000, "超时后派发请求");
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      6000,
+      "超时后派发响应",
+    );
+    check("超时后 in-flight 串行锁已释放", true);
+
+    // ---- 17. plugin host: ready drop blocked, other columns work ------
+    const reactUmd = readFileSync(
+      join(uiRoot, "node_modules/react/umd/react.production.min.js"),
+      "utf8",
+    );
+    const reactDomUmd = readFileSync(
+      join(uiRoot, "node_modules/react-dom/umd/react-dom.production.min.js"),
+      "utf8",
+    );
+    const pluginBundle = readFileSync(join(uiRoot, "dist/plugin/index.js"), "utf8");
+    const PLUGIN_READONLY_NOTICE = "插件宿主只读；请在 127.0.0.1:8787 独立版派发";
+
+    await cdp.send("Page.navigate", { url: `${base}/healthz` });
+    await waitFor(
+      async () => {
+        try {
+          return (await evaluate("document.readyState")) === "complete";
+        } catch {
+          return false;
+        }
+      },
+      { timeout: 10000, label: "plugin probe document" },
+    );
+    await evaluate(reactUmd + "\n;true");
+    await evaluate(reactDomUmd + "\n;true");
+    check(
+      "插件探针 React UMD 就绪",
+      (await evaluate("typeof React + ':' + typeof ReactDOM")) === "object:object",
+      await evaluate("typeof React + ':' + typeof ReactDOM"),
+    );
+
+    // 8. host detection: SDK without fetchJSON must fail loudly, not render
+    // the standalone/silently-broken UI.
+    await evaluate(`(() => {
+      document.body.innerHTML = '<div id="workbench-root"></div>';
+      window.__HERMES_PLUGIN_SDK__ = { React: window.React, ReactDOM: window.ReactDOM };
+      return true;
+    })()`);
+    const unsupportedHost = await evaluate(
+      "(() => { try {\n" +
+        pluginBundle +
+        "\n; return 'no-error'; } catch (error) { return String((error && error.message) || error); } })()",
+    );
+    check(
+      "缺少 fetchJSON 的宿主抛出明确错误",
+      typeof unsupportedHost === "string" &&
+        unsupportedHost.includes("fetchJSON") &&
+        unsupportedHost.includes("不支持的插件宿主"),
+      String(unsupportedHost),
+    );
+
+    await evaluate(`(() => {
+      document.body.innerHTML = '<div id="workbench-root"></div>';
+      window.__wbProbe = { dispatch: 0, readyPatch: 0, otherPatch: 0 };
+      const original = window.fetch.bind(window);
+      window.fetch = (input, init) => {
+        const url = typeof input === "string" ? input : (input && input.url) || "";
+        const method = ((init && init.method) || "GET").toUpperCase();
+        if (url.includes("/api/workbench/dispatch/")) window.__wbProbe.dispatch += 1;
+        if (method === "PATCH" && url.includes("/api/plugins/kanban/tasks/")) {
+          const body = String((init && init.body) || "");
+          if (body.includes('"ready"')) window.__wbProbe.readyPatch += 1;
+          else window.__wbProbe.otherPatch += 1;
+        }
+        return original(input, init);
+      };
+      window.__HERMES_PLUGIN_SDK__ = {
+        React: window.React,
+        ReactDOM: window.ReactDOM,
+        // The real dashboard SDK returns parsed JSON and throws on non-2xx;
+        // mirror that shape so the plugin sees the same data contract.
+        fetchJSON: async (url, init) => {
+          const response = await window.fetch(url, init);
+          const text = await response.text();
+          let data = null;
+          try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+          if (!response.ok) {
+            const detail = data && (data.detail || data.error);
+            const error = new Error(
+              Array.isArray(detail) ? JSON.stringify(detail) : String(detail || "HTTP " + response.status),
+            );
+            error.status = response.status;
+            if (data && typeof data === "object" && typeof data.error === "string") {
+              error.code = data.error;
+            }
+            throw error;
+          }
+          return data;
+        },
+      };
+      window.__HERMES_PLUGINS__ = {
+        register: (name, component) => {
+          window.__wbPlugin = { name };
+          window.ReactDOM.createRoot(document.getElementById("workbench-root"))
+            .render(window.React.createElement(component));
+        },
+      };
+      return true;
+    })()`);
+    await evaluate(pluginBundle);
+    await waitForEval(
+      "document.querySelectorAll('.wb-board .wb-col').length === 8",
+      15000,
+      "插件宿主看板 8 列",
+    );
+    const pluginHostState = await evaluate(`(() => ({
+      registered: window.__wbPlugin?.name || '',
+      tabs: [...document.querySelectorAll('.wb-tab')].map((node) => node.textContent),
+      notice: document.querySelector('.wb-notice')?.textContent || '',
+      hint: document.querySelector('.wb-board-wrap .wb-hint')?.textContent || '',
+      todoMounted: Boolean(document.querySelector('.wb-todo-wrap')),
+    }))()`);
+    check(
+      "插件宿主只注册看板且无待办",
+      pluginHostState.registered === "workbench" &&
+        JSON.stringify(pluginHostState.tabs) === JSON.stringify(["看板"]) &&
+        pluginHostState.todoMounted === false,
+      JSON.stringify(pluginHostState),
+    );
+    check(
+      "插件宿主显示只读提示",
+      pluginHostState.notice === PLUGIN_READONLY_NOTICE &&
+        pluginHostState.hint === PLUGIN_READONLY_NOTICE,
+      JSON.stringify(pluginHostState),
+    );
+
+    const pluginCard = await createUpstream("插件拖拽卡");
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-card')]
+        .some((node) => node.textContent.includes('插件拖拽卡'))`,
+      12000,
+      "插件宿主卡片渲染",
+    );
+    const pluginOverState = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-card')]
+        .find((node) => node.textContent.includes('插件拖拽卡'));
+      const byLabel = (label) => [...document.querySelectorAll('.wb-col')]
+        .find((node) => node.querySelector('.wb-cname')?.textContent === label);
+      const dataTransfer = new DataTransfer();
+      card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
+      const readyOver = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer });
+      byLabel('就绪').dispatchEvent(readyOver);
+      const todoOver = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer });
+      byLabel('待执行').dispatchEvent(todoOver);
+      return {
+        readyPrevented: readyOver.defaultPrevented,
+        todoPrevented: todoOver.defaultPrevented,
+      };
+    })()`);
+    check(
+      "插件宿主就绪列不是投放目标，其他列仍可投放",
+      pluginOverState.readyPrevented === false && pluginOverState.todoPrevented === true,
+      JSON.stringify(pluginOverState),
+    );
+
+    await dragBoardCardToColumn("插件拖拽卡", "就绪");
+    await waitFor(
+      async () => (await boardToastText()) === PLUGIN_READONLY_NOTICE,
+      { timeout: 5000, interval: 50, label: "插件宿主只读提示" },
+    );
+    check("插件宿主就绪拖拽显示只读提示", true);
+    const pluginReadyState = await evaluate(
+      "window.__wbProbe.dispatch + window.__wbProbe.readyPatch",
+    );
+    const pluginStatusAfterReady = (
+      await httpJson("GET", `${base}/api/plugins/kanban/tasks/${pluginCard}`)
+    ).data?.task?.status;
+    check(
+      "插件宿主就绪拖拽被客户端拦截（零请求、状态不变）",
+      pluginReadyState === 0 && pluginStatusAfterReady === "triage",
+      JSON.stringify({ requests: pluginReadyState, status: pluginStatusAfterReady }),
+    );
+
+    await dragBoardCardToColumn("插件拖拽卡", "待执行");
+    await waitForEval("window.__wbProbe.otherPatch === 1", 5000, "插件宿主其他列 PATCH");
+    await waitFor(
+      async () => {
+        const status = (
+          await httpJson("GET", `${base}/api/plugins/kanban/tasks/${pluginCard}`)
+        ).data?.task?.status;
+        return status === "todo";
+      },
+      { timeout: 8000, interval: 100, label: "插件宿主其他列落 todo" },
+    );
+    check("插件宿主其他列仍可拖拽（PATCH 生效）", true);
 
     console.log(`\nPROBE OK — ${checks.length} checks passed`);
   } finally {

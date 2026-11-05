@@ -60,9 +60,12 @@ DISPATCH_BUDGET_SECONDS = 2.9
 BUDGET_KEYS = ("max_minutes", "max_cost", "deny_paths")
 TASK_PATH_RE = re.compile(r"^/api/plugins/kanban/tasks/([^/]+)$")
 RECLAIM_PATH_RE = re.compile(r"^/api/plugins/kanban/tasks/([^/]+)/reclaim$")
+REASSIGN_PATH_RE = re.compile(r"^/api/plugins/kanban/tasks/([^/]+)/reassign$")
+RUN_TERMINATE_PATH_RE = re.compile(r"^/api/plugins/kanban/runs/([0-9]+)/terminate$")
 CREATE_TASK_PATH = "/api/plugins/kanban/tasks"
 BULK_TASK_PATH = "/api/plugins/kanban/tasks/bulk"
 TERMINAL_STATUSES = ("done", "archived")
+MAX_METADATA_IDS = 200
 MAX_MINUTES = 10080
 MAX_COST = 1000
 MAX_MINUTES_PER_TASK = 1440
@@ -262,6 +265,10 @@ class SnapshotWrite:
     token: str
     created: bool
     value: dict[str, Any]
+    # Set when this write replaced an existing snapshot (rework re-dispatch);
+    # compensation restores it instead of deleting the history.
+    previous: Optional[dict[str, Any]] = None
+    previous_token: Optional[str] = None
 
 
 class MetadataStore:
@@ -426,11 +433,20 @@ class MetadataStore:
             finally:
                 conn.close()
 
-    def write_snapshot(self, task_id: str, value: dict[str, Any]) -> SnapshotWrite:
-        """Insert ``contract_defaults`` only when absent; never overwrite it.
+    def write_snapshot(
+        self, task_id: str, value: dict[str, Any], *, overwrite: bool = False
+    ) -> SnapshotWrite:
+        """Write ``contract_defaults`` for a dispatch.
 
-        The stored ``write_token`` identifies the request that created the
-        snapshot so compensation cannot delete a foreign/replaced snapshot.
+        ``overwrite=False`` (ready re-dispatch) keeps an existing snapshot and
+        only inserts one when the card has none. ``overwrite=True`` is used when
+        a dispatch starts from another status (triage/todo/blocked/scheduled/
+        review): the card is being dispatched afresh, so the current defaults
+        replace an older snapshot and take a new ``write_token``.
+
+        The stored ``write_token`` identifies the request that wrote the
+        snapshot so compensation cannot delete a foreign/replaced snapshot. A
+        replaced snapshot is remembered so a failed re-dispatch can restore it.
         """
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         now_ms = int(time.time() * 1000)
@@ -440,16 +456,20 @@ class MetadataStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT metadata FROM task_metadata WHERE task_id = ?", (task_id,)
+                    "SELECT metadata, write_token FROM task_metadata WHERE task_id = ?", (task_id,)
                 ).fetchone()
                 if row is not None:
                     current = self._decode(row[0])
                     if current is None:
                         conn.execute("ROLLBACK")
                         raise MetadataUnavailable(f"corrupt metadata row for {task_id}")
-                    if "contract_defaults" in current:
+                    if "contract_defaults" in current and not overwrite:
                         conn.execute("COMMIT")
-                        return SnapshotWrite(task_id=task_id, token=token, created=False, value=value)
+                        return SnapshotWrite(
+                            task_id=task_id, token=token, created=False, value=value
+                        )
+                    previous = current.get("contract_defaults")
+                    previous_token = row[1] if "contract_defaults" in current else None
                     conn.execute(
                         "UPDATE task_metadata SET "
                         "metadata = json_set(metadata, '$.contract_defaults', json(?)), "
@@ -457,7 +477,14 @@ class MetadataStore:
                         (encoded, now_ms, token, task_id),
                     )
                     conn.execute("COMMIT")
-                    return SnapshotWrite(task_id=task_id, token=token, created=True, value=value)
+                    return SnapshotWrite(
+                        task_id=task_id,
+                        token=token,
+                        created=True,
+                        value=value,
+                        previous=previous if isinstance(previous, dict) else None,
+                        previous_token=previous_token,
+                    )
                 conn.execute(
                     "INSERT INTO task_metadata (task_id, metadata, updated_at, write_token) "
                     "VALUES (?, json_object('contract_defaults', json(?)), ?, ?)",
@@ -495,11 +522,31 @@ class MetadataStore:
                 if current is None or current.get("contract_defaults") != write.value:
                     conn.execute("COMMIT")
                     return False
-                conn.execute(
-                    "UPDATE task_metadata SET metadata = json_remove(metadata, '$.contract_defaults'), "
-                    "write_token = NULL, updated_at = ? WHERE task_id = ?",
-                    (int(time.time() * 1000), task_id),
-                )
+                if write.previous is None:
+                    conn.execute(
+                        "UPDATE task_metadata SET metadata = json_remove(metadata, '$.contract_defaults'), "
+                        "write_token = NULL, updated_at = ? WHERE task_id = ?",
+                        (int(time.time() * 1000), task_id),
+                    )
+                else:
+                    # Re-dispatch replaced an older snapshot; a failed PATCH
+                    # restores it rather than erasing the last known contract.
+                    conn.execute(
+                        "UPDATE task_metadata SET "
+                        "metadata = json_set(metadata, '$.contract_defaults', json(?)), "
+                        "write_token = ?, updated_at = ? WHERE task_id = ?",
+                        (
+                            json.dumps(
+                                write.previous,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            write.previous_token,
+                            int(time.time() * 1000),
+                            task_id,
+                        ),
+                    )
                 row = conn.execute(
                     "SELECT metadata FROM task_metadata WHERE task_id = ?", (task_id,)
                 ).fetchone()
@@ -535,19 +582,49 @@ class WorkbenchService:
         self.base_url = base_url.rstrip("/")
         self.store = store
         self.defaults_path = Path(defaults_path)
-        # One lock per task: dispatch holds it from the acceptance gate read
-        # through the ready PATCH, so update_metadata cannot clear acceptance
-        # in the middle of a dispatch for the same card.
-        self._task_locks: dict[str, threading.RLock] = {}
+        # Loopback calls made by this service carry an in-process token. The
+        # middleware trusts it and skips re-gating: dispatch's own ready PATCH
+        # already passed the gate before it was sent, and re-entering the gate
+        # would deadlock on the per-task lock dispatch is holding.
+        self.internal_token = uuid.uuid4().hex
+        # One lock per task: dispatch/gates hold it from the acceptance read
+        # through the forwarded state change, so update_metadata cannot clear
+        # acceptance in between. These are plain Locks (not RLocks) because a
+        # gate acquires them in a threadpool worker but must release them from
+        # the event loop after the ASGI forward completes; plain Lock.release()
+        # is the only primitive that may be called from another thread.
+        self._task_locks: dict[str, threading.Lock] = {}
         self._task_locks_guard = threading.Lock()
 
-    def _task_lock(self, task_id: str) -> threading.RLock:
+    def _task_lock(self, task_id: str) -> threading.Lock:
         with self._task_locks_guard:
             lock = self._task_locks.get(task_id)
             if lock is None:
-                lock = threading.RLock()
+                lock = threading.Lock()
                 self._task_locks[task_id] = lock
             return lock
+
+    def acquire_task_locks(self, task_ids: list[str]) -> list[threading.Lock]:
+        """Acquire per-task locks in a deterministic order (off the event loop).
+
+        Sorted order prevents two multi-id bulk gates from deadlocking. On any
+        failure the already-acquired locks are released.
+        """
+        locks: list[threading.Lock] = []
+        try:
+            for task_id in sorted({item for item in task_ids if isinstance(item, str) and item}):
+                lock = self._task_lock(task_id)
+                lock.acquire()
+                locks.append(lock)
+        except BaseException:
+            self.release_task_locks(locks)
+            raise
+        return locks
+
+    @staticmethod
+    def release_task_locks(locks: list[threading.Lock]) -> None:
+        for lock in reversed(locks):
+            lock.release()
 
     # -- upstream ---------------------------------------------------------
 
@@ -564,7 +641,10 @@ class WorkbenchService:
             if remaining <= 0:
                 raise UpstreamUnavailable("dispatch budget exhausted")
             timeout = min(UPSTREAM_CALL_TIMEOUT, remaining)
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "X-Workbench-Internal": self.internal_token,
+        }
         body = None
         if payload is not None:
             body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -750,6 +830,57 @@ class WorkbenchService:
     patch_ready_gate = _ready_gate
     reclaim_gate = _ready_gate
 
+    def resolve_run_task(
+        self, run_id: str
+    ) -> tuple[Optional[str], Optional[tuple[int, dict[str, Any]]]]:
+        """Map a run id to its task through the public ``GET /runs/{run_id}``.
+
+        ``POST /runs/{run_id}/terminate`` reclaims the task and can therefore
+        put it back into ``ready``. The workbench cannot gate that request
+        without the mapping, so an unavailable/unreadable mapping fails closed
+        with 403 ``gate_unavailable`` instead of forwarding an ungated reclaim.
+        """
+        try:
+            fetched = self._request(
+                "GET",
+                "/api/plugins/kanban/runs/" + urlparse.quote(str(run_id), safe=""),
+                deadline=time.monotonic() + GATE_UPSTREAM_TIMEOUT,
+            )
+        except UpstreamUnavailable:
+            return None, (
+                403,
+                {
+                    "ok": False,
+                    "error": "gate_unavailable",
+                    "detail": "cannot resolve run's task; terminate blocked",
+                },
+            )
+        if fetched.status == 404:
+            return None, (
+                403,
+                {
+                    "ok": False,
+                    "error": "gate_unavailable",
+                    "detail": "run not found; terminate blocked",
+                },
+            )
+        run = fetched.data.get("run") if isinstance(fetched.data, dict) else None
+        task_id = run.get("task_id") if isinstance(run, dict) else None
+        if (
+            fetched.status != 200
+            or not isinstance(task_id, str)
+            or not task_id.strip()
+        ):
+            return None, (
+                403,
+                {
+                    "ok": False,
+                    "error": "gate_unavailable",
+                    "detail": "cannot resolve run's task; terminate blocked",
+                },
+            )
+        return task_id.strip(), None
+
     def bulk_ready_gate(self, task_ids: list[str]) -> Optional[tuple[int, dict[str, Any]]]:
         """Reject the whole bulk request when any id lacks acceptance."""
         unique = [task_id for task_id in dict.fromkeys(task_ids) if task_id]
@@ -860,14 +991,36 @@ class WorkbenchService:
         if actual != "triage":
             return self._fail(502, "upstream_unavailable", actual if isinstance(actual, str) else None)
 
-        metadata = {
-            "bucket": bucket,
-            "contract": {"input": "", "accept": "", "ready": False},
-        }
-        try:
-            merged = self.store.merge(task_id, metadata)
-        except MetadataUnavailable:
-            return 503, {"ok": False, "error": "metadata_unavailable", "task_id": task_id}
+        # An idempotent retry may hit a card whose requirements were already
+        # edited. Only fill *missing* keys: never overwrite an existing bucket
+        # or a non-empty contract (accept/input/budget).
+        with self._task_lock(task_id):
+            try:
+                existing = self.store.get(task_id)
+            except MetadataUnavailable:
+                return 503, {"ok": False, "error": "metadata_unavailable", "task_id": task_id}
+
+            fill: dict[str, Any] = {}
+            if not isinstance(existing, dict) or "bucket" not in existing:
+                fill["bucket"] = bucket
+            existing_contract = existing.get("contract") if isinstance(existing, dict) else None
+            if not isinstance(existing_contract, dict):
+                fill["contract"] = {"input": "", "accept": "", "ready": False}
+            else:
+                contract_fill = {
+                    key: default
+                    for key, default in (("input", ""), ("accept", ""), ("ready", False))
+                    if key not in existing_contract
+                }
+                if contract_fill:
+                    fill["contract"] = contract_fill
+
+            if not fill and isinstance(existing, dict):
+                return 200, {"ok": True, "task": fresh, "metadata": existing}
+            try:
+                merged = self.store.merge(task_id, fill)
+            except MetadataUnavailable:
+                return 503, {"ok": False, "error": "metadata_unavailable", "task_id": task_id}
         return 200, {"ok": True, "task": fresh, "metadata": merged}
 
     def update_metadata(self, task_id: str, raw: Any) -> tuple[int, dict[str, Any]]:
@@ -977,8 +1130,14 @@ class WorkbenchService:
 
         snapshot = build_contract_snapshot(defaults, metadata)
         minutes = defaults["minutes_per_task"]
+        # Lifecycle: a re-dispatch from a non-ready/non-running status is a fresh
+        # dispatch and re-snapshots the effective defaults (new write_token). A
+        # ready re-dispatch keeps the existing snapshot and only fills a missing
+        # one (e.g. a card put into ready by a legacy direct PATCH).
         try:
-            write = self.store.write_snapshot(task_id, snapshot)
+            write = self.store.write_snapshot(
+                task_id, snapshot, overwrite=status != "ready"
+            )
         except MetadataUnavailable:
             return self._fail(503, "metadata_unavailable")
 
@@ -1140,9 +1299,20 @@ class ReadyGateMiddleware:
 
     * ``PATCH /tasks/{id}`` with ``status=ready`` (404 is forwarded upstream)
     * ``POST /tasks`` when no ``triage`` flag would create a ready card
-    * ``POST /tasks/bulk`` with ``status=ready`` (any id missing acceptance
-      rejects the whole batch)
-    * ``POST /tasks/{id}/reclaim`` (can restore a ready/review phase)
+    * ``POST /tasks/bulk`` with ``status=ready``, or with
+      ``assignee`` + ``reclaim_first`` (the upstream bulk path then calls
+      ``reclaim_task``); any id missing acceptance rejects the whole batch
+    * ``POST /tasks/{id}/reclaim`` (restores a ready/review phase)
+    * ``POST /tasks/{id}/reassign`` with ``reclaim_first``
+    * ``POST /runs/{run_id}/terminate`` — the run is mapped to its task via
+      ``GET /runs/{run_id}`` and gated. If the mapping cannot be resolved the
+      request is refused with 403 ``gate_unavailable`` (fail closed), never
+      forwarded ungated.
+
+    The per-task lock is acquired before the gate's metadata read and held
+    until the forwarded state change finishes, so ``update_metadata`` cannot
+    clear acceptance in between. Acquisition runs off the event loop; release
+    happens in ``finally``.
 
     Upstream ``recompute_ready`` (parent completion) and the native 9119
     dashboard do not pass through this service and are outside the gate.
@@ -1159,8 +1329,33 @@ class ReadyGateMiddleware:
         status_code, payload = gate
         await JSONResponse(payload, status_code=status_code)(scope, receive, send)
 
+    async def _gated_forward(
+        self,
+        scope: dict[str, Any],
+        receive: Callable[[], Any],
+        send: Callable[[], Any],
+        task_ids: list[str],
+        gate_fn: Callable[[], Optional[tuple[int, dict[str, Any]]]],
+    ) -> None:
+        """Hold the per-task lock(s) across gate read + ASGI forward."""
+        locks = await run_in_threadpool(self.service.acquire_task_locks, task_ids)
+        try:
+            gate = await run_in_threadpool(gate_fn)
+            if gate is not None:
+                await self._reject(scope, receive, send, gate)
+                return
+            await self.app(scope, receive, send)
+        finally:
+            self.service.release_task_locks(locks)
+
     async def __call__(self, scope: dict[str, Any], receive: Callable[[], Any], send: Callable[[], Any]) -> None:
         if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        # Trusted loopback call from WorkbenchService itself (dispatch's PATCH,
+        # gate reads). It already passed the gate before being sent.
+        headers = dict(scope.get("headers") or [])
+        if headers.get(b"x-workbench-internal") == self.service.internal_token.encode():
             await self.app(scope, receive, send)
             return
         method = scope.get("method")
@@ -1176,11 +1371,14 @@ class ReadyGateMiddleware:
             if _requested_status(body) != "ready":
                 await self.app(scope, replay, send)
                 return
-            gate = await run_in_threadpool(self.service.patch_ready_gate, match.group(1))
-            if gate is not None:
-                await self._reject(scope, receive, send, gate)
-                return
-            await self.app(scope, replay, send)
+            task_id = match.group(1)
+            await self._gated_forward(
+                scope,
+                replay,
+                send,
+                [task_id],
+                lambda: self.service.patch_ready_gate(task_id),
+            )
             return
 
         if method != "POST":
@@ -1201,27 +1399,90 @@ class ReadyGateMiddleware:
             body = await _read_http_body(receive)
             replay = _replay_receive(body, receive)
             payload = _body_object(body)
-            if payload is None or payload.get("status") != "ready":
+            if payload is None:
                 await self.app(scope, replay, send)
                 return
             ids = payload.get("ids")
             if not isinstance(ids, list) or not all(isinstance(item, str) for item in ids):
                 await self.app(scope, replay, send)
                 return
-            gate = await run_in_threadpool(self.service.bulk_ready_gate, ids)
-            if gate is not None:
-                await self._reject(scope, receive, send, gate)
+            # ``reclaim_first`` only reclaims when an assignee is carried
+            # (upstream: ``payload.assignee is not None``).
+            reclaiming = (
+                "assignee" in payload
+                and payload.get("assignee") is not None
+                and _truthy(payload.get("reclaim_first"))
+            )
+            if payload.get("status") != "ready" and not reclaiming:
+                await self.app(scope, replay, send)
                 return
-            await self.app(scope, replay, send)
+            await self._gated_forward(
+                scope,
+                replay,
+                send,
+                ids,
+                lambda: self.service.bulk_ready_gate(ids),
+            )
+            return
+
+        match = REASSIGN_PATH_RE.match(path)
+        if match is not None:
+            body = await _read_http_body(receive)
+            replay = _replay_receive(body, receive)
+            payload = _body_object(body)
+            if payload is None or not _truthy(payload.get("reclaim_first")):
+                await self.app(scope, replay, send)
+                return
+            task_id = match.group(1)
+            await self._gated_forward(
+                scope,
+                replay,
+                send,
+                [task_id],
+                lambda: self.service.reclaim_gate(task_id),
+            )
             return
 
         match = RECLAIM_PATH_RE.match(path)
         if match is not None:
-            gate = await run_in_threadpool(self.service.reclaim_gate, match.group(1))
-            if gate is not None:
-                await self._reject(scope, receive, send, gate)
+            task_id = match.group(1)
+            await self._gated_forward(
+                scope,
+                receive,
+                send,
+                [task_id],
+                lambda: self.service.reclaim_gate(task_id),
+            )
+            return
+
+        match = RUN_TERMINATE_PATH_RE.match(path)
+        if match is not None:
+            task_id, gate_error = await run_in_threadpool(
+                self.service.resolve_run_task, match.group(1)
+            )
+            if gate_error is not None or task_id is None:
+                await self._reject(
+                    scope,
+                    receive,
+                    send,
+                    gate_error
+                    or (
+                        403,
+                        {
+                            "ok": False,
+                            "error": "gate_unavailable",
+                            "detail": "cannot resolve run's task; terminate blocked",
+                        },
+                    ),
+                )
                 return
-            await self.app(scope, receive, send)
+            await self._gated_forward(
+                scope,
+                receive,
+                send,
+                [task_id],
+                lambda: self.service.reclaim_gate(task_id),
+            )
             return
 
         await self.app(scope, receive, send)
@@ -1259,15 +1520,16 @@ def _self_base(host: str, port: int) -> str:
     return f"http://{resolved}:{int(port)}"
 
 
-def _parse_ids(raw: str) -> list[str]:
+def _parse_ids(raw: str) -> tuple[list[str], bool]:
+    """Return ``(ids, too_many)``; never silently truncate the caller's list."""
     seen: list[str] = []
     for part in raw.split(","):
         task_id = part.strip()
         if task_id and task_id not in seen:
+            if len(seen) >= MAX_METADATA_IDS:
+                return seen, True
             seen.append(task_id)
-        if len(seen) >= 200:
-            break
-    return seen
+    return seen, False
 
 
 def _json_error(status_code: int, error: str, **extra: Any) -> JSONResponse:
@@ -1393,7 +1655,10 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
 
     @app.get("/api/workbench/metadata")
     def metadata(ids: str = "") -> JSONResponse:
-        status_code, payload = service.metadata_for(_parse_ids(ids))
+        task_ids, too_many = _parse_ids(ids)
+        if too_many:
+            return _json_error(400, "too_many_ids")
+        status_code, payload = service.metadata_for(task_ids)
         return JSONResponse(payload, status_code=status_code)
 
     @app.post("/api/workbench/tasks")

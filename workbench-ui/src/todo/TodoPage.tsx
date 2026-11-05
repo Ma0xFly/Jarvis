@@ -159,7 +159,6 @@ export default function TodoPage(): React.ReactElement {
       if (superseded()) return;
       const columns = Array.isArray(data.columns) ? data.columns : [];
       setBoard({ columns });
-      setLoaded(true);
       const ids = columns.reduce<string[]>(
         (acc, column) => acc.concat((column.tasks || []).map((task) => task.id)),
         [],
@@ -175,9 +174,14 @@ export default function TodoPage(): React.ReactElement {
         // every repository card disappear.
         setErr("契约不可读：" + errText(error));
       }
+      // Only clear loading after metadata settles (success or failure): the
+      // first paint must not show empty today/long columns while acceptance
+      // is still in flight.
+      setLoaded(true);
     } catch (error) {
       if (superseded()) return;
       setErr("kanban 不可达：" + errText(error));
+      setLoaded(true);
     }
   }, []);
 
@@ -237,6 +241,10 @@ export default function TodoPage(): React.ReactElement {
         } else if (error instanceof WorkbenchError && error.code === "missing_acceptance") {
           flashWarn(task.id);
           return;
+        } else if (error instanceof WorkbenchError && error.code === "dispatch_timeout") {
+          // The dispatch client aborted; pending receipt was cleared above and
+          // the in-flight guard is released in `finally`.
+          showToast("派发超时，请刷新后重试");
         } else {
           showToast("派发失败：" + errText(error));
         }
