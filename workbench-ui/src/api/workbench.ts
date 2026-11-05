@@ -63,10 +63,12 @@ export type WorkbenchErrorCode =
   | "not_in_review"
   | "reason_required"
   | "reason_too_long"
+  | "stale_review"
   | "invalid_action"
   | "verify_failed"
   | "inbox_failed"
-  | "sweep_failed";
+  | "sweep_failed"
+  | "notification_failed";
 
 const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "missing_acceptance",
@@ -94,10 +96,12 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "not_in_review",
   "reason_required",
   "reason_too_long",
+  "stale_review",
   "invalid_action",
   "verify_failed",
   "inbox_failed",
   "sweep_failed",
+  "notification_failed",
 ];
 
 /** 后端错误码优先；宿主 SDK 只给 message 时按文本兜底，最后按 HTTP 状态兜底 */
@@ -159,7 +163,8 @@ type ErrorContext =
   | "metadata"
   | "verify"
   | "inbox"
-  | "sweep";
+  | "sweep"
+  | "notifications";
 
 /**
  * HTTP 状态兜底只在没有后端 error 码时使用。400 的含义随调用而变：
@@ -179,6 +184,7 @@ function fallbackCode(status: number | undefined, context: ErrorContext): Workbe
       if (context === "verify") return "verify_failed";
       if (context === "inbox") return "inbox_failed";
       if (context === "sweep") return "sweep_failed";
+      if (context === "notifications") return "notification_failed";
       return "metadata_failed";
     case 502:
       return "upstream_unavailable";
@@ -190,6 +196,7 @@ function fallbackCode(status: number | undefined, context: ErrorContext): Workbe
       if (context === "verify") return "verify_failed";
       if (context === "inbox") return "inbox_failed";
       if (context === "sweep") return "sweep_failed";
+      if (context === "notifications") return "notification_failed";
       return "metadata_failed";
   }
 }
@@ -559,5 +566,359 @@ export async function verifyTask(
     };
   } catch (error) {
     throw toWorkbenchError(error, "verify");
+  }
+}
+
+/* -------------------------------------------------------------------------
+ * 通知中心（2.2）：P0/P1/P2 快照 + 动作。
+ * 后端只在独立版 8787 提供；事件 id 含冒号，路径参数必须 encodeURIComponent。
+ * ---------------------------------------------------------------------- */
+
+export type NotificationLevel = "p0" | "p1" | "p2";
+export type NotificationActionName = "accept" | "reject" | "remind";
+
+export interface NotificationItem {
+  id: string;
+  task_id: string;
+  kind: "blocked" | "review";
+  level: NotificationLevel;
+  title: string;
+  status: string;
+  /** 中文原因，UI 直接展示。 */
+  reason: string;
+  block_kind: string | null;
+  block_recurrences: number;
+  review_requested_at: number | null;
+  /** 距 48h 自动收的剩余秒数；null = 无 review 记录。 */
+  auto_collect_in_seconds: number | null;
+  auto_collect_due: boolean;
+  parent_ids: string[];
+  first_seen_at: number;
+  age_seconds: number;
+  notified_at: number | null;
+  escalated: boolean;
+  snooze_until: number | null;
+  actions: NotificationActionName[];
+  slot: "active" | "queued" | null;
+  bundle_key: string | null;
+}
+
+export interface NotificationBundle {
+  key: string;
+  parent_ids: string[];
+  count: number;
+  task_ids: string[];
+  cards: NotificationItem[];
+  oldest_review_at: number | null;
+}
+
+export interface NotificationSlots {
+  capacity: number;
+  active: NotificationBundle[];
+  queued: NotificationBundle[];
+  queued_count: number;
+  queued_cards: number;
+}
+
+export interface NotificationDaily {
+  date: string;
+  sent: boolean;
+  count: number;
+  line: string;
+  hour: number;
+}
+
+export interface NotificationDesktopState {
+  available: boolean;
+  command: string;
+  last_error: string | null;
+  last_sent_at: number | null;
+  last_kind: string | null;
+  last_urgency: string | null;
+}
+
+export interface NotificationSnapshot {
+  ok: true;
+  generated_at: number;
+  now: number;
+  counts: { p0: number; p1: number; p2: number; total: number };
+  p0: NotificationItem[];
+  p1: NotificationItem[];
+  p2: NotificationItem[];
+  review_ttl_seconds: number;
+  slots: NotificationSlots;
+  daily: NotificationDaily;
+  desktop: NotificationDesktopState;
+  sweep: { last_at: number | null; last_error: string | null };
+  channels: { desktop: string; mobile: string };
+  thresholds?: {
+    batch_size?: number;
+    batch_seconds?: number;
+    escalate_seconds?: number;
+    snooze_seconds?: number;
+    daily_hour?: number;
+  };
+}
+
+export interface NotificationActionResult {
+  ok: true;
+  id?: string;
+  action: string;
+  status?: string;
+  comment_written?: boolean;
+  snooze_until?: number;
+}
+
+const NOTIFICATION_ACTIONS: readonly NotificationActionName[] = [
+  "accept",
+  "reject",
+  "remind",
+];
+
+function numberOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function stringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === "string" && entry.length > 0)
+    : [];
+}
+
+function normalizeNotificationItem(raw: unknown): NotificationItem | null {
+  if (!raw || typeof raw !== "object") return null;
+  const source = raw as Record<string, unknown>;
+  if (typeof source.id !== "string" || !source.id) return null;
+  const kind = source.kind === "blocked" || source.kind === "review" ? source.kind : null;
+  const level =
+    source.level === "p0" || source.level === "p1" || source.level === "p2"
+      ? source.level
+      : null;
+  if (!kind || !level) return null;
+  const actions = Array.isArray(source.actions)
+    ? source.actions.filter(
+        (entry): entry is NotificationActionName =>
+          typeof entry === "string" &&
+          (NOTIFICATION_ACTIONS as readonly string[]).includes(entry),
+      )
+    : [];
+  return {
+    id: source.id,
+    task_id: typeof source.task_id === "string" ? source.task_id : "",
+    kind,
+    level,
+    title: typeof source.title === "string" ? source.title : source.id,
+    status: typeof source.status === "string" ? source.status : kind,
+    reason: typeof source.reason === "string" ? source.reason : "",
+    block_kind: typeof source.block_kind === "string" ? source.block_kind : null,
+    block_recurrences: numberOr(source.block_recurrences, 0),
+    review_requested_at: nullableNumber(source.review_requested_at),
+    auto_collect_in_seconds: nullableNumber(source.auto_collect_in_seconds),
+    auto_collect_due: source.auto_collect_due === true,
+    parent_ids: stringList(source.parent_ids),
+    first_seen_at: numberOr(source.first_seen_at, 0),
+    age_seconds: numberOr(source.age_seconds, 0),
+    notified_at: nullableNumber(source.notified_at),
+    escalated: source.escalated === true,
+    snooze_until: nullableNumber(source.snooze_until),
+    actions,
+    slot:
+      source.slot === "active" || source.slot === "queued" ? source.slot : null,
+    bundle_key: typeof source.bundle_key === "string" ? source.bundle_key : null,
+  };
+}
+
+function normalizeItems(value: unknown): NotificationItem[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map(normalizeNotificationItem)
+    .filter((item): item is NotificationItem => item !== null);
+}
+
+function normalizeBundles(value: unknown): NotificationBundle[] {
+  if (!Array.isArray(value)) return [];
+  const bundles: NotificationBundle[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const source = raw as Record<string, unknown>;
+    if (typeof source.key !== "string") continue;
+    const cards = normalizeItems(source.cards);
+    bundles.push({
+      key: source.key,
+      parent_ids: stringList(source.parent_ids),
+      count: numberOr(source.count, cards.length),
+      task_ids: stringList(source.task_ids),
+      cards,
+      oldest_review_at: nullableNumber(source.oldest_review_at),
+    });
+  }
+  return bundles;
+}
+
+function normalizeNotificationSnapshot(data: unknown): NotificationSnapshot {
+  if (!data || typeof data !== "object") {
+    throw new WorkbenchError("notification_failed", "通知快照响应格式不正确", 200);
+  }
+  const source = data as Record<string, unknown>;
+  if (source.ok !== true) {
+    throw new WorkbenchError("notification_failed", "通知快照响应格式不正确", 200);
+  }
+  const p0 = normalizeItems(source.p0);
+  const p1 = normalizeItems(source.p1);
+  const p2 = normalizeItems(source.p2);
+  const slotsRaw =
+    source.slots && typeof source.slots === "object"
+      ? (source.slots as Record<string, unknown>)
+      : {};
+  const dailyRaw =
+    source.daily && typeof source.daily === "object"
+      ? (source.daily as Record<string, unknown>)
+      : {};
+  const desktopRaw =
+    source.desktop && typeof source.desktop === "object"
+      ? (source.desktop as Record<string, unknown>)
+      : {};
+  const sweepRaw =
+    source.sweep && typeof source.sweep === "object"
+      ? (source.sweep as Record<string, unknown>)
+      : {};
+  const channelsRaw =
+    source.channels && typeof source.channels === "object"
+      ? (source.channels as Record<string, unknown>)
+      : {};
+  const generatedAt = numberOr(source.generated_at, Math.floor(Date.now() / 1000));
+  return {
+    ok: true,
+    generated_at: generatedAt,
+    now: numberOr(source.now, generatedAt),
+    counts: {
+      p0: p0.length,
+      p1: p1.length,
+      p2: p2.length,
+      total: p0.length + p1.length + p2.length,
+    },
+    p0,
+    p1,
+    p2,
+    review_ttl_seconds: numberOr(source.review_ttl_seconds, 0),
+    slots: {
+      capacity: numberOr(slotsRaw.capacity, 3),
+      active: normalizeBundles(slotsRaw.active),
+      queued: normalizeBundles(slotsRaw.queued),
+      queued_count: numberOr(slotsRaw.queued_count, 0),
+      queued_cards: numberOr(slotsRaw.queued_cards, 0),
+    },
+    daily: {
+      date: typeof dailyRaw.date === "string" ? dailyRaw.date : "",
+      sent: dailyRaw.sent === true,
+      count: numberOr(dailyRaw.count, p2.length),
+      line: typeof dailyRaw.line === "string" ? dailyRaw.line : "",
+      hour: numberOr(dailyRaw.hour, 8),
+    },
+    desktop: {
+      available: desktopRaw.available === true,
+      command: typeof desktopRaw.command === "string" ? desktopRaw.command : "",
+      last_error:
+        typeof desktopRaw.last_error === "string" ? desktopRaw.last_error : null,
+      last_sent_at: nullableNumber(desktopRaw.last_sent_at),
+      last_kind: typeof desktopRaw.last_kind === "string" ? desktopRaw.last_kind : null,
+      last_urgency:
+        typeof desktopRaw.last_urgency === "string" ? desktopRaw.last_urgency : null,
+    },
+    sweep: {
+      last_at: nullableNumber(sweepRaw.last_at),
+      last_error:
+        typeof sweepRaw.last_error === "string" ? sweepRaw.last_error : null,
+    },
+    channels: {
+      desktop: typeof channelsRaw.desktop === "string" ? channelsRaw.desktop : "",
+      mobile:
+        typeof channelsRaw.mobile === "string" ? channelsRaw.mobile : "reserved",
+    },
+    thresholds:
+      source.thresholds && typeof source.thresholds === "object"
+        ? (source.thresholds as NotificationSnapshot["thresholds"])
+        : undefined,
+  };
+}
+
+/** 通知快照：pure read，后端内存态；采集由 sweep 或后台轮询完成。 */
+export async function getNotifications(): Promise<NotificationSnapshot> {
+  try {
+    const data = await api(WORKBENCH + "/notifications");
+    return normalizeNotificationSnapshot(data);
+  } catch (error) {
+    throw toWorkbenchError(error, "notifications");
+  }
+}
+
+/** 显式采集一轮（guarded POST）；后台 5s 轮询在服务端也做同样的事。 */
+export async function sweepNotifications(): Promise<NotificationSnapshot> {
+  try {
+    const data = await api(WORKBENCH + "/notifications/sweep", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    return normalizeNotificationSnapshot(data);
+  } catch (error) {
+    throw toWorkbenchError(error, "notifications");
+  }
+}
+
+/**
+ * 通知动作：accept / reject 直接复用 2.1 verify；remind 由后端 snooze 10 分钟。
+ * reject 的空理由在前端先拦一次，后端仍会校验。
+ */
+export async function notificationAction(
+  eventId: string,
+  action: NotificationActionName,
+  reason?: string,
+  expectedReviewAt?: number | null,
+): Promise<NotificationActionResult> {
+  if (!eventId || !eventId.trim()) {
+    throw new WorkbenchError("notification_failed", "缺少通知 id");
+  }
+  const trimmedReason = typeof reason === "string" ? reason.trim() : "";
+  if (action === "reject" && !trimmedReason) {
+    throw new WorkbenchError("reason_required", "不收必须写理由");
+  }
+  if (action === "reject" && trimmedReason.length > MAX_REJECT_REASON_CHARS) {
+    throw new WorkbenchError(
+      "reason_too_long",
+      `理由最多 ${MAX_REJECT_REASON_CHARS} 字，请精简后再提交`,
+    );
+  }
+  const payload: Record<string, unknown> = { action };
+  if (action === "reject") payload.reason = trimmedReason;
+  if (typeof expectedReviewAt === "number" && Number.isFinite(expectedReviewAt)) {
+    payload.expected_review_at = expectedReviewAt;
+  }
+  try {
+    const data = (await api(
+      WORKBENCH + "/notifications/" + encodeURIComponent(eventId) + "/action",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    )) as Partial<NotificationActionResult> | null;
+    if (!data || data.ok !== true) {
+      throw new WorkbenchError("notification_failed", "通知动作响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      id: typeof data.id === "string" ? data.id : eventId,
+      action: typeof data.action === "string" ? data.action : action,
+      status: typeof data.status === "string" ? data.status : undefined,
+      comment_written: data.comment_written === true,
+      snooze_until: nullableNumber(data.snooze_until) ?? undefined,
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "notifications");
   }
 }

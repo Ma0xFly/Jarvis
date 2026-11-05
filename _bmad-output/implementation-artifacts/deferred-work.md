@@ -62,3 +62,7 @@
   summary: 抽取 Board / TodoPage 共享的轮询、toast、拖拽与 loading hook。
   evidence: `Board.tsx` 与 `TodoPage.tsx` 各自实现 5s 轮询、toast 定时器与 HTML5 拖拽；1.4 又在 TodoPage 增加了回执 6s 定时器与常驻 live-region，行为已出现重复维护点（如拖拽高亮/清理、定时器清理），后续做详情抽屉或多视图时应先抽 hook。
 
+- source_spec: `_bmad-output/implementation-artifacts/spec-2-2-p0-notifications.md`
+  summary: 补一条通知 sweep 与 accept/reject 并发的 guard 测试（board 读取窗口内完成动作）。
+  evidence: （VG6）`server.py` 的 `notification_lock` 已把 board 读取 + collect 与动作串行化，但测试只顺序调用 sweep/action；重叠窗口为一次 board 读取，下一轮 sweep 会自愈。可仿照 `tests/test_dispatch.py:1598` 的 GateLockTests 构造阻塞 board 读取。
+

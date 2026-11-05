@@ -220,6 +220,94 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
   - `WORKBENCH_INBOX_CACHE_SECONDS` count/inbox 的 /board 短缓存，默认 `1`；
     `0` 关闭缓存（仍保留 in-flight 合并），测试用
 
+## 通知中心 / P0 通知与动作
+
+通知引擎（`notifications.py`）只读 `/board` + `GET /tasks/{id}` 分类，不写
+`kanban.db`、不新增状态迁移；状态全部在内存里，重启后重新采集。
+
+分类规则：
+
+- `blocked` 且有未完成子卡，或 `block_kind ∈ {needs_input, capability}` → **P0**
+- 其余 `blocked`（`dependency` / `transient` / 未分类）→ **P1**
+- `review` 且有未完成子卡 → **P0**；其余 `review` → **P2**
+- 其它状态（`ready` / `running` / `done` 等）不通知
+
+事件 id 稳定并绑定一轮处理：
+`n:{task_id}:review:{review_requested_at}` /
+`n:{task_id}:blocked:{block_kind}:{block_recurrences}`。事件离开候选集即
+resolved；同一 id 再次出现视为新事件，通知/升级/snooze 全部重置。
+
+推送：
+
+- **P0**：5s 轮询内发桌面 `notify-send`（`--urgency=critical`）并在右上角置顶；
+  30 分钟未处理再提醒一次，之后不再重复。
+- **P1**：攒批；待推达到 3 条时合并为一条（`--urgency=normal`，内容截断）。
+  最早一条等满 30 分钟仍未处理 → 升级 P0 一次（`--urgency=critical`；
+  同一轮到期的事件合并成一条升级），之后不再重复。
+- **P2**：每日 08:00 一条汇总（`--urgency=low`），当天最多一次。
+- review 卡统一显示「还有 Xh Ym 自动收」倒计时；验收槽固定 3 束，同一
+  `parent` 集合的兄弟卡（同一次 decompose）成一束，超出的束排队。
+- reminder/升级只对 P0/P1；P2 只支持 accept/reject。
+
+```bash
+# 快照（pure read，内存态；UI 每 5s 轮询）
+curl -s http://127.0.0.1:8787/api/workbench/notifications
+# 200 {"ok":true,"generated_at":…,"counts":{"p0":1,"p1":0,"p2":2,"total":3},
+#      "p0":[{…}],"p1":[],"p2":[…],
+#      "slots":{"capacity":3,"active":[…],"queued":[…],"queued_count":1,
+#               "queued_cards":1},
+#      "daily":{"date":"2026-11-05","sent":true,"count":2,"hour":8,
+#               "line":"P2 待验收 2 张：…"},
+#      "sweep":{"last_at":1762345678,"last_error":null},
+#      "desktop":{"available":true,"last_error":null,"last_kind":"p0",…},
+#      "channels":{"desktop":"notify-send","mobile":"reserved"}}
+
+# 采集一轮（guarded POST；服务端后台每 5s 也跑同一轮）
+curl -s -X POST http://127.0.0.1:8787/api/workbench/notifications/sweep \
+  -H 'content-type: application/json' -d '{}'
+# 200 快照；502 upstream_unavailable（保留上一份快照，不重复通知）
+
+# 动作：accept | reject（reason 必填）| remind（10 分钟后）
+curl -s -X POST \
+  'http://127.0.0.1:8787/api/workbench/notifications/<event_id>/action' \
+  -H 'content-type: application/json' -d '{"action":"remind"}'
+# 200 {"ok":true,"id":"n:…","action":"remind","snooze_until":…}
+# 400 invalid_action / reason_required / reason_too_long
+# 404 not_found
+# 409 stale_review（accept/reject 可带 expected_review_at；与最新
+#     review_requested 不一致时拒绝，避免旧通知操作新一轮 review）
+# accept/reject 直接调用 2.1 verify：
+#   200 {"ok":true,"action":"accept","status":"done","comment_written":false}
+#   verify 失败按 2.1 状态码回传，通知保留以便重试
+```
+
+规则：
+
+- `POST /notifications/sweep` 与 accept/reject 都受 JSON Content-Type +
+  同源 Origin 守卫；`GET /notifications` 是纯读，不访问上游。快照里的
+  `sweep.last_at/last_error` 记录最近一次采集结果，采集失败时保留上一份
+  数据并把错误显示在通知中心。
+- 通知命令缺失、解析失败或退出码非 0 只写进快照的 `desktop.last_error`，
+  不影响快照、动作或其它端点；失败的推送不会标记 `notified_at`/升级/
+  日报已发，60 秒退避后重试（桌面通道不可用时服务仍可启动）。命令可整体
+  由 `WORKBENCH_NOTIFY_COMMAND` 覆盖（测试用 logger 脚本），参数追加
+  `--app-name=Jarvis 工作台 --urgency=<critical|normal|low> <summary> <body>`。
+- 手机通道只在根 payload 预留 `channels.mobile`（固定 `reserved`），不做
+  真实推送；`channels.desktop` 是实际通知命令。
+- 验收槽只约束通知中心的展示/推送，不改变 2.1 全屏验收队列的处理能力。
+- 引擎是内存态：重启后当前 P0 会重新推送一次，P1 重新计时攒批，P2 当天
+  可能再次发送日报（没有持久化去重）。
+- 只在独立版 8787 提供；插件宿主不渲染通知中心、也不轮询该端点。
+- 环境变量：时间阈值均为有限正数，非法值回落默认；例外是
+  `WORKBENCH_NOTIFY_SWEEP_SECONDS` 的 `0`/非法值表示关闭后台采集。
+  - `WORKBENCH_NOTIFY_SWEEP_SECONDS` 后台采集间隔，默认 `5`；`0`/非法值关闭
+  - `WORKBENCH_NOTIFY_BATCH_SIZE` P1 攒批条数，默认 `3`
+  - `WORKBENCH_NOTIFY_BATCH_SECONDS` P1 最早等待，默认 `1800`
+  - `WORKBENCH_NOTIFY_ESCALATE_SECONDS` P0/P1 未处理升级，默认 `1800`
+  - `WORKBENCH_NOTIFY_SNOOZE_SECONDS` remind 延后，默认 `600`
+  - `WORKBENCH_NOTIFY_DAILY_HOUR` P2 汇总小时，默认 `8`
+  - `WORKBENCH_NOTIFY_COMMAND` 覆盖通知命令
+
 ## 界面
 
 - **待办**（独立版默认 tab）：三列「流水线（302px 凹槽）/ 今日 / 长期」。
@@ -241,6 +329,13 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
   Ctrl/Cmd+Enter 提交）、`S` 跳过、`Esc` 退出；清空后展示本批统计并约 3 秒
   自动返回。队列 5s 轮询，跳过卡不会被重新加回；新 review 卡会自动追加。
   `initialTaskId` 不在队列时给出提示而不是静默换卡；2.3 会话入口仅占位。
+- **通知中心**（独立版右上角固定层，不是 tab）：P0 置顶常驻；P1 攒批面板；
+  P2 每日一行 + 当天 review 卡列表；review 卡显示自动收倒计时；验收槽摘要
+  展示当前 3 束（兄弟卡成束）与排队束/张数。review 卡可直接「收」「不收」
+  （理由必填）或「10 分钟后再提醒」；非 review 卡只有提醒与「打开看板」。
+  首次进入显式采集一轮，之后每 5s 拉 `GET /notifications`（不轮询写接口）。
+  桌面通知失败时在面板顶部显示 `desktop.last_error`，不影响卡片操作。
+  插件宿主不挂载该组件，也不发通知请求。
 - **看板**：8 列 `待整理 / 待执行 / 已排期 / 就绪 / 运行中 / 待拍板 / 待验收 / 已完成`。
   独立版把卡拖到「就绪」会走 `dispatchTask`（写快照、算位次、过验收闸门），
   其他列仍是原生 PATCH；闸门拒绝显示中文提示（空验收 / parent / 不可派发）。
@@ -260,11 +355,13 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
 | 文件 | 作用 |
 |---|---|
 | `server.py` | FastAPI：挂 kanban router + `/api/workbench/*` + PATCH-ready 闸门 + 静态页 + `/healthz` |
+| `notifications.py` | 通知引擎：分类 / 事件 id / P1 攒批 / 升级 / snooze / P2 日报 / 验收槽 / 桌面通知 + 后台 poller |
 | `defaults.json` | 预算与队列估算的唯一全局默认源 |
 | `workbench.db` | 运行期生成的工作台 metadata 库（已 gitignore） |
 | `tests/test_dispatch.py` | 派发/闸门/metadata 的可重复集成测试（临时库，不碰真实数据） |
 | `tests/test_todo.py` | 待办建卡 / metadata 写端点的可重复集成测试 |
 | `tests/test_verify.py` | inbox / count / sweep / verify / 48h 自动收与退避的可重复集成测试 |
+| `tests/test_notifications.py` | 通知分类/攒批/升级/日报/槽/动作/snooze/命令失败/后台 10s 的测试 |
 | `web/index.js` / `web/style.css` | `workbench-ui` 的构建产物（禁止手改） |
 | `web/index.html` / `web/icon.svg` / `web/theme.css` | 独立版页面骨架与主题 |
 | `install.sh` | 用户级 systemd 服务 + 桌面入口 |
@@ -289,7 +386,11 @@ systemctl --user restart jarvis-workbench
 ```bash
 python3 workbench-app/tests/test_dispatch.py -v
 python3 workbench-app/tests/test_todo.py -v
-cd workbench-ui && npm run probe:todo   # headless 三列/拖拽/建卡/验收/回执/位次探针
+python3 workbench-app/tests/test_verify.py -v
+python3 workbench-app/tests/test_notifications.py -v
+cd workbench-ui && npm run probe:todo    # headless 三列/拖拽/建卡/验收/回执/位次探针
+cd workbench-ui && npm run probe:verify  # headless 全屏验收探针
+cd workbench-ui && npm run probe:notify  # headless 通知中心探针
 ```
 
 后端测试会为每个套件创建临时 `HERMES_KANBAN_HOME` 与 `WORKBENCH_DB`，并用
@@ -312,7 +413,10 @@ done/archived、running、非法 defaults 与卡覆盖、metadata 201-id 返回
 与回执/徽标对比度、窄视口与双 tab 状态保持；并覆盖看板拖到就绪走 dispatch
 （快照/位次/中文闸门提示）、dispatch 5s 超时清理 pending 与串行锁、插件宿主
 SDK stub（只读就绪列、其他列仍可 PATCH、缺少 `fetchJSON` 的宿主报错）。
-`npm run verify` = `build + probe:todo`。
+`npm run probe:notify` 覆盖通知中心：P0 置顶、P1 面板、P2 日报、验收槽/
+排队、倒计时数值、remind/不收/收、桌面通知失败提示、挂载后新卡 5s 轮询，
+以及插件宿主无通知中心/无轮询。
+`npm run verify` = `build + probe:todo + probe:verify + probe:notify`。
 
 探针前置条件：Node ≥22（内置 `WebSocket`/`fetch`）、本机 Chrome/Chromium
 （自动找 `google-chrome` / Playwright 缓存，找不到时用 `CHROME_BIN` 指定）、
@@ -336,6 +440,8 @@ Python 运行时（同后端测试，可用 `WORKBENCH_PYTHON` 覆盖）。
 - 已跟踪的 `web/*.bak-*` 与旧 `web/app.js` / `sync-ui.sh` 清理 deferred；本次不删已跟踪文件
 - 没有任务详情抽屉（看详情仍可用 dashboard 的 Kanban 页）
 - 5 秒轮询，不是 WebSocket
+- 通知引擎是内存态：重启后重新采集，不持久化通知历史；手机通道只在 payload
+  预留 `channels.mobile`，不做真实推送
 - 「今日/长期」归属以 `metadata.bucket` 为准；列表固定 `created_at` 倒序，不做栏内拖动或排序持久化
 - 无登录，仅限本机 / Tailscale
 

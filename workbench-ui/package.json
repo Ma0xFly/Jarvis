@@ -11,7 +11,8 @@
     "build": "npm run typecheck && npm run build:plugin && npm run build:standalone && node scripts/distribute.mjs",
     "probe:todo": "node scripts/todo-probe.mjs",
     "probe:verify": "node scripts/verify-probe.mjs",
-    "verify": "npm run build && npm run probe:todo && npm run probe:verify"
+    "probe:notify": "node scripts/notification-probe.mjs",
+    "verify": "npm run build && npm run probe:todo && npm run probe:verify && npm run probe:notify"
   },
   "dependencies": {
     "react": "^18.3.1",

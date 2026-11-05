@@ -301,6 +301,10 @@ async function main() {
         HERMES_KANBAN_DB: join(tmp, "kanban-home", "kanban.db"),
         WORKBENCH_DB: join(tmp, "workbench.db"),
         WORKBENCH_DEFAULTS: defaults,
+        // Notification polling is covered by notification-probe.mjs; keep
+        // this probe free of background desktop notifications.
+        WORKBENCH_NOTIFY_SWEEP_SECONDS: "0",
+        WORKBENCH_NOTIFY_COMMAND: "true",
       },
       stdio: ["ignore", "pipe", "pipe"],
     });

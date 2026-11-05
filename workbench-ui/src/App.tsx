@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useState } from "react";
 import Board from "./board/Board";
 import TodoPage from "./todo/TodoPage";
 import VerifyPage from "./verify/VerifyPage";
+import NotificationCenter from "./notify/NotificationCenter";
 import { getInboxCount, sweepReviews } from "./api/workbench";
 import { isPluginHost } from "./platform";
 import "./styles/board.css";
 import "./styles/todo.css";
 import "./styles/verify.css";
+import "./styles/notify.css";
 
 type TabKey = "todo" | "flow";
 
@@ -61,6 +63,8 @@ export default function App(): React.ReactElement {
     void refreshInbox();
   }, [refreshInbox]);
 
+  const openBoard = useCallback(() => setTab("flow"), []);
+
   return (
     <div className="wb-root">
       <div className="wb-head">
@@ -100,6 +104,15 @@ export default function App(): React.ReactElement {
       <div className={"wb-pane" + (tab === "flow" ? "" : " wb-pane-hidden")}>
         <Board />
       </div>
+
+      {/* 通知中心只在独立版挂载（插件宿主没有 /api/workbench/*，也不轮询）。 */}
+      {!isPluginHost ? (
+        <NotificationCenter
+          onOpenBoard={openBoard}
+          onOpenVerify={openVerify}
+          onChanged={refreshInbox}
+        />
+      ) : null}
 
       {/* 验收是全屏覆盖层，不是 tab；插件宿主的 TABS 里没有入口。 */}
       {!isPluginHost && verifyOpen ? (
