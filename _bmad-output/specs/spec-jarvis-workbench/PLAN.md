@@ -377,6 +377,12 @@ executor-run --executor claude_code --cwd <dir> --mode write              --budg
 
 **适配器只做翻译**：统一参数 → 各家 CLI；各家输出 → 统一 JSON。不放业务逻辑，不读 `kanban.db`。
 
+**流式模式（`--stream`，用于"编程时看得见"）**：不退出进程，改用 `--input-format stream-json --output-format stream-json` 保持双向 stdio；事件逐行落 `log_path`，工作台 tail 这个文件即可实时看到工具调用与文本。已实测：发一条 user 消息，可收到 `system/init`、`assistant`、`result` 三类事件。
+
+- **权限询问**走 `--permission-prompt-tool`，由调用方答复；不要用 `--dangerously-skip-permissions`。
+- 中途干预靠发新消息或 `interrupt_*` 能力（init 事件里会列出当前可用 capabilities）。
+- init 事件还给出 `messaging_socket_path`（`/run/user/1000/cc-socks/*.sock`），Claude Code 自身暴露了消息 socket，桌面端就是用它做多会话管理。
+
 **新增一个执行器 = 三步**：写一个 ~60 行的适配器 → 在 `executors.json` 注册 → `routing.json` 里可以开始用它。别的代码一行不动。
 
 **什么时候才该再包一层插件**：当你想在 dashboard 里给执行器做管理页（开关、并发数、当前在跑什么），或者想让模型通过 tool schema 自动发现「有哪些执行器可用」。那时写个薄插件去调这个 CLI 就行。**顺序是先 CLI 后插件，反过来会把自己焊死。**
