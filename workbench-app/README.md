@@ -147,8 +147,15 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
 - **待办**（独立版默认 tab）：三列「流水线（302px 凹槽）/ 今日 / 长期」。
   今日/长期只显示 `triage` 且 `metadata.bucket` 匹配的卡，仓库卡只有标题 +
   验收一行；验收在卡上就地编辑（失败保留输入）。拖进流水线调用 1.2 的
-  `dispatchTask`；验收为空时回原位、抖动 300ms、红字提示且不发请求。底部
-  输入框回车建卡，今日/长期可切换（默认今日），不自动派发。
+  `dispatchTask`；验收为空时回原位、抖动 300ms、红字提示且不发请求。
+  顶部回执条在 drop 时显示「正在派发…」，响应后显示「已入队 · 第 N 位 ·
+  预计 HH:MM」（running 卡显示「已在运行」）；只保留最近一次派发尝试
+  （latest-attempt；新尝试会替换旧回执），6 秒后自动消失，可用关闭按钮提前
+  隐藏（本次尝试迟到的结果不再弹出），不显示卡片标题/ID。
+  回执位次/ETA 是 dispatch 响应的快照；流水线 `ready` 卡上的「第 N 位」是每次
+  5s 轮询按 `/board` 顺序重算的实时值，刷新后只保留行内位次、不显示 ETA。
+  ETA 是队列槽位近似：位次 1 = 7 分钟，不扣除卡已运行时间。底部输入框回车
+  建卡，今日/长期可切换（默认今日），不自动派发。
 - **看板**：8 列 `待整理 / 待执行 / 已排期 / 就绪 / 运行中 / 待拍板 / 待验收 / 已完成`
 - 明暗主题由宿主 `data-theme` / `theme.css` token 驱动；当前 React UI 不写
   `localStorage`。
@@ -189,7 +196,7 @@ systemctl --user restart jarvis-workbench
 ```bash
 python3 workbench-app/tests/test_dispatch.py -v
 python3 workbench-app/tests/test_todo.py -v
-cd workbench-ui && npm run probe:todo   # headless 三区/拖拽/建卡/验收探针
+cd workbench-ui && npm run probe:todo   # headless 三列/拖拽/建卡/验收/回执/位次探针
 ```
 
 后端测试会为每个套件创建临时 `HERMES_KANBAN_HOME` 与 `WORKBENCH_DB`，并用
@@ -203,8 +210,11 @@ PATCH 404、metadata 库故障、并发派发与共享 `kanban.db` 无 workbench
 
 `npm run probe:todo` 会自起隔离服务与 headless Chrome（无新增 npm 依赖），
 断言三列顺序/计数、仓库卡静态内容、空验收抖动与零请求、验收就地编辑、
-有验收派发、新建卡落今日/长期、外部轮询、created_at 排序、409 parent 提示、
-明暗 token、窄视口与双 tab 状态保持。`npm run verify` = `build + probe:todo`。
+有验收派发、pending→最终回执与 dispatch 响应一致、全局串行派发、回执存活期
+409/空验收拒绝清回执、关闭按钮与 6s 自动消失、ready 卡 1-based 位次、外部
+队列变化后轮询重算、刷新后位次重派生、running 回执/徽标（暂停轮询避免竞态）、
+新建卡落今日/长期、外部轮询、created_at 排序、409 parent 提示、明暗 token
+与回执/徽标对比度、窄视口与双 tab 状态保持。`npm run verify` = `build + probe:todo`。
 
 探针前置条件：Node ≥22（内置 `WebSocket`/`fetch`）、本机 Chrome/Chromium
 （自动找 `google-chrome` / Playwright 缓存，找不到时用 `CHROME_BIN` 指定）、
@@ -221,7 +231,6 @@ Python 运行时（同后端测试，可用 `WORKBENCH_PYTHON` 覆盖）。
 - 非工作台建的 `triage` 卡没有 `bucket`，不会出现在今日/长期（需先写 metadata）
 - `contract.budget` 只能合并/覆盖键，暂不支持清空单个 budget 键
 - 待办/看板的轮询与拖拽逻辑目前各自实现，尚未抽共享 hook
-- 1.4 派发回执（位次/预计开始时间）尚未实现，现在成功只提示「已派发」
 - 上游 `recompute_ready` 与原生 9119 dashboard 不经过 ready 闸门；不额外加 watcher
 - 自调用仍是独立 `urllib` 请求（dispatch 在线程池执行），不共享连接池
 - 已跟踪的 `web/*.bak-*` 与旧 `web/app.js` / `sync-ui.sh` 清理 deferred；本次不删已跟踪文件

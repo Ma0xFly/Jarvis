@@ -1,4 +1,4 @@
-/* 待办三区：流水线（302px 凹槽）/ 今日 / 长期（平面）。
+/* 待办三列：流水线（302px 凹槽）/ 今日 / 长期（平面）。
    仓库卡只承载标题 + 验收一行；hover 只换背景，不做边框/状态装饰。 */
 
 .wb-todo-wrap {
@@ -143,6 +143,114 @@
 }
 .wb-todo-flow-card .wb-todo-accept:hover {
   background: transparent;
+}
+
+/* 回执槽位：始终预留高度，回执出现/消失不会重排三列。 */
+.wb-todo-receipt-slot {
+  position: relative;
+  flex: 0 0 auto;
+  height: 32px;
+}
+/* 回执条：常驻 live region，只换文本；只展示 dispatch 返回值，不做进度条。 */
+.wb-todo-receipt {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 6px 0 11px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, var(--wb-accent) 42%, var(--wb-border));
+  background: color-mix(in srgb, var(--wb-accent) 12%, var(--wb-card));
+  color: var(--wb-fg);
+  font-size: 12px;
+  font-weight: 500;
+  /* 不用 visibility/display 隐藏：live region 常驻可访问树，文本变化能被朗读 */
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition:
+    opacity 140ms ease,
+    transform 140ms ease;
+}
+.wb-todo-receipt.visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+.wb-todo-receipt.running {
+  border-color: color-mix(in srgb, var(--wb-ok) 42%, var(--wb-border));
+  background: color-mix(in srgb, var(--wb-ok) 12%, var(--wb-card));
+}
+.wb-todo-receipt-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-todo-receipt-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--wb-accent);
+}
+.wb-todo-receipt.running .wb-todo-receipt-dot {
+  background: var(--wb-ok);
+}
+.wb-todo-receipt-dismiss {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--wb-muted);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.wb-todo-receipt-dismiss:hover:not(:disabled) {
+  background: var(--wb-hover);
+  color: var(--wb-fg);
+}
+.wb-todo-receipt-dismiss:disabled {
+  visibility: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-todo-receipt {
+    transition: none;
+  }
+}
+
+/* 流水线卡片位次徽标：ready = 第 N 位；running = 已在运行 */
+.wb-todo-flow-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.wb-todo-flow-head .wb-todo-title {
+  flex: 1;
+  min-width: 0;
+}
+.wb-todo-badge {
+  flex: 0 0 auto;
+  font-size: 10.5px;
+  line-height: 1.4;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0 6px;
+  border-radius: 999px;
+  /* 与前景色混合，保证明暗主题下小字号也达到 AA 对比度 */
+  color: color-mix(in srgb, var(--wb-accent) 70%, var(--wb-fg));
+  background: color-mix(in srgb, var(--wb-accent) 14%, transparent);
+  white-space: nowrap;
+}
+.wb-todo-badge.running {
+  color: color-mix(in srgb, var(--wb-ok) 70%, var(--wb-fg));
+  background: color-mix(in srgb, var(--wb-ok) 14%, transparent);
 }
 
 .wb-todo-accept-input {

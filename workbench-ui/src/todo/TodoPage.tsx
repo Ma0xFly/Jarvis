@@ -12,6 +12,7 @@ import {
   type Bucket,
   type TaskMetadata,
 } from "../api/workbench";
+import { PositionBadge, ReceiptBar, type ReceiptState } from "./Receipt";
 
 interface BoardColumn {
   name: string;
@@ -25,6 +26,8 @@ interface BoardData {
 type TaskWithMeta = Task & { metadata?: TaskMetadata };
 
 const POLL_MS = 5000;
+/** 回执是瞬时 UI：出现后保留一会儿，刷新/轮询都不重建它。 */
+const RECEIPT_MS = 6000;
 
 /** 流水线只放 ready/running/review；todo/blocked/scheduled 留在看板 */
 const FLOW_SEGMENTS = [
@@ -67,6 +70,7 @@ export default function TodoPage(): React.ReactElement {
   const [err, setErr] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const [toast, setToast] = useState("");
+  const [receipt, setReceipt] = useState<ReceiptState | null>(null);
   const [loaded, setLoaded] = useState(false);
 
   const [shakeId, setShakeId] = useState<string | null>(null);
@@ -82,12 +86,16 @@ export default function TodoPage(): React.ReactElement {
   const toastTimer = useRef<number | null>(null);
   const shakeTimer = useRef<number | null>(null);
   const warnTimer = useRef<number | null>(null);
+  const receiptTimer = useRef<number | null>(null);
+  const receiptSeq = useRef(0);
+  const dismissedSeq = useRef(-1);
   const cancelEditRef = useRef(false);
   // A poll that started before a local write must not overwrite that write.
   const loadSeq = useRef(0);
   const mutationSeq = useRef(0);
   const savingCardsRef = useRef<Set<string>>(new Set());
-  const dispatchPendingRef = useRef<Set<string>>(new Set());
+  // 全局串行派发：一次只允许一张卡在途，回执只属于最近一次尝试。
+  const dispatchInFlightRef = useRef(false);
   const draftAttemptRef = useRef<{ key: string; title: string; bucket: Bucket } | null>(null);
 
   const showToast = useCallback((message: string) => {
@@ -104,6 +112,43 @@ export default function TodoPage(): React.ReactElement {
     shakeTimer.current = window.setTimeout(() => setShakeId(null), 320);
     warnTimer.current = window.setTimeout(() => setWarnId(null), 2600);
   }, []);
+
+  const clearReceipt = useCallback(() => {
+    if (receiptTimer.current) {
+      window.clearTimeout(receiptTimer.current);
+      receiptTimer.current = null;
+    }
+    setReceipt(null);
+  }, []);
+
+  /** drop 时立即显示 pending；替换上一条回执（latest-attempt）。 */
+  const showPendingReceipt = useCallback((): number => {
+    receiptSeq.current += 1;
+    const seq = receiptSeq.current;
+    if (receiptTimer.current) {
+      window.clearTimeout(receiptTimer.current);
+      receiptTimer.current = null;
+    }
+    setReceipt({ kind: "pending", seq });
+    return seq;
+  }, []);
+
+  /** 只消费 dispatch 返回值；不重算 ETA，也不写缓存。 */
+  const showReceipt = useCallback(
+    (seq: number, position: number, eta: string | null) => {
+      // 用户已关闭这次尝试的回执：迟到的响应不再弹出。
+      if (dismissedSeq.current === seq) return;
+      setReceipt({ kind: "final", seq, position, eta });
+      if (receiptTimer.current) window.clearTimeout(receiptTimer.current);
+      receiptTimer.current = window.setTimeout(() => setReceipt(null), RECEIPT_MS);
+    },
+    [],
+  );
+
+  const dismissReceipt = useCallback(() => {
+    dismissedSeq.current = receiptSeq.current;
+    clearReceipt();
+  }, [clearReceipt]);
 
   const load = useCallback(async () => {
     const seq = ++loadSeq.current;
@@ -147,6 +192,7 @@ export default function TodoPage(): React.ReactElement {
       if (toastTimer.current) window.clearTimeout(toastTimer.current);
       if (shakeTimer.current) window.clearTimeout(shakeTimer.current);
       if (warnTimer.current) window.clearTimeout(warnTimer.current);
+      if (receiptTimer.current) window.clearTimeout(receiptTimer.current);
     },
     [],
   );
@@ -172,14 +218,20 @@ export default function TodoPage(): React.ReactElement {
 
   const dispatchToFlow = useCallback(
     async (task: TaskWithMeta) => {
-      // Ignore repeated drops while this card's dispatch is in flight.
-      if (dispatchPendingRef.current.has(task.id)) return;
-      dispatchPendingRef.current.add(task.id);
+      // 防御性串行化：handleDrop 已拦一次，这里再兜底。
+      if (dispatchInFlightRef.current) {
+        showToast("正在派发上一张");
+        return;
+      }
+      dispatchInFlightRef.current = true;
+      // 新尝试立刻用 pending 替换上一条回执；失败时清掉，不留下旧成功回执。
+      const seq = showPendingReceipt();
       setDispatchingId(task.id);
       try {
-        await dispatchTask(task.id);
-        showToast("已派发");
+        const result = await dispatchTask(task.id);
+        showReceipt(seq, result.position, result.eta);
       } catch (error) {
+        clearReceipt();
         if (error instanceof WorkbenchError && error.code === "blocked_by_parent") {
           showToast("已转为 todo，等 parent 完成");
         } else if (error instanceof WorkbenchError && error.code === "missing_acceptance") {
@@ -189,13 +241,13 @@ export default function TodoPage(): React.ReactElement {
           showToast("派发失败：" + errText(error));
         }
       } finally {
-        dispatchPendingRef.current.delete(task.id);
+        dispatchInFlightRef.current = false;
         setDispatchingId(null);
         mutationSeq.current += 1;
         void load();
       }
     },
-    [showToast, flashWarn, load],
+    [showToast, flashWarn, clearReceipt, showPendingReceipt, showReceipt, load],
   );
 
   const handleDrop = useCallback(
@@ -206,14 +258,20 @@ export default function TodoPage(): React.ReactElement {
       if (!taskId) return;
       const task = tasks.find((candidate) => candidate.id === taskId);
       if (!task) return;
+      // 全局串行：上一张还在派发时，忽略新 drop，保留当前 pending 回执。
+      if (dispatchInFlightRef.current) {
+        showToast("正在派发上一张");
+        return;
+      }
       // 客户端闸门：验收为空时零请求，抖动 + 红字后卡回原位。
       if (!hasAcceptance(task.metadata)) {
+        clearReceipt();
         flashWarn(task.id);
         return;
       }
       void dispatchToFlow(task);
     },
-    [tasks, flashWarn, dispatchToFlow],
+    [tasks, showToast, flashWarn, clearReceipt, dispatchToFlow],
   );
 
   const handleDragLeave = (event: React.DragEvent<HTMLElement>) => {
@@ -372,6 +430,7 @@ export default function TodoPage(): React.ReactElement {
   return (
     <div className="wb-todo-wrap">
       {err ? <div className="wb-empty">{err}</div> : null}
+      <ReceiptBar receipt={receipt} onDismiss={dismissReceipt} />
 
       <div className="wb-todo-grid">
         <section
@@ -395,11 +454,16 @@ export default function TodoPage(): React.ReactElement {
                 <span>{segment.label}</span>
                 <span>{segment.cards.length}</span>
               </div>
-              {segment.cards.map((task) => {
+              {segment.cards.map((task, index) => {
                 const accept = acceptText(task);
+                // 位次是派生值：ready 段内按 /board 顺序 1-based，每次渲染重算。
+                const position = segment.key === "ready" ? index + 1 : 0;
                 return (
                   <div className="wb-todo-card wb-todo-flow-card" key={task.id}>
-                    <div className="wb-todo-title">{task.title}</div>
+                    <div className="wb-todo-flow-head">
+                      <span className="wb-todo-title">{task.title}</span>
+                      <PositionBadge status={task.status} position={position} />
+                    </div>
                     <div className={"wb-todo-accept" + (accept ? "" : " empty")}>
                       {accept || "未写验收"}
                     </div>

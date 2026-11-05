@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Headless probe for Story 1.3 (todo three-zone).
+ * Headless probe for Story 1.3/1.4 (todo three columns + dispatch receipt).
  *
  * Boots an isolated workbench server (throwaway HERMES_KANBAN_HOME /
- * WORKBENCH_DB), seeds cards through the public REST surfaces, then drives
- * the standalone UI in headless Chrome over CDP. No npm dependencies: Node 22
- * ships a global WebSocket and fetch.
+ * HERMES_KANBAN_DB / WORKBENCH_DB), seeds cards through the public REST
+ * surfaces, then drives the standalone UI in headless Chrome over CDP. No npm
+ * dependencies: Node 22 ships a global WebSocket and fetch.
  *
  * Covered matrix rows:
  *   - three column order / counts == rendered cards
@@ -13,13 +13,26 @@
  *   - empty acceptance drop: column highlight, 300ms shake, red hint, 0 request
  *   - acceptance inline edit writes through to workbench.db
  *   - dispatch with acceptance leaves the repository and reaches ready
+ *   - receipt live region is always mounted; pending「正在派发…」at drop then
+ *     the final text verbatim from the dispatch response (controlled hold,
+ *     no wall-clock latency assertion)
+ *   - dispatch is globally serialized: a second drop while one is in flight is
+ *     ignored with「正在派发上一张」and sends no request
+ *   - receipts showing during 409 / empty-acceptance rejections are cleared
+ *     immediately while the existing toast / shake stays intact
+ *   - latest-attempt replacement, dismiss button, and RECEIPT_MS auto-hide
+ *   - ready cards show 1-based「第 N 位」from the same /board query the UI uses
+ *   - external queue change shifts inline positions on the next 5s poll
+ *   - refresh re-derives positions from /board only (no receipt / ETA)
+ *   - already-running re-dispatch shows「已在运行」without a position (poll paused)
+ *   - badge contrast >= 4.5:1 in both themes
  *   - new card lands in today, triage, empty acceptance, not auto-dispatched
  *   - 409 parent: toast「已转为 todo，等 parent 完成」and card leaves repository
  *
  * Usage: node scripts/todo-probe.mjs
  *   CHROME_BIN, WORKBENCH_PYTHON override auto-discovery.
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { homedir, tmpdir } from "node:os";
@@ -32,6 +45,40 @@ const repoRoot = resolve(uiRoot, "..");
 const appDir = join(repoRoot, "workbench-app");
 const serverPath = join(appDir, "server.py");
 const defaultsPath = join(appDir, "defaults.json");
+
+/** 与 TodoPage 的 RECEIPT_MS 保持一致（回执自动消失时长）。 */
+const RECEIPT_MS = 6000;
+
+/**
+ * Runs before app code on the reloaded document. Records the 5s board poll and
+ * exposes pause/resume so the running-race test can stop polling around its
+ * direct kanban DB write.
+ */
+const POLL_INTERVAL_SOURCE = `(() => {
+  const intervals = [];
+  const originalSetInterval = window.setInterval.bind(window);
+  window.setInterval = (fn, ms, ...args) => {
+    const id = originalSetInterval(fn, ms, ...args);
+    intervals.push({ id, fn, ms, args, resumed: false });
+    return id;
+  };
+  window.__wbPausePoll = () => {
+    for (const entry of intervals) {
+      if (entry.ms === 5000) {
+        clearInterval(entry.id);
+        entry.resumed = false;
+      }
+    }
+  };
+  window.__wbResumePoll = () => {
+    for (const entry of intervals) {
+      if (entry.ms === 5000 && !entry.resumed) {
+        entry.id = originalSetInterval(entry.fn, entry.ms, ...entry.args);
+        entry.resumed = true;
+      }
+    }
+  };
+})();`;
 
 function findPython() {
   const override = process.env.WORKBENCH_PYTHON;
@@ -211,11 +258,43 @@ async function main() {
     console.log(`✓ ${name}`);
   }
 
+  // Direct writes to the throwaway kanban DB: running / priority transitions are
+  // kernel-only through the public REST surface, but the probe needs them to
+  // exercise the running receipt and an external queue change. The server is
+  // pinned to the exact same file via HERMES_KANBAN_DB.
+  const kanbanDb = join(tmp, "kanban-home", "kanban.db");
+  const updateKanban = (sql, taskId, value) => {
+    const output = execFileSync(
+      python,
+      [
+        "-I",
+        "-c",
+        `import sqlite3,sys; conn=sqlite3.connect(sys.argv[1], timeout=5); ` +
+          `cur=conn.execute(${JSON.stringify(sql)}, (sys.argv[2], sys.argv[3])); ` +
+          `conn.commit(); print(cur.rowcount); conn.close()`,
+        kanbanDb,
+        String(value),
+        taskId,
+      ],
+      { encoding: "utf8" },
+    );
+    const rows = Number(String(output).trim());
+    if (rows !== 1) {
+      throw new Error(`kanban UPDATE 应命中 1 行，实际 ${rows} 行：${sql} / ${taskId}`);
+    }
+    return rows;
+  };
+  const setKanbanStatus = (taskId, status) =>
+    updateKanban("UPDATE tasks SET status=? WHERE id=?", taskId, status);
+  const setKanbanPriority = (taskId, priority) =>
+    updateKanban("UPDATE tasks SET priority=? WHERE id=?", taskId, priority);
+
   try {
     server = spawn(python, ["-I", serverPath, "--host", "127.0.0.1", "--port", String(port)], {
       env: {
         ...process.env,
         HERMES_KANBAN_HOME: join(tmp, "kanban-home"),
+        HERMES_KANBAN_DB: join(tmp, "kanban-home", "kanban.db"),
         WORKBENCH_DB: join(tmp, "workbench.db"),
         WORKBENCH_DEFAULTS: defaults,
       },
@@ -241,7 +320,7 @@ async function main() {
     // The standalone host must serve the fresh build, not stale artifacts.
     const bundle = await fetch(`${base}/static/index.js`).then((response) => response.text());
     check(
-      "独立版产物包含待办三区",
+      "独立版产物包含待办三列",
       bundle.includes("wb-todo-cname") && bundle.includes("wb-todo-flow"),
       "先运行 npm run build",
     );
@@ -326,6 +405,7 @@ async function main() {
 
     cdp = await cdpConnect(page.webSocketDebuggerUrl);
     await cdp.send("Runtime.enable");
+    await cdp.send("Page.enable");
 
     const evaluate = async (expression) => {
       const result = await cdp.send("Runtime.evaluate", {
@@ -341,6 +421,114 @@ async function main() {
     const waitForEval = (expression, timeout, label) =>
       waitFor(async () => Boolean(await evaluate(expression)), { timeout, label });
 
+    const readReceiptText = () =>
+      evaluate("document.querySelector('.wb-todo-receipt-text')?.textContent || ''");
+
+    const readReceipt = () =>
+      evaluate(`(() => {
+        const node = document.querySelector('.wb-todo-receipt');
+        return node
+          ? {
+              text: node.querySelector('.wb-todo-receipt-text')?.textContent || '',
+              visible: node.classList.contains('visible'),
+              pending: node.classList.contains('pending'),
+              running: node.classList.contains('running'),
+              role: node.getAttribute('role'),
+              dismissLabel: node.querySelector('.wb-todo-receipt-dismiss')?.getAttribute('aria-label') || '',
+            }
+          : null;
+      })()`);
+
+    const readFlowSegment = (label) =>
+      evaluate(`(() => {
+        const seg = [...document.querySelectorAll('.wb-todo-seg')].find(
+          (node) => node.querySelector('.wb-todo-seghead span:first-child')?.textContent === ${JSON.stringify(label)},
+        );
+        if (!seg) return [];
+        return [...seg.querySelectorAll('.wb-todo-flow-card')].map((card) => ({
+          title: card.querySelector('.wb-todo-title')?.textContent || '',
+          badge: card.querySelector('.wb-todo-badge')?.textContent || '',
+        }));
+      })()`);
+
+    const readReadyBadges = () => readFlowSegment("队列");
+
+    // Must match the exact query the UI polls (no include_archived).
+    const boardReadyTasks = async () => {
+      const board = (await httpJson("GET", `${base}/api/plugins/kanban/board`)).data;
+      return board?.columns?.find((column) => column.name === "ready")?.tasks || [];
+    };
+
+    const expectedBadges = (tasks) =>
+      tasks.map((task, index) => ({ title: task.title, badge: `第 ${index + 1} 位` }));
+
+    /** ready 段标题/位次必须与 /board 的 ready 顺序逐项一致。 */
+    const expectBadgesMatch = async (label) => {
+      await waitFor(
+        async () => {
+          const expected = expectedBadges(await boardReadyTasks());
+          const actual = await readReadyBadges();
+          return actual.length === expected.length &&
+            JSON.stringify(actual) === JSON.stringify(expected);
+        },
+        { timeout: 9000, interval: 200, label },
+      );
+      check(label, true);
+    };
+
+    const dragCardToFlow = (title) =>
+      evaluate(`(async () => {
+        const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+          .find((node) => node.textContent.includes(${JSON.stringify(title)}));
+        if (!card) return false;
+        const flow = document.querySelector('.wb-todo-flow');
+        const dataTransfer = new DataTransfer();
+        card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
+        flow.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+        flow.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
+        return true;
+      })()`);
+
+    // Instrument workbench calls; also keeps the dispatch response so the probe
+    // can compare the receipt text with what the backend actually returned.
+    const installProbe = () =>
+      evaluate(`(() => {
+        window.__wbProbe = {
+          dispatch: 0,
+          create: 0,
+          metadata: 0,
+          lastDispatch: null,
+          holdMs: 0,
+        };
+        const original = window.fetch.bind(window);
+        window.fetch = (input, init) => {
+          const url = typeof input === "string" ? input : (input && input.url) || "";
+          const promise = original(input, init);
+          if (url.includes("/api/workbench/dispatch/")) {
+            window.__wbProbe.dispatch += 1;
+            promise.then((response) => {
+              response.clone().json()
+                .then((data) => { window.__wbProbe.lastDispatch = data; })
+                .catch(() => {});
+            }).catch(() => {});
+            // 受控响应：给探针时间观察 pending 状态，不依赖机器快慢。
+            const hold = window.__wbProbe.holdMs;
+            if (hold > 0) {
+              return promise.then((response) => new Promise((resolveHold) => {
+                setTimeout(() => resolveHold(response), hold);
+              }));
+            }
+          } else if (/\\/api\\/workbench\\/metadata\\/[^?]+$/.test(url)) {
+            window.__wbProbe.metadata += 1;
+          } else if (url.endsWith("/api/workbench/tasks")) {
+            window.__wbProbe.create += 1;
+          }
+          return promise;
+        };
+        return true;
+      })()`);
+
     await waitForEval(
       "document.querySelectorAll('.wb-todo-col').length === 3 && document.querySelectorAll('.wb-todo-repo-card').length === 4",
       15000,
@@ -348,18 +536,7 @@ async function main() {
     );
 
     // Instrument the workbench calls made after this point.
-    await evaluate(`(() => {
-      window.__wbProbe = { dispatch: 0, create: 0, metadata: 0 };
-      const original = window.fetch.bind(window);
-      window.fetch = (input, init) => {
-        const url = typeof input === "string" ? input : (input && input.url) || "";
-        if (url.includes("/api/workbench/dispatch/")) window.__wbProbe.dispatch += 1;
-        else if (/\\/api\\/workbench\\/metadata\\/[^?]+$/.test(url)) window.__wbProbe.metadata += 1;
-        else if (url.endsWith("/api/workbench/tasks")) window.__wbProbe.create += 1;
-        return original(input, init);
-      };
-      return true;
-    })()`);
+    await installProbe();
 
     // ---- 1. column order and counts ----------------------------------
     const columns = await evaluate(
@@ -505,6 +682,7 @@ async function main() {
       emptyDrop.warn,
     );
     check("空验收零请求", emptyDrop.dispatch === 0, String(emptyDrop.dispatch));
+    check("空验收被拦不出回执", (await readReceipt())?.text === "");
 
     // ---- 4. inline acceptance edit -----------------------------------
     const editStart = await evaluate(`(async () => {
@@ -546,19 +724,92 @@ async function main() {
       JSON.stringify(edited.data),
     );
 
-    // ---- 5. dispatch with acceptance ---------------------------------
-    await evaluate(`(async () => {
-      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
-        .find((node) => node.textContent.includes('空验收卡'));
-      const flow = document.querySelector('.wb-todo-flow');
-      const dataTransfer = new DataTransfer();
-      card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
-      flow.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
-      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-      flow.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
-      return true;
-    })()`);
-    await waitForEval("window.__wbProbe.dispatch === 1", 5000, "dispatch 请求");
+    // 回执存活期拒绝测试用卡：一张空验收、一张有验收（等 5s 轮询渲染）。
+    const rejectEmptyCard = await createUpstream("待补验收卡");
+    await setMetadata(rejectEmptyCard, {
+      bucket: "today",
+      contract: { input: "", accept: "", ready: false },
+    });
+    const rejectValidCard = await createUpstream("回执测试卡");
+    await setMetadata(rejectValidCard, { bucket: "today", contract: { accept: "回执测试" } });
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('待补验收卡')) &&
+       [...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('回执测试卡'))`,
+      8000,
+      "拒绝/回执测试卡渲染",
+    );
+
+    // ---- 5. dispatch: pending → final receipt, serialized ------------
+    const liveRegion = await readReceipt();
+    check(
+      "回执 live region 常驻（role=status）",
+      liveRegion?.role === "status" &&
+        liveRegion.text === "" &&
+        liveRegion.visible === false &&
+        (await evaluate("Boolean(document.querySelector('.wb-todo-receipt-slot'))")) === true,
+      JSON.stringify(liveRegion),
+    );
+    const gridTopBefore = await evaluate(
+      "document.querySelector('.wb-todo-grid').getBoundingClientRect().top",
+    );
+    await evaluate("void (window.__wbReceiptNode = document.querySelector('.wb-todo-receipt'))");
+    await evaluate(
+      "window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null; window.__wbProbe.holdMs = 500;",
+    );
+    check("拖拽有验收卡触发派发", (await dragCardToFlow("空验收卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === '正在派发…'",
+      1500,
+      "drop 后 pending 回执",
+    );
+    check("drop 后立即显示 pending 回执", true);
+    const gridTopPending = await evaluate(
+      "document.querySelector('.wb-todo-grid').getBoundingClientRect().top",
+    );
+    check(
+      "回执出现不改变三列布局",
+      gridTopBefore === gridTopPending,
+      `${gridTopBefore} -> ${gridTopPending}`,
+    );
+
+    // 全局串行：上一张在途时第二次 drop 被忽略，只发一次请求。
+    check("并发 drop 第二张卡", (await dragCardToFlow("有验收卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-toast')?.textContent || '') === '正在派发上一张'",
+      1500,
+      "并发派发 toast",
+    );
+    check("并发派发只发一次请求", (await evaluate("window.__wbProbe.dispatch")) === 1);
+
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      5000,
+      "dispatch 响应",
+    );
+    const firstDispatch = await evaluate("window.__wbProbe.lastDispatch");
+    const expectedFirstReceipt =
+      `已入队 · 第 ${firstDispatch.position} 位 · 预计 ${firstDispatch.eta}`;
+    await waitFor(
+      async () => (await readReceiptText()) === expectedFirstReceipt,
+      { timeout: 5000, interval: 50, label: "最终回执" },
+    );
+    const firstReceipt = await readReceipt();
+    check(
+      "最终回执文案 = dispatch 返回值（位次 + ETA）",
+      firstReceipt?.text === expectedFirstReceipt &&
+        firstReceipt.running === false &&
+        firstReceipt.pending === false,
+      JSON.stringify({ expected: expectedFirstReceipt, actual: firstReceipt }),
+    );
+    check(
+      "回执 live region 节点未重建",
+      (await evaluate(
+        "document.querySelector('.wb-todo-receipt') === window.__wbReceiptNode",
+      )) === true,
+    );
+    await evaluate("window.__wbProbe.holdMs = 0;");
     await waitForEval(
       `![...document.querySelectorAll('.wb-todo-repo-card')]
         .some((node) => node.textContent.includes('空验收卡'))`,
@@ -573,9 +824,314 @@ async function main() {
       };
     })()`);
     check("派发成功卡进入流水线", dispatched.inFlow === true, JSON.stringify(dispatched));
-    check("派发成功 toast「已派发」", dispatched.toast === "已派发", dispatched.toast);
+    check("派发成功不再显示旧「已派发」toast", dispatched.toast !== "已派发", dispatched.toast);
+    await expectBadgesMatch("ready 卡片按 /board 顺序显示 1-based 位次");
+    const firstOwnBadge = (await readReadyBadges()).find((card) => card.title === "空验收卡");
+    check(
+      "派发卡自身徽标 = dispatch position",
+      firstOwnBadge?.badge === `第 ${firstDispatch.position} 位`,
+      JSON.stringify({ position: firstDispatch.position, badge: firstOwnBadge?.badge }),
+    );
     const emptyStatus = (await httpJson("GET", `${base}/api/plugins/kanban/tasks/${emptyCard}`)).data?.task?.status;
     check("派发后上游状态 ready", emptyStatus === "ready", String(emptyStatus));
+
+    // ---- 5b. second dispatch: latest-attempt replaces the receipt ----
+    await evaluate("window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null;");
+    check("拖拽第二张有验收卡", (await dragCardToFlow("有验收卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === '正在派发…'",
+      1500,
+      "第二次 pending 回执",
+    );
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      5000,
+      "第二次 dispatch 响应",
+    );
+    const secondDispatch = await evaluate("window.__wbProbe.lastDispatch");
+    const expectedSecondReceipt =
+      `已入队 · 第 ${secondDispatch.position} 位 · 预计 ${secondDispatch.eta}`;
+    await waitFor(
+      async () => (await readReceiptText()) === expectedSecondReceipt,
+      { timeout: 5000, interval: 50, label: "第二次最终回执" },
+    );
+    const secondReceipt = await readReceipt();
+    check(
+      "第二次回执位次/ETA 与 dispatch 返回值一致",
+      secondReceipt?.text === expectedSecondReceipt,
+      JSON.stringify({ dispatch: secondDispatch, receipt: secondReceipt }),
+    );
+    check(
+      "新尝试回执替换旧回执（latest-attempt）",
+      secondReceipt?.text !== expectedFirstReceipt,
+      `${expectedFirstReceipt} -> ${secondReceipt?.text}`,
+    );
+    check(
+      "第二张卡位次排在已入队卡之后",
+      secondDispatch.position > firstDispatch.position,
+      `${firstDispatch.position} -> ${secondDispatch.position}`,
+    );
+    await waitForEval(
+      `![...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('有验收卡'))`,
+      8000,
+      "第二张卡离开仓库",
+    );
+
+    // ---- 5c. rejection while a receipt is live -----------------------
+    check("空验收 drop 前回执仍显示", (await readReceiptText()) === expectedSecondReceipt);
+    const dispatchBeforeEmptyReject = await evaluate("window.__wbProbe.dispatch");
+    check("拖拽待补验收卡", (await dragCardToFlow("待补验收卡")) === true);
+    const emptyRejectNow = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('待补验收卡'));
+      return {
+        receipt: document.querySelector('.wb-todo-receipt-text')?.textContent || '',
+        shaking: card?.classList.contains('wb-todo-shake') || false,
+        warn: card?.querySelector('.wb-todo-warn')?.textContent || '',
+        dispatch: window.__wbProbe.dispatch,
+      };
+    })()`);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === ''",
+      1500,
+      "空验收立即清回执",
+    );
+    check(
+      "空验收：回执立即清空",
+      emptyRejectNow.receipt === "",
+      JSON.stringify(emptyRejectNow),
+    );
+    check(
+      "空验收：抖动/红字保留",
+      emptyRejectNow.shaking === true && emptyRejectNow.warn === "先补一句怎样算做完",
+      JSON.stringify(emptyRejectNow),
+    );
+    check(
+      "空验收：拒绝不发请求",
+      emptyRejectNow.dispatch === dispatchBeforeEmptyReject,
+      `${dispatchBeforeEmptyReject} -> ${emptyRejectNow.dispatch}`,
+    );
+
+    // 新回执 → 立刻拖 409 parent：pending 出现在 drop，拒绝后清掉。
+    await evaluate(
+      "window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null; window.__wbProbe.holdMs = 400;",
+    );
+    check("拖拽回执测试卡", (await dragCardToFlow("回执测试卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === '正在派发…'",
+      1500,
+      "回执测试卡 pending",
+    );
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      5000,
+      "回执测试卡 dispatch 响应",
+    );
+    const testDispatch = await evaluate("window.__wbProbe.lastDispatch");
+    const expectedTestReceipt =
+      `已入队 · 第 ${testDispatch.position} 位 · 预计 ${testDispatch.eta}`;
+    await waitFor(
+      async () => (await readReceiptText()) === expectedTestReceipt,
+      { timeout: 5000, interval: 50, label: "回执测试卡最终回执" },
+    );
+    check("409 前回执仍显示", (await readReceiptText()) === expectedTestReceipt);
+
+    await evaluate("window.__wbProbe.dispatch = 0; window.__wbProbe.holdMs = 400;");
+    check("拖拽等 parent 卡", (await dragCardToFlow("等 parent 卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === '正在派发…'",
+      1500,
+      "409 pending 回执",
+    );
+    check("409 drop 后先显示 pending 回执", true);
+    await waitForEval(
+      `(document.querySelector('.wb-toast')?.textContent || '') === '已转为 todo，等 parent 完成'`,
+      8000,
+      "409 toast",
+    );
+    await evaluate("window.__wbProbe.holdMs = 0;");
+    await waitForEval(
+      `![...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('等 parent 卡'))`,
+      8000,
+      "409 卡离开仓库",
+    );
+    const blockedState = await evaluate(`(() => ({
+      receipt: document.querySelector('.wb-todo-receipt-text')?.textContent || '',
+      toast: document.querySelector('.wb-toast')?.textContent || '',
+    }))()`);
+    check(
+      "409 拒绝后清掉 pending，不出成功回执",
+      blockedState.receipt === "",
+      JSON.stringify(blockedState),
+    );
+    check(
+      "409 既有 toast 保留",
+      blockedState.toast === "已转为 todo，等 parent 完成",
+      blockedState.toast,
+    );
+    const blockedStatus = (await httpJson("GET", `${base}/api/plugins/kanban/tasks/${blockedChild}`)).data?.task?.status;
+    check("有未完成 parent 的卡落 todo", blockedStatus === "todo", String(blockedStatus));
+
+    await expectBadgesMatch("三张 ready 卡的位次与 /board 顺序一致");
+    const readyAfterRejects = await readReadyBadges();
+    const secondOwnBadge = readyAfterRejects.find((card) => card.title === "有验收卡");
+    check(
+      "第二张派发卡自身徽标 = dispatch position",
+      secondOwnBadge?.badge === `第 ${secondDispatch.position} 位`,
+      JSON.stringify({ position: secondDispatch.position, badge: secondOwnBadge?.badge }),
+    );
+
+    // ---- 5d. external queue change: next poll recomputes positions ---
+    const jumpCard = await createUpstream("队列插队卡");
+    await setMetadata(jumpCard, { bucket: "today", contract: { accept: "插队" } });
+    setKanbanPriority(jumpCard, 9);
+    const jumpDispatch = await httpJson(
+      "POST",
+      `${base}/api/workbench/dispatch/${encodeURIComponent(jumpCard)}`,
+      {},
+    );
+    check(
+      "外部派发的高优先级卡排到第 1 位",
+      jumpDispatch.status === 200 && jumpDispatch.data?.position === 1,
+      JSON.stringify(jumpDispatch.data),
+    );
+    await expectBadgesMatch("外部改队列后 5s 轮询重算位次");
+    const jumpBadge = (await readReadyBadges()).find((card) => card.title === "队列插队卡");
+    check("外部插队卡自身徽标 = 第 1 位", jumpBadge?.badge === "第 1 位", JSON.stringify(jumpBadge));
+
+    // ---- 5e. refresh: positions re-derived from /board, no ETA -------
+    await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: POLL_INTERVAL_SOURCE });
+    await cdp.send("Page.reload");
+    await waitForEval(
+      `document.querySelectorAll('.wb-todo-col').length === 3 &&
+        document.querySelectorAll('.wb-todo-flow-card').length >= 3`,
+      15000,
+      "刷新后待办渲染",
+    );
+    await expectBadgesMatch("刷新后位次按 /board 重新派生");
+    const reloadState = await evaluate(`(() => ({
+      receiptText: document.querySelector('.wb-todo-receipt-text')?.textContent || '',
+      slot: Boolean(document.querySelector('.wb-todo-receipt-slot')),
+      eta: [...document.querySelectorAll('.wb-todo-receipt, .wb-todo-badge')]
+        .some((node) => node.textContent.includes('预计')),
+    }))()`);
+    check(
+      "刷新后无回执、无 ETA，回执槽位仍在",
+      reloadState.receiptText === "" && reloadState.eta === false && reloadState.slot === true,
+      JSON.stringify(reloadState),
+    );
+    await installProbe();
+
+    // ---- 5f. running: 已在运行, no position --------------------------
+    const runningCard = await createUpstream("运行竞态卡");
+    await setMetadata(runningCard, { bucket: "today", contract: { accept: "运行中" } });
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('运行竞态卡'))`,
+      8000,
+      "运行竞态卡渲染",
+    );
+    // 客户端仍按 triage 显示时把后端置为 running，模拟 worker 刚领走后的重派。
+    await evaluate("window.__wbPausePoll()");
+    // Let any board read already in flight settle before mutating status.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 150));
+    setKanbanStatus(runningCard, "running");
+    await evaluate(
+      "window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null; window.__wbProbe.holdMs = 400;",
+    );
+    check("拖拽已 running 的卡", (await dragCardToFlow("运行竞态卡")) === true);
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === '正在派发…'",
+      1500,
+      "running pending 回执",
+    );
+    await evaluate("window.__wbResumePoll()");
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      5000,
+      "running dispatch 响应",
+    );
+    const runningDispatch = await evaluate("window.__wbProbe.lastDispatch");
+    check(
+      "running 重派返回 position=0 / eta=null",
+      runningDispatch.position === 0 &&
+        runningDispatch.eta === null &&
+        runningDispatch.status === "running",
+      JSON.stringify(runningDispatch),
+    );
+    await waitFor(
+      async () => (await readReceiptText()) === "已在运行",
+      { timeout: 5000, interval: 50, label: "running 回执" },
+    );
+    const runningReceipt = await readReceipt();
+    check(
+      "running 回执「已在运行」且不显示位次",
+      runningReceipt?.text === "已在运行" &&
+        runningReceipt.running === true &&
+        !runningReceipt.text.includes("第"),
+      JSON.stringify(runningReceipt),
+    );
+    await waitForEval(
+      `(() => {
+        const seg = [...document.querySelectorAll('.wb-todo-seg')].find(
+          (node) => node.querySelector('.wb-todo-seghead span:first-child')?.textContent === '运行',
+        );
+        return Boolean(seg) && [...seg.querySelectorAll('.wb-todo-flow-card')].some(
+          (card) => card.textContent.includes('运行竞态卡') &&
+            card.querySelector('.wb-todo-badge')?.textContent === '已在运行',
+        );
+      })()`,
+      8000,
+      "running 卡「已在运行」徽标",
+    );
+    check("running 卡显示「已在运行」", true);
+    await evaluate("window.__wbProbe.holdMs = 0;");
+
+    // ---- 5g. dismiss + 6s auto-hide ---------------------------------
+    check(
+      "回执有关闭按钮（aria-label）",
+      runningReceipt?.dismissLabel === "关闭派发回执",
+      JSON.stringify(runningReceipt),
+    );
+    await evaluate("document.querySelector('.wb-todo-receipt-dismiss').click()");
+    await waitForEval(
+      "(document.querySelector('.wb-todo-receipt-text')?.textContent || '') === ''",
+      1000,
+      "关闭回执",
+    );
+    const dismissed = await readReceipt();
+    check(
+      "关闭按钮立即隐藏回执",
+      dismissed?.text === "" && dismissed.visible === false,
+      JSON.stringify(dismissed),
+    );
+
+    // 新一次成功派发 → 等待超过 RECEIPT_MS 自动消失。
+    await evaluate("window.__wbProbe.dispatch = 0; window.__wbProbe.lastDispatch = null;");
+    check("拖拽长期卡获取新回执", (await dragCardToFlow("长期卡")) === true);
+    await waitForEval(
+      "Boolean(window.__wbProbe.lastDispatch && window.__wbProbe.lastDispatch.ok)",
+      5000,
+      "回执寿命 dispatch 响应",
+    );
+    await waitFor(
+      async () => (await readReceiptText()).startsWith("已入队 · 第 "),
+      { timeout: 5000, interval: 50, label: "回执寿命最终回执" },
+    );
+    check("自动消失前回执可见", (await readReceipt())?.visible === true);
+    await new Promise((resolveWait) => setTimeout(resolveWait, RECEIPT_MS - 1500));
+    check(
+      "RECEIPT_MS 内回执仍可见",
+      (await readReceipt())?.visible === true,
+      JSON.stringify(await readReceipt()),
+    );
+    await waitFor(
+      async () => (await readReceiptText()) === "",
+      { timeout: 4000, interval: 200, label: "回执自动消失" },
+    );
+    check("超过 RECEIPT_MS 后回执自动消失", true);
 
     // ---- 6. create card lands in today, not dispatched ---------------
     const emptyTitle = await evaluate(`(async () => {
@@ -677,33 +1233,14 @@ async function main() {
       JSON.stringify(cancelState),
     );
 
-    // ---- 8. 409 parent: toast + card leaves repository ---------------
-    await evaluate(`(async () => {
-      window.__wbProbe.dispatch = 0;
-      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
-        .find((node) => node.textContent.includes('等 parent 卡'));
-      const flow = document.querySelector('.wb-todo-flow');
-      const dataTransfer = new DataTransfer();
-      card.dispatchEvent(new DragEvent('dragstart', { bubbles: true, cancelable: true, dataTransfer }));
-      flow.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
-      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-      flow.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
-      return true;
-    })()`);
-    await waitForEval("window.__wbProbe.dispatch === 1", 5000, "parent 派发请求");
-    await waitForEval(
-      `(document.querySelector('.wb-toast')?.textContent || '') === '已转为 todo，等 parent 完成'`,
-      8000,
-      "409 toast",
+    // ---- 8. 409 result re-check (dispatch + live receipt done in 5c) --
+    check(
+      "409 卡仍不在仓库",
+      (await evaluate(
+        "[...document.querySelectorAll('.wb-todo-repo-card')].some((node) => node.textContent.includes('等 parent 卡'))",
+      )) === false,
     );
-    await waitForEval(
-      `![...document.querySelectorAll('.wb-todo-repo-card')]
-        .some((node) => node.textContent.includes('等 parent 卡'))`,
-      8000,
-      "停卡离开仓库",
-    );
-    const blockedStatus = (await httpJson("GET", `${base}/api/plugins/kanban/tasks/${blockedChild}`)).data?.task?.status;
-    check("有未完成 parent 的卡落 todo", blockedStatus === "todo", String(blockedStatus));
+    check("409 后回执仍为空", (await readReceiptText()) === "");
 
     // ---- final invariant: counts still equal rendered cards ----------
     const finalColumns = await evaluate(`(() => {
@@ -735,6 +1272,95 @@ async function main() {
       return { before, after };
     })()`);
     check("明暗主题走 base.css token", theme.before !== theme.after, JSON.stringify(theme));
+
+    // Badge is 10.5px text and the receipt is 12px: require WCAG AA 4.5:1.
+    const themeContrast = await evaluate(`(() => {
+      const parse = (value) => {
+        const rgba = value.match(/^rgba?\\(([^)]+)\\)$/);
+        if (rgba) {
+          const parts = rgba[1].split(/[ ,\\/]+/).filter(Boolean).map(Number);
+          return { r: parts[0], g: parts[1], b: parts[2], a: parts.length > 3 ? parts[3] : 1 };
+        }
+        const srgb = value.match(/^color\\(srgb ([^)]+)\\)$/);
+        if (srgb) {
+          const parts = srgb[1].split(/[ \\/]+/).filter(Boolean).map(Number);
+          return {
+            r: parts[0] * 255,
+            g: parts[1] * 255,
+            b: parts[2] * 255,
+            a: parts.length > 3 ? parts[3] : 1,
+          };
+        }
+        return null;
+      };
+      const over = (top, bottom) => ({
+        r: top.r * top.a + bottom.r * (1 - top.a),
+        g: top.g * top.a + bottom.g * (1 - top.a),
+        b: top.b * top.a + bottom.b * (1 - top.a),
+        a: 1,
+      });
+      const lum = (color) => {
+        const channel = (value) => {
+          const n = value / 255;
+          return n <= 0.03928 ? n / 12.92 : Math.pow((n + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * channel(color.r) + 0.7152 * channel(color.g) + 0.0722 * channel(color.b);
+      };
+      const ratio = (a, b) => {
+        const l1 = lum(a);
+        const l2 = lum(b);
+        return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+      };
+      const contrastFor = (selector) => {
+        const badge = document.querySelector(selector);
+        if (!badge) return null;
+        const style = getComputedStyle(badge);
+        const text = parse(style.color);
+        const layer = parse(style.backgroundColor);
+        let base = parse(getComputedStyle(badge.closest('.wb-todo-card')).backgroundColor);
+        const page = parse(getComputedStyle(document.body).backgroundColor);
+        if (!text || !layer || !base || !page) return null;
+        if (base.a < 1) base = over(base, page);
+        return ratio(text, over(layer, base));
+      };
+      const contrastOnPage = (selector) => {
+        const node = document.querySelector(selector);
+        if (!node) return null;
+        const style = getComputedStyle(node);
+        const text = parse(style.color);
+        const layer = parse(style.backgroundColor);
+        const page = parse(getComputedStyle(document.body).backgroundColor);
+        if (!text || !layer || !page) return null;
+        return ratio(text, over(layer, page));
+      };
+      const root = document.documentElement;
+      const result = {};
+      for (const theme of ['light', 'dark']) {
+        root.dataset.theme = theme;
+        result[theme] = {
+          ready: contrastFor('.wb-todo-badge:not(.running)'),
+          running: contrastFor('.wb-todo-badge.running'),
+          receipt: contrastOnPage('.wb-todo-receipt'),
+        };
+      }
+      root.dataset.theme = 'dark';
+      return result;
+    })()`);
+    check(
+      "ready 徽标明暗主题对比度 >= 4.5",
+      themeContrast?.light?.ready >= 4.5 && themeContrast?.dark?.ready >= 4.5,
+      JSON.stringify(themeContrast),
+    );
+    check(
+      "running 徽标明暗主题对比度 >= 4.5",
+      themeContrast?.light?.running >= 4.5 && themeContrast?.dark?.running >= 4.5,
+      JSON.stringify(themeContrast),
+    );
+    check(
+      "回执条明暗主题对比度 >= 4.5",
+      themeContrast?.light?.receipt >= 4.5 && themeContrast?.dark?.receipt >= 4.5,
+      JSON.stringify(themeContrast),
+    );
 
     await cdp.send("Emulation.setDeviceMetricsOverride", {
       width: 420,

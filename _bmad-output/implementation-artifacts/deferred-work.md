@@ -47,7 +47,7 @@
   evidence: （二次审查 11）本次只把新 `.bak-*` 加入 `.gitignore`，不删除任何已跟踪文件；旧文件清理仍是独立任务（见 1.1 的 BH-7/BH-2 条目）。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
-  summary: 在真实插件宿主里运行待办三区（或给插件宿主提供 `/api/workbench/*` 代理/后端）。
+  summary: 在真实插件宿主里运行待办三列（或给插件宿主提供 `/api/workbench/*` 代理/后端）。
   evidence: 插件宿主没有 workbench 后端，当前只显示看板并提示使用独立版 8787；`dist/plugin` 只做了产物字节一致性检查，未在 Hermes dashboard 里跑待办运行时。
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
@@ -60,8 +60,5 @@
 
 - source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
   summary: 抽取 Board / TodoPage 共享的轮询、toast、拖拽与 loading hook。
-  evidence: `Board.tsx` 与 `TodoPage.tsx` 各自实现 5s 轮询、toast 定时器与 HTML5 拖拽；行为已出现重复维护点（如拖拽高亮/清理），后续做详情抽屉或多视图时应先抽 hook。
+  evidence: `Board.tsx` 与 `TodoPage.tsx` 各自实现 5s 轮询、toast 定时器与 HTML5 拖拽；1.4 又在 TodoPage 增加了回执 6s 定时器与常驻 live-region，行为已出现重复维护点（如拖拽高亮/清理、定时器清理），后续做详情抽屉或多视图时应先抽 hook。
 
-- source_spec: `_bmad-output/implementation-artifacts/spec-1-3-todo-three-zone.md`
-  summary: Story 1.4 派发回执：派发后显示「已入队 · 第 N 位 · 预计 HH:MM」。
-  evidence: 1.3 成功派发只提示「已派发」并刷新；dispatch API 已返回 `position`/`eta`，但回执 UI、刷新后位次重算与失败重试文案属于 1.4。
