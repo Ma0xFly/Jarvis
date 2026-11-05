@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-05-2026 13:41
-last_updated: 11-05-2026 22:03
+last_updated: 11-05-2026 22:05
 project: Jarvis
 project_key: NOKEY
 tracking_system: file-system
@@ -43,7 +43,7 @@ development_status:
   1-4-派发回执与排队位次: done
   epic-1-retrospective: done
 
-  epic-2: in-progress
+  epic-2: done
   2-1-全屏验收与验收动作: done
   2-2-p0-通知与通知操作: done
   2-3-会话追溯入口: done
