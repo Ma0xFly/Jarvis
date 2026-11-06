@@ -1528,13 +1528,15 @@ async function main() {
       action: document.querySelector('.wb-update-action')?.textContent || '',
       dismiss: Boolean(document.querySelector('.wb-update-dismiss')),
       fixed: getComputedStyle(document.querySelector('.wb-update-banner')).position,
+      zIndex: Number(getComputedStyle(document.querySelector('.wb-update-banner')).zIndex || 0),
     }))()`);
     check(
       "新版本提示出现且有刷新/稍后按钮",
       updateBanner.text.includes("已更新") &&
         updateBanner.action === "刷新" &&
         updateBanner.dismiss === true &&
-        updateBanner.fixed === "fixed",
+        updateBanner.fixed === "fixed" &&
+        updateBanner.zIndex < 90,
       JSON.stringify(updateBanner),
     );
     const bannerContrast = await contrastMatrix({
@@ -1871,6 +1873,64 @@ async function main() {
     await waitForEval("!Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "关闭仓库卡详情");
     check("仓库卡详情可关闭", true);
 
+    // ---- 7c. scheduled 卡也能互拖（不是只有旧 triage 卡） -------------
+    await evaluate("window.__wbProbe.dispatch = 0; true");
+    check(
+      "scheduled 卡互拖：今日 → 长期",
+      (await dragRepoCardToStore("探针改名卡", "长期")) === true,
+    );
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-plane')][1].textContent.includes('探针改名卡')`,
+      8000,
+      "scheduled 卡移到长期",
+    );
+    await waitFor(
+      async () =>
+        (await httpJson(
+          "GET",
+          `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
+        )).data?.[createdCard.id]?.bucket === "long",
+      { timeout: 3000, interval: 100, label: "scheduled 卡 bucket=long" },
+    );
+    const scheduledLongMeta = (await httpJson(
+      "GET",
+      `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
+    )).data?.[createdCard.id];
+    check(
+      "scheduled 卡互拖只改 bucket（今日 → 长期）",
+      scheduledLongMeta?.bucket === "long" && scheduledLongMeta?.contract?.accept === "改名后验收",
+      JSON.stringify(scheduledLongMeta),
+    );
+    check(
+      "scheduled 卡互拖不派发",
+      (await evaluate("window.__wbProbe.dispatch || 0")) === 0,
+      String(await evaluate("window.__wbProbe.dispatch || 0")),
+    );
+    check(
+      "scheduled 卡互拖：长期 → 今日",
+      (await dragRepoCardToStore("探针改名卡", "今日")) === true,
+    );
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-plane')][0].textContent.includes('探针改名卡')`,
+      8000,
+      "scheduled 卡移回今日",
+    );
+    await waitFor(
+      async () =>
+        (await httpJson(
+          "GET",
+          `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
+        )).data?.[createdCard.id]?.bucket === "today",
+      { timeout: 3000, interval: 100, label: "scheduled 卡 bucket=today" },
+    );
+    check(
+      "scheduled 卡互拖恢复 today",
+      (await httpJson(
+        "GET",
+        `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
+      )).data?.[createdCard.id]?.bucket === "today",
+    );
+
     // ---- 8. 409 result re-check (dispatch + live receipt done in 5c) --
     check(
       "409 卡回到仓库（等 parent）",
@@ -2150,6 +2210,27 @@ async function main() {
         boardVisual.cardBg !== null &&
         boardVisual.cardBg !== boardVisual.colBg,
       JSON.stringify(boardVisual),
+    );
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-board .wb-card')]
+        .some((node) => node.textContent.includes('探针改名卡'))`,
+      8000,
+      "看板出现 scheduled 卡",
+    );
+    check(
+      "看板拖 scheduled → 待执行",
+      (await dragBoardCardToColumn("探针改名卡", "待执行")).ok === true,
+    );
+    await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+    const boardGuardToast = await boardToastText();
+    const boardGuardStatus = (await httpJson(
+      "GET",
+      `${base}/api/plugins/kanban/tasks/${encodeURIComponent(createdCard.id)}`,
+    )).data?.task?.status;
+    check(
+      "看板拒绝把仓库卡移回待执行",
+      boardGuardToast.includes("仓库卡不能") && boardGuardStatus === "scheduled",
+      JSON.stringify({ toast: boardGuardToast, status: boardGuardStatus }),
     );
     check(
       "切到看板只显示看板面板",

@@ -93,6 +93,63 @@ def run_server(root: Path, defaults: Path, upstream: str) -> base.WorkbenchServe
     ).start()
 
 
+@contextlib.contextmanager
+def parking_upstream(patches: list[bytes]):
+    """Upstream whose scheduled PATCH returns 200 without landing there.
+
+    The first PATCH (triage -> todo) and the second (todo -> scheduled) both
+    return a task body; the second is a no-op ``todo``. The third PATCH is the
+    best-effort restore to triage.
+    """
+
+    responses = [
+        b'{"task":{"id":"t_fake","status":"todo"}}',
+        b'{"task":{"id":"t_fake","status":"todo"}}',
+        b'{"task":{"id":"t_fake","status":"triage"}}',
+    ]
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def _respond(self, code: int, raw: bytes) -> None:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)
+            self._respond(200, b'{"task":{"id":"t_fake","status":"triage"}}')
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._respond(200, b'{"task":{"id":"t_fake","status":"triage"}}')
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length") or 0)
+            patches.append(self.rfile.read(length) if length else b"")
+            self._respond(
+                200,
+                responses.pop(0)
+                if responses
+                else b'{"task":{"id":"t_fake","status":"triage"}}',
+            )
+
+        def log_message(self, *args) -> None:
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 class TodoBackendTestCase(unittest.TestCase):
     tmp: Path
     server: base.WorkbenchServer
@@ -199,6 +256,34 @@ class CreateTaskTests(TodoBackendTestCase):
         self.assertEqual(code, 200, body)
         self.assertEqual(body["metadata"]["bucket"], "long")
         self.assertEqual(self.server.status(body["task"]["id"]), "scheduled")
+
+    def test_create_rejects_overlong_title(self):
+        code, body = self.create("x" * 501)
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body["error"], "invalid_title")
+
+    def test_scheduled_noop_is_502_and_restores_triage(self):
+        patches: list[bytes] = []
+        root = self.tmp / "parking"
+        root.mkdir()
+        defaults = root / "defaults.json"
+        defaults.write_text(json.dumps(base.VALID_DEFAULTS), encoding="utf-8")
+        with parking_upstream(patches) as upstream:
+            server = run_server(root, defaults, upstream)
+            try:
+                code, body = base.http_json(
+                    "POST",
+                    server.base + "/api/workbench/tasks",
+                    {"title": "停车失败", "bucket": "today"},
+                )
+            finally:
+                server.stop()
+        self.assertEqual(code, 502, body)
+        self.assertEqual(body.get("task_id"), "t_fake")
+        self.assertEqual(
+            [json.loads(raw).get("status") for raw in patches],
+            ["todo", "scheduled", "triage"],
+        )
 
     def test_create_rejects_empty_title_and_bad_buckets(self):
         before = self.board_titles()
@@ -502,6 +587,20 @@ class UpdateTaskTests(TodoBackendTestCase):
         # The title lives upstream, the contract stays workbench-owned.
         self.assertEqual(self.server.task(task_id)["title"], "改名后的卡")
         self.assertEqual(self.metadata(task_id)["contract"]["accept"], "跑通测试")
+
+    def test_edit_rejects_card_outside_store(self):
+        code, created = self.create("已派发卡")
+        self.assertEqual(code, 200, created)
+        task_id = created["task"]["id"]
+        code, _ = self.patch_metadata(task_id, {"contract": {"accept": "完成"}})
+        self.assertEqual(code, 200)
+        code, body = self.server.dispatch(task_id)
+        self.assertEqual(code, 200, body)
+
+        code, body = self.patch_task(task_id, {"title": "不该改"})
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["error"], "not_in_store")
+        self.assertNotEqual(self.server.task(task_id)["title"], "不该改")
 
     def test_title_only_keeps_bucket_and_contract(self):
         code, created = self.create("只改标题", bucket="long")

@@ -51,8 +51,16 @@ self.addEventListener("fetch", (event) => {
         }
         return response;
       })
-      .catch(() =>
-        caches.match(event.request).then((hit) => hit || caches.match("/")),
-      ),
+      .catch(async () => {
+        const hit = await caches.match(event.request);
+        if (hit) return hit;
+        // Only a navigation may fall back to the cached HTML shell. Returning
+        // HTML for a failed script/style/icon request makes the browser parse
+        // markup as JS/CSS; non-UI paths like /healthz must fail honestly.
+        if (event.request.mode === "navigate") {
+          return (await caches.match("/")) || Response.error();
+        }
+        return Response.error();
+      }),
   );
 });

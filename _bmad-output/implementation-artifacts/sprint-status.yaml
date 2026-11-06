@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-05-2026 13:41
-last_updated: 11-05-2026 22:05
+last_updated: 11-06-2026 13:37
 project: Jarvis
 project_key: NOKEY
 tracking_system: file-system
@@ -47,4 +47,102 @@ development_status:
   2-1-全屏验收与验收动作: done
   2-2-p0-通知与通知操作: done
   2-3-会话追溯入口: done
-  epic-2-retrospective: optional
+  epic-2-retrospective: done
+action_items:
+  - id: "epic-2-retro-item-1-create-parking"
+    epic: 2
+    action: "建卡停车：要求 scheduled PATCH 的真实落点，失败恢复 triage 并返回 task_id；create_task 同步应用标题长度上限；补两步
+      PATCH 失败测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-2-legacy-todo-board-bypass"
+    epic: 2
+    action: "修复旧 todo 仓库卡的失败回退，并禁止看板把 scheduled/triage 拖回 todo；补跨视图测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-3-edit-guard"
+    epic: 2
+    action: "PATCH /api/workbench/tasks/{id} 只允许仓库状态编辑；部分成功返回 task_id；补未变标题不发上游 PATCH
+      的测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-4-notification-race"
+    epic: 2
+    action: "让 verify 与 reviews/sweep 共用 notification_lock（或 collect 前重验状态），补 sweep
+      与 accept 并发测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-5-p0-visibility"
+    epic: 2
+    action: "P0 自动置顶/展开紧凑区，P1/P2 仍默认收起；保留手动关闭并补 P0 显示测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-6-shell-update"
+    epic: 2
+    action: "版本指纹改内容 hash 并覆盖 index.html/theme.css/sw.js 与 SHELL 全资产；banner 降到模态之下；SW
+      仅对导航回退 /；补刷新与版本变化测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-7-detail-a11y"
+    epic: 2
+    action: "TaskDetail 复用 SessionViewer 的 Tab 陷阱与背景 inert，补键盘探针。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-8-verify-empty"
+    epic: 2
+    action: "验收队列变为非空时清 openedEmpty，处理完新卡后保留批次统计/自动退出；补空态来卡测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-9-doc-reconcile"
+    epic: 2
+    action: "对账 README/visual-align spec/epics.md 到 as-built：scheduled、过滤、blocked
+      落点、跨仓库拖动、分区创建卡、2.2/2.3 完成状态。"
+    owner: "PM + dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-10-cleanup"
+    epic: 2
+    action: "清理 workbench-app/web 中 8 个已跟踪 .bak；更新 deferred BH11；保留 PWA manifest/DonePage
+      stale/48h comment 等已知 deferred。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-11-ui-probe-gaps"
+    epic: 2
+    action: "补跨故事 UI 探针：scheduled 互拖、通知去验收与计数、accept→DonePage completed_at、DonePage
+      错误态、顶栏计数、刷新按钮、TaskDetail 会话/草稿抗轮询、verify 502/503。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-12-endpoint-guards"
+    epic: 2
+    action: "补 PATCH /api/workbench/tasks/{id} 与 notification action 的 JSON content-type/跨域/体积守卫测试。"
+    owner: "dev"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-13-structure-process"
+    epic: 2
+    action: "拆分 server.py；抽共享轮询/overlay/timer hook；把完成=用户可见验收与 spec 模板「宿主矩阵+闸门覆盖+存储原子性」落地。"
+    owner: "dev + PM"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-14-epic1-backfill"
+    epic: 2
+    action: "把 Epic 1 未关闭的 action 13/14/17/19/20 补录进 sprint-status 或明确人工跟踪。"
+    owner: "PM"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-2-retro-item-15-product-boundaries"
+    epic: 2
+    action: "决定非工作台 triage 无 bucket 卡的可见性，以及插件宿主 9119 是否需要待办/验收能力。"
+    owner: "PM + architect"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"

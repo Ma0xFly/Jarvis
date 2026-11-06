@@ -153,6 +153,20 @@ export default function Board({ onOpenSession, onStats }: BoardProps): React.Rea
       }
       if (cur === status) return;
 
+      // 仓库卡不能从看板移回待整理/待执行：triage 会被 triage specifier
+      // 接走，todo 会被 Hermes recompute_ready 自动提升为 ready。允许
+      // todo -> scheduled（停车），不允许反向。
+      if (
+        !isPluginHost &&
+        (status === "triage" || status === "todo") &&
+        (cur === "triage" || cur === "todo" || cur === "scheduled")
+      ) {
+        showToast(
+          "仓库卡不能移到「" + colLabel(status) + "」；请从待办页拖入流水线",
+        );
+        return;
+      }
+
       const from = ENTERABLE[status];
       if (cur && from && from.indexOf(cur) < 0) {
         showToast("不能从「" + colLabel(cur) + "」移到「" + colLabel(status) + "」：" + enterHint(status));

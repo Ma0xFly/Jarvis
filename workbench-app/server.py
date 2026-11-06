@@ -66,20 +66,32 @@ DEFAULT_DEFAULTS_PATH = APP_DIR / "defaults.json"
 
 
 def _shell_version() -> str:
-    """Fingerprint the deployed standalone shell (JS + CSS + SW mtimes/sizes).
+    """Content fingerprint of the deployed standalone shell.
 
-    The client uses this to detect a newer build without a page reload. A
-    missing artifact returns "" so an in-progress deploy never produces a
-    version that could flap the update banner.
+    Covers every asset a deploy can change without touching ``index.js``
+    (HTML, theme, service worker, icons). Content hashing avoids the false
+    "updated" banner a no-op rebuild causes when only mtimes change. A missing
+    artifact returns "" so a partial deploy never publishes a version.
     """
-    parts: list[str] = []
-    for name in ("index.js", "style.css", "sw.js"):
+    digest = hashlib.sha256()
+    for name in (
+        "index.html",
+        "index.js",
+        "style.css",
+        "theme.css",
+        "sw.js",
+        "icon.svg",
+        "icon-192.png",
+        "icon-512.png",
+    ):
         try:
-            info = (WEB_DIR / name).stat()
+            with (WEB_DIR / name).open("rb") as handle:
+                digest.update(name.encode("utf-8") + b"\0")
+                for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                    digest.update(chunk)
         except OSError:
             return ""
-        parts.append(f"{name}:{info.st_mtime_ns}:{info.st_size}")
-    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
+    return digest.hexdigest()[:12]
 
 UPSTREAM_CALL_TIMEOUT = 1.0
 DISPATCH_BUDGET_SECONDS = 2.9
@@ -1023,7 +1035,6 @@ class WorkbenchService:
             return self._fail(409, "blocked_by_parent", "scheduled")
 
         original = current_status
-        stepped = False
         if current_status == "triage":
             # triage -> scheduled is not a legal edge; park it via todo first.
             try:
@@ -1038,44 +1049,44 @@ class WorkbenchService:
                 self._rollback(write)
                 return self._fail(502, "upstream_unavailable")
             current_status = "todo"
-            stepped = True
 
         try:
             patched = self._patch_status(task_id, "scheduled", deadline)
         except UpstreamUnavailable:
-            self._restore_store_status(task_id, original, deadline, stepped)
+            self._restore_store_status(task_id, original, deadline)
             self._rollback(write)
             return self._fail(502, "upstream_unavailable")
         if patched.status == 404:
-            self._restore_store_status(task_id, original, deadline, stepped)
+            self._restore_store_status(task_id, original, deadline)
             self._rollback(write)
             return self._fail(404, "not_found")
         if patched.status != 200:
-            self._restore_store_status(task_id, original, deadline, stepped)
+            self._restore_store_status(task_id, original, deadline)
             self._rollback(write)
             return self._fail(502, "upstream_unavailable")
         landed = None
         if isinstance(patched.data, dict) and isinstance(patched.data.get("task"), dict):
             landed = patched.data["task"].get("status")
-        if not isinstance(landed, str) or not landed:
-            # A 200 without task.status is not proof of a scheduled landing.
-            self._restore_store_status(task_id, original, deadline, stepped)
+        if landed != "scheduled":
+            # A 200 without a real scheduled landing is not proof of parking.
+            self._restore_store_status(task_id, original, deadline)
             self._rollback(write)
             return self._fail(502, "upstream_unavailable")
         self._rollback(write)
         return self._fail(409, "blocked_by_parent", landed)
 
     def _restore_store_status(
-        self, task_id: str, original: Optional[str], deadline: float, stepped: bool
+        self, task_id: str, original: Optional[str], deadline: float
     ) -> None:
-        """Best effort: undo the triage -> todo step when the scheduled PATCH fails.
+        """Best effort: park a failed store landing back in triage.
 
         A failed store landing must not leave the card in ``todo`` — Hermes's
-        ``recompute_ready`` would queue it. The test proxy and a transient
-        upstream can make the scheduled PATCH fail; restoring triage keeps the
-        card visibly in the workbench store (and retryable).
+        ``recompute_ready`` would queue it. ``triage`` is the only retryable
+        store status reachable from both the stepped and legacy-todo paths; if
+        upstream refuses that edge, the caller still returns an error and the
+        next dispatch/retry can park it.
         """
-        if not stepped or original != "triage":
+        if original not in ("triage", "todo"):
             return
         try:
             self._patch_status(task_id, "triage", deadline)
@@ -2392,7 +2403,11 @@ class WorkbenchService:
         returns 503 plus the task id, so an idempotent retry can finish the
         metadata without creating a duplicate.
         """
-        if not isinstance(title, str) or not title.strip():
+        if (
+            not isinstance(title, str)
+            or not title.strip()
+            or len(title.strip()) > MAX_TITLE_CHARS
+        ):
             return self._fail(400, "invalid_title")
         if bucket not in BUCKETS:
             return self._fail(400, "invalid_bucket")
@@ -2455,9 +2470,12 @@ class WorkbenchService:
             # The kanban status machine does not allow triage -> scheduled;
             # triage -> todo -> scheduled is the supported path. Both PATCHes
             # happen immediately, well inside the gateway's 60s tick.
-            stepped = self._patch_status(
-                task_id, "todo", time.monotonic() + GATE_UPSTREAM_TIMEOUT
-            )
+            try:
+                stepped = self._patch_status(
+                    task_id, "todo", time.monotonic() + GATE_UPSTREAM_TIMEOUT
+                )
+            except UpstreamUnavailable:
+                return self._fail(502, "upstream_unavailable")
             if stepped.status != 200 or not isinstance(stepped.data, dict):
                 return self._fail(
                     502, "upstream_unavailable", actual if isinstance(actual, str) else None
@@ -2470,18 +2488,44 @@ class WorkbenchService:
             )
             actual = "todo"
         if actual == "todo":
-            patched = self._patch_status(
-                task_id, "scheduled", time.monotonic() + GATE_UPSTREAM_TIMEOUT
-            )
-            if patched.status != 200 or not isinstance(patched.data, dict):
-                return self._fail(
-                    502, "upstream_unavailable", actual if isinstance(actual, str) else None
+            try:
+                patched = self._patch_status(
+                    task_id, "scheduled", time.monotonic() + GATE_UPSTREAM_TIMEOUT
                 )
+            except UpstreamUnavailable:
+                self._restore_store_status(task_id, "triage", time.monotonic() + GATE_UPSTREAM_TIMEOUT)
+                return 502, {
+                    "ok": False,
+                    "error": "upstream_unavailable",
+                    "task_id": task_id,
+                }
+            if patched.status != 200 or not isinstance(patched.data, dict):
+                self._restore_store_status(task_id, "triage", time.monotonic() + GATE_UPSTREAM_TIMEOUT)
+                return 502, {
+                    "ok": False,
+                    "error": "upstream_unavailable",
+                    "task_id": task_id,
+                    "status": actual if isinstance(actual, str) else None,
+                }
             patched_task = patched.data.get("task")
-            if isinstance(patched_task, dict) and patched_task.get("id") == task_id:
-                fresh = patched_task
-            else:
-                fresh = {**fresh, "status": "scheduled"}
+            landed = (
+                patched_task.get("status")
+                if isinstance(patched_task, dict) and patched_task.get("id") == task_id
+                else None
+            )
+            if landed != "scheduled":
+                # A 200 without task.status is not proof of a scheduled
+                # landing; leave the card in the retryable triage store.
+                self._restore_store_status(
+                    task_id, "triage", time.monotonic() + GATE_UPSTREAM_TIMEOUT
+                )
+                return 502, {
+                    "ok": False,
+                    "error": "upstream_unavailable",
+                    "task_id": task_id,
+                    "status": landed if isinstance(landed, str) else None,
+                }
+            fresh = patched_task
         elif actual != "scheduled":
             return self._fail(502, "upstream_unavailable", actual if isinstance(actual, str) else None)
 
@@ -2599,6 +2643,13 @@ class WorkbenchService:
             ):
                 return self._fail(502, "upstream_unavailable")
             task = fetched.data["task"]
+            status = task.get("status")
+            if status not in ("triage", "todo", "scheduled"):
+                return self._fail(
+                    409,
+                    "not_in_store",
+                    status if isinstance(status, str) else None,
+                )
 
             # Only forward a real change: an unchanged title must not emit an
             # upstream ``edited`` event on every drawer save.
@@ -2635,13 +2686,21 @@ class WorkbenchService:
             try:
                 existing = self.store.get(normalized)
             except MetadataUnavailable:
-                return self._fail(503, "metadata_unavailable")
+                return 503, {
+                    "ok": False,
+                    "error": "metadata_unavailable",
+                    "task_id": normalized,
+                }
             if metadata_patch is None:
                 return 200, {"ok": True, "task": task, "metadata": existing or {}}
             try:
                 merged = self.store.merge(normalized, metadata_patch)
             except MetadataUnavailable:
-                return self._fail(503, "metadata_unavailable")
+                return 503, {
+                    "ok": False,
+                    "error": "metadata_unavailable",
+                    "task_id": normalized,
+                }
             return 200, {"ok": True, "task": task, "metadata": merged}
 
     def _landing_error(
@@ -2842,9 +2901,12 @@ class ReviewSweeper:
     only needed to unclog the queue when nobody has the verify page open.
     """
 
-    def __init__(self, service: WorkbenchService, interval_seconds: float) -> None:
+    def __init__(
+        self, service: WorkbenchService, interval_seconds: float, lock: Any = None
+    ) -> None:
         self.service = service
         self.interval_seconds = interval_seconds
+        self._lock = lock
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -2864,7 +2926,11 @@ class ReviewSweeper:
         # and the inbox read covers cards that are already overdue.
         while not self._stop.wait(self.interval_seconds):
             try:
-                self.service.sweep_reviews()
+                if self._lock is None:
+                    self.service.sweep_reviews()
+                else:
+                    with self._lock:
+                        self.service.sweep_reviews()
             except Exception as exc:  # a daemon thread must never die silently
                 print(f"workbench: review sweep failed: {exc}", file=sys.stderr, flush=True)
 
@@ -3351,10 +3417,16 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
     except DefaultsError as exc:
         print(f"workbench: defaults invalid at startup: {exc}", file=sys.stderr, flush=True)
 
+    # Serialise board-read+collect against every review write: otherwise a sweep
+    # that fetched the board just before an accept could re-add the review card
+    # as a new event. This covers notification sweep/action, full-screen verify,
+    # the guarded review sweep, and the background 48h sweeper.
+    notification_lock = threading.Lock()
+
     sweep_seconds = _env_sweep_seconds()
     sweeper: Optional[ReviewSweeper] = None
     if sweep_seconds > 0:
-        sweeper = ReviewSweeper(service, sweep_seconds)
+        sweeper = ReviewSweeper(service, sweep_seconds, lock=notification_lock)
         sweeper.start()
         app.router.add_event_handler("shutdown", sweeper.stop)
 
@@ -3378,11 +3450,6 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
             "WORKBENCH_NOTIFY_DAILY_HOUR", NOTIFY_DAILY_HOUR, minimum=0, maximum=23
         ),
     )
-
-    # Serialise board-read+collect against actions: otherwise a sweep that
-    # fetched the board just before an accept could re-add the review card as
-    # a new event (and notify again) after the action removed it.
-    notification_lock = threading.Lock()
 
     def notification_sweep() -> tuple[int, dict[str, Any]]:
         """One collection round; a failed upstream keeps the old snapshot."""
@@ -3411,6 +3478,16 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
     ) -> tuple[int, dict[str, Any]]:
         with notification_lock:
             return notification_engine.action(event_id, action, reason)
+
+    def verify_locked(
+        task_id: str, action: Any, reason: Any, expected_review_at: Any
+    ) -> tuple[int, dict[str, Any]]:
+        with notification_lock:
+            return service.verify(task_id, action, reason, expected_review_at)
+
+    def reviews_sweep_locked() -> tuple[int, dict[str, Any]]:
+        with notification_lock:
+            return service.sweep_reviews()
 
     notify_sweep_seconds = _env_notify_sweep_seconds()
     notification_poller: Optional[NotificationPoller] = None
@@ -3520,7 +3597,7 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
             if body_error == "payload_too_large":
                 return _json_error(413, "payload_too_large")
             return _json_error(400, "invalid_request")
-        status_code, body = await run_in_threadpool(service.sweep_reviews)
+        status_code, body = await run_in_threadpool(reviews_sweep_locked)
         return JSONResponse(body, status_code=status_code)
 
     @app.post("/api/workbench/verify/{task_id}")
@@ -3534,7 +3611,7 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
                 return _json_error(413, "payload_too_large")
             return _json_error(400, "invalid_request")
         status_code, body = await run_in_threadpool(
-            service.verify,
+            verify_locked,
             task_id,
             payload.get("action"),
             payload.get("reason"),

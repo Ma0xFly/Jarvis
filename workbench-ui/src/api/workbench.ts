@@ -61,6 +61,7 @@ export type WorkbenchErrorCode =
   | "create_failed"
   | "metadata_failed"
   | "not_in_review"
+  | "not_in_store"
   | "reason_required"
   | "reason_too_long"
   | "stale_review"
@@ -97,6 +98,7 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "create_failed",
   "metadata_failed",
   "not_in_review",
+  "not_in_store",
   "reason_required",
   "reason_too_long",
   "stale_review",
@@ -205,7 +207,7 @@ function fallbackCode(status: number | undefined, context: ErrorContext): Workbe
     case 404:
       return "not_found";
     case 409:
-      return "not_in_review";
+      return context === "task" ? "not_in_store" : "not_in_review";
     case 500:
       if (context === "dispatch") return "invalid_defaults";
       if (context === "create") return "create_failed";
@@ -393,7 +395,15 @@ export async function updateTaskCard(
       metadata: data.metadata as TaskMetadata,
     };
   } catch (error) {
-    throw toWorkbenchError(error, "task");
+    const normalized = toWorkbenchError(error, "task");
+    if (normalized.code === "not_in_store") {
+      throw new WorkbenchError(
+        "not_in_store",
+        "卡已离开仓库，刷新后再编辑",
+        normalized.status,
+      );
+    }
+    throw normalized;
   }
 }
 
