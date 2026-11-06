@@ -30,7 +30,8 @@ workbench-app/server.py  (FastAPI)
   读写任务；不打开、不建表、不写 `kanban.db`
 
 `workbench.db` 只存工作台自己的 `task_metadata(task_id, metadata, write_token)`：
-`bucket`、`contract`、派发瞬间的 `contract_defaults` 快照。`write_token` 是快照
+`bucket`、`contract`、派发瞬间的 `contract_defaults` 快照，以及定时唤醒的
+`wake_at` / `wake_error` / `wake_next_try_at`。`write_token` 是快照
 归属标记（补偿时只删自己写的），不会出现在 metadata 响应里。不碰共享
 `kanban.db`，上游升级重建表/加同名列都不会影响。
 
@@ -128,10 +129,12 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
   重拍后若 PATCH 失败，补偿会恢复上一份快照及其 token，不丢历史。
 - `GET /api/workbench/metadata` 单请求最多 200 个 id；超过返回
   400 `too_many_ids`，不静默截断。前端按 100 个 id/请求分块，长列表仍完整。
-- metadata 写端点只接受 `bucket` 与 `contract`，`bucket` 只允许
-  `today|long`；用 JSON1 `json_patch` 按 key 合并，派发快照
-  `contract_defaults` 不会被客户端覆盖。未知键、空 patch、非法 contract
-  一律 400；建卡 `title` 与 `accept` 落库前都会 trim。
+- metadata 写端点接受 `bucket`、`contract` 与 `wake_at`（epoch seconds，
+  0..2100；`null` 清除），`bucket` 只允许 `today|long`；用 JSON1
+  `json_patch` 按 key 合并，派发快照 `contract_defaults` 不会被客户端覆盖。
+  `wake_error` / `wake_next_try_at` 由服务端写，客户端不可写。未知键、空
+  patch、非法 contract / wake_at 一律 400；建卡 `title` 与 `accept` 落库前
+  都会 trim。
 - 校验上限：`accept` ≤2000、`input` ≤4000、`deny_paths` 1–100 个非空字符串、
   请求体 ≤64KB。POST/PATCH 必须 `Content-Type: application/json`（否则 415）；
   带 `Origin` 时必须与 Host 同源（否则 403）。
@@ -152,6 +155,43 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
 
 上游 `recompute_ready`（parent 完成自动提升）和原生 9119 dashboard 不经过本服务，
 **不在闸门范围内**，属已知限制。
+
+## 定时唤醒（3.3）
+
+仓库卡可在 workbench metadata 写顶层 `wake_at`（epoch seconds）；后台
+`WakeScheduler` 只扫描带该键的卡。Hermes 原生 `scheduled` 卡没有这个键，
+不会被读取或修改，也不使用上游 `not_before`。
+
+```bash
+# 设置 / 清除（null 为清除；wake_error / wake_next_try_at 客户端不可写）
+curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
+  -H 'content-type: application/json' -d '{"wake_at":1730000000}'
+curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
+  -H 'content-type: application/json' -d '{"wake_at":null}'
+
+# 手动提前唤醒：与后台到点共用同一 wake_task 逻辑，不受退避窗口限制
+curl -s -X POST http://127.0.0.1:8787/api/workbench/wake/<task_id> \
+  -H 'content-type: application/json' -d '{}'
+# 200 {"ok":true,"position":2,"eta":"14:19","status":"ready"}   # 无 parent
+# 200 {"ok":true,"status":"todo"}                                # 有未完成 parent
+# 400 missing_acceptance / 404 not_found / 409 not_in_store
+# 502 upstream_unavailable / 503 metadata_unavailable
+```
+
+规则：
+
+- 到期且有验收、无未完成 parent：复用 dispatch 进 `ready`，写
+  `contract_defaults`；有未完成 parent：PATCH `todo`。成功后清空
+  `wake_at` / `wake_error` / `wake_next_try_at`。
+- 缺验收：留在 `scheduled`，写 `wake_error=missing_acceptance`、
+  `wake_next_try_at=now+300`，保留 `wake_at`，不自动派发；补验收后自动重试，
+  也可手动提前唤醒。
+- 上游 502：保留 `wake_at`，写 `wake_error=upstream_unavailable`、
+  `wake_next_try_at=now+60`，下一轮重试。重复扫描幂等；卡已离开仓库时清掉
+  残留 wake 字段。
+- `wake_at` 只接受非负整数（bool / 浮点 / 字符串 / 负数一律 400
+  `invalid_metadata`）；设置新时间会清掉上一轮的 `wake_error` /
+  `wake_next_try_at`。
 
 ## 验收 inbox / verify / sweep
 
@@ -250,6 +290,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/solidified/<task_id>/verify 
 - 环境变量覆盖（均为有限正数，非法值回落默认）：
   - `WORKBENCH_REVIEW_TTL_SECONDS` 自动收窗口，默认 `172800`（48h）
   - `WORKBENCH_REVIEW_SWEEP_SECONDS` 后台扫描间隔，默认 `300`；`0`/非法值关闭
+  - `WORKBENCH_WAKE_SWEEP_SECONDS` 定时唤醒扫描间隔，默认 `30`；`0` 关闭，非法值告警后关闭
   - `WORKBENCH_REVIEW_BACKOFF_SECONDS` 失败退避，默认 `300`
   - `WORKBENCH_INBOX_CACHE_SECONDS` count/inbox 的 /board 短缓存，默认 `1`；
     `0` 关闭缓存（仍保留 in-flight 合并），测试用
@@ -446,6 +487,7 @@ curl -s -X POST \
 | `workbench.db` | 运行期生成的工作台 metadata 库（已 gitignore） |
 | `tests/test_dispatch.py` | 派发/闸门/metadata 的可重复集成测试（临时库，不碰真实数据） |
 | `tests/test_todo.py` | 待办建卡 / metadata 写端点的可重复集成测试 |
+| `tests/test_wake.py` | 定时唤醒：到期 ready / parent todo / 缺验收退避 / 原生 scheduled / 手动提前 / 非法值 / 后台调度器 / 上游 502 |
 | `tests/test_verify.py` | inbox / count / sweep / verify / solidified 归一化与 accept 门禁 / overlay / 48h 自动收与退避的可重复集成测试 |
 | `tests/test_notifications.py` | 通知分类/攒批/升级/日报/槽/动作/snooze/命令失败/后台 10s 的测试 |
 | `tests/test_session.py` | 会话解析/只读 state.db/窗口与过滤/截断/脱敏/no-store 的集成测试 |
@@ -473,6 +515,7 @@ systemctl --user restart jarvis-workbench
 ```bash
 python3 workbench-app/tests/test_dispatch.py -v
 python3 workbench-app/tests/test_todo.py -v
+python3 workbench-app/tests/test_wake.py -v
 python3 workbench-app/tests/test_verify.py -v
 python3 workbench-app/tests/test_notifications.py -v
 python3 workbench-app/tests/test_session.py -v

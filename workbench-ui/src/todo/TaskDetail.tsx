@@ -1,6 +1,11 @@
 import React, { useEffect, useRef, useState } from "react";
 import type { Task } from "../board/Board";
-import type { TaskMetadata, WorkbenchContractBudget } from "../api/workbench";
+import {
+  WorkbenchError,
+  type TaskMetadata,
+  type WakeResult,
+  type WorkbenchContractBudget,
+} from "../api/workbench";
 
 /**
  * 卡片详情抽屉：流水线卡只读 + 两个出口（去验收 / 查看执行会话）；
@@ -22,12 +27,65 @@ const STATUS_LABEL: Record<string, string> = {
 const STORE_STATUSES = new Set(["triage", "todo", "scheduled"]);
 
 function clock(ts?: number | null): string {
-  if (!ts) return "—";
+  // Epoch 0 is a real instant (and a valid wake_at), so only null/undefined
+  // and non-finite values are "no time".
+  if (ts === undefined || ts === null || !Number.isFinite(ts)) return "—";
   const date = new Date(ts * 1000);
+  if (Number.isNaN(date.getTime())) return "—";
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(
     date.getHours(),
   )}:${pad(date.getMinutes())}`;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/** epoch seconds → `<input type="datetime-local">` 的本地时间值。 */
+function wakeAtValue(wakeAt: number | null): string {
+  if (wakeAt === null) return "";
+  const date = new Date(wakeAt * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  return (
+    `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}` +
+    `T${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+  );
+}
+
+/** datetime-local 按浏览器本地时区解析；空/非法值返回 null。 */
+function wakeAtFromInput(value: string): number | null {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  const seconds = Math.floor(parsed / 1000);
+  return seconds >= 0 ? seconds : null;
+}
+
+function wakeErrorText(code: string): string {
+  if (code === "missing_acceptance") return "缺验收，暂时无法自动唤醒";
+  if (code === "upstream_unavailable") return "上游暂不可用，稍后自动重试";
+  if (code === "invalid_defaults") return "派发默认值配置有误，先检查 defaults.json";
+  if (code === "not_ready") return "上游暂时不让派发，稍后自动重试";
+  return "唤醒失败：" + code;
+}
+
+function wakeActionError(error: unknown): string {
+  if (error instanceof WorkbenchError) {
+    if (error.code === "missing_acceptance") {
+      return "缺验收，补一句怎样算做完再唤醒";
+    }
+    if (error.code === "not_in_store") return "卡已离开仓库，刷新后重试";
+    if (error.code === "not_found") return "卡已不存在，刷新后重试";
+    if (error.code === "metadata_unavailable") {
+      return "本地 metadata 暂不可用，稍后重试";
+    }
+    if (error.code === "upstream_unavailable") return "上游暂不可用，稍后重试";
+    if (error.code === "invalid_defaults") return "派发默认值配置有误，先检查 defaults.json";
+    if (error.code === "not_ready") return "上游暂时不让派发，稍后重试";
+    return "唤醒失败：" + error.message;
+  }
+  return "唤醒失败：" + errText(error);
 }
 
 function budgetText(budget?: WorkbenchContractBudget | null): string {
@@ -64,6 +122,10 @@ interface TaskDetailProps {
   onOpenSession?: (taskId: string, title?: string) => void;
   /** 仓库卡编辑保存；不传则整张卡只读。 */
   onSave?: (patch: DetailEditPatch) => Promise<void>;
+  /** 设置/清除唤醒时间；null 表示清除。 */
+  onWakeChange?: (wakeAt: number | null) => Promise<void>;
+  /** 立即唤醒（与后台到点共用同一后端路径）。 */
+  onWakeNow?: () => Promise<WakeResult | void>;
 }
 
 export default function TaskDetail({
@@ -73,6 +135,8 @@ export default function TaskDetail({
   onVerify,
   onOpenSession,
   onSave,
+  onWakeChange,
+  onWakeNow,
 }: TaskDetailProps): React.ReactElement {
   const closeRef = useRef<HTMLButtonElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -92,12 +156,27 @@ export default function TaskDetail({
     task.status !== "scheduled";
   const canVerify = task.status === "review" && Boolean(onVerify);
 
+  const metadataWakeAt =
+    typeof task.metadata?.wake_at === "number" &&
+    Number.isFinite(task.metadata.wake_at) &&
+    task.metadata.wake_at >= 0
+      ? task.metadata.wake_at
+      : null;
+  const metadataWakeError =
+    typeof task.metadata?.wake_error === "string" ? task.metadata.wake_error : "";
+  const canWake =
+    STORE_STATUSES.has(task.status) && (Boolean(onWakeChange) || Boolean(onWakeNow));
+
   const [editing, setEditing] = useState(false);
   const [titleDraft, setTitleDraft] = useState(task.title);
   const [acceptDraft, setAcceptDraft] = useState(accept);
   const [inputDraft, setInputDraft] = useState(input);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
+  const [wakeDraft, setWakeDraft] = useState(wakeAtValue(metadataWakeAt));
+  const [wakeSaving, setWakeSaving] = useState(false);
+  const [wakeError, setWakeError] = useState("");
+  const [wakeNotice, setWakeNotice] = useState("");
   editingRef.current = editing;
 
   // Polling keeps replacing the task object; never clobber an active edit.
@@ -107,6 +186,12 @@ export default function TaskDetail({
     setAcceptDraft(accept);
     setInputDraft(input);
   }, [task.id, task.title, accept, input, editing]);
+
+  // Sync the wake input with server truth (after set/clear or a poll update),
+  // but never while the user is typing in the title/accept editor.
+  useEffect(() => {
+    setWakeDraft(wakeAtValue(metadataWakeAt));
+  }, [task.id, metadataWakeAt]);
 
   // The card may leave the store (dispatch) while the drawer is open.
   useEffect(() => {
@@ -171,6 +256,61 @@ export default function TaskDetail({
     } finally {
       setSaving(false);
     }
+  };
+
+  const runWake = async (action: () => Promise<WakeResult | void>) => {
+    if (wakeSaving) return;
+    setWakeSaving(true);
+    setWakeError("");
+    setWakeNotice("");
+    try {
+      await action();
+    } catch (error) {
+      setWakeError(wakeActionError(error));
+    } finally {
+      setWakeSaving(false);
+    }
+  };
+
+  const saveWake = () => {
+    if (!onWakeChange) return;
+    const wakeAt = wakeAtFromInput(wakeDraft);
+    if (wakeAt === null) {
+      setWakeError("选择有效的唤醒时间");
+      return;
+    }
+    void runWake(() => onWakeChange(wakeAt));
+  };
+
+  const clearWake = () => {
+    if (!onWakeChange) return;
+    void runWake(() => onWakeChange(null));
+  };
+
+  const wakeNow = () => {
+    if (!onWakeNow) return;
+    void runWake(async () => {
+      const result = await onWakeNow();
+      if (!result) return;
+      if (result.status === "todo") {
+        setWakeNotice("有未完成 parent，已转入待执行");
+      } else if (typeof result.position === "number") {
+        setWakeNotice(
+          `已唤醒，队列第 ${result.position} 位` +
+            (result.eta ? `，预计 ${result.eta}` : ""),
+        );
+      } else {
+        setWakeNotice("已唤醒");
+      }
+    });
+  };
+
+  const quickWake = () => {
+    setWakeError("");
+    // datetime-local drops seconds, so round up to the next minute: flooring
+    // would turn "5 minutes" into as little as 4m01s in the stored epoch.
+    const target = Math.ceil((Date.now() / 1000 + 5 * 60) / 60) * 60;
+    setWakeDraft(wakeAtValue(target));
   };
 
   return (
@@ -268,6 +408,76 @@ export default function TaskDetail({
               </section>
             </>
           )}
+
+          {canWake && !editing ? (
+            <section className="wb-detail-section wb-detail-wake">
+              <h3>定时唤醒</h3>
+              <div className="wb-detail-wake-row">
+                <input
+                  className="wb-detail-wake-input"
+                  type="datetime-local"
+                  value={wakeDraft}
+                  disabled={wakeSaving}
+                  aria-label="唤醒时间"
+                  onChange={(event) => {
+                    setWakeDraft(event.target.value);
+                    setWakeError("");
+                  }}
+                />
+                <button
+                  className="wb-detail-btn"
+                  type="button"
+                  onClick={quickWake}
+                  disabled={wakeSaving}
+                >
+                  5 分钟后
+                </button>
+                <button
+                  className="wb-detail-btn"
+                  type="button"
+                  onClick={saveWake}
+                  disabled={wakeSaving || !onWakeChange}
+                >
+                  设置
+                </button>
+                <button
+                  className="wb-detail-btn"
+                  type="button"
+                  onClick={clearWake}
+                  disabled={wakeSaving || !onWakeChange || metadataWakeAt === null}
+                >
+                  清除
+                </button>
+                <button
+                  className="wb-detail-btn"
+                  type="button"
+                  onClick={wakeNow}
+                  disabled={wakeSaving || !onWakeNow}
+                >
+                  提前唤醒
+                </button>
+              </div>
+              <p className="wb-detail-wake-hint">
+                {metadataWakeAt !== null
+                  ? `已排期：${clock(metadataWakeAt)}`
+                  : "未设置；也可以直接提前唤醒。"}
+              </p>
+              {wakeNotice ? (
+                <p className="wb-detail-wake-ok" role="status">
+                  {wakeNotice}
+                </p>
+              ) : null}
+              {wakeError ? (
+                <div className="wb-detail-wake-error" role="alert">
+                  {wakeError}
+                </div>
+              ) : metadataWakeError ? (
+                <div className="wb-detail-wake-error" role="alert">
+                  {wakeErrorText(metadataWakeError)}
+                </div>
+              ) : null}
+            </section>
+          ) : null}
 
           {task.latest_summary ? (
             <section className="wb-detail-section">

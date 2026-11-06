@@ -117,8 +117,10 @@ class WorkbenchServer:
         env.pop("WORKBENCH_UPSTREAM_BASE", None)
         # Notification polling is covered by test_notifications; keeping it off
         # by default makes call-count assertions and the developer's desktop
-        # deterministic. Tests that need it opt in via env_extra.
+        # deterministic. The wake scheduler is likewise off unless a suite
+        # opts in via env_extra (test_wake uses 0.2s).
         env.setdefault("WORKBENCH_NOTIFY_SWEEP_SECONDS", "0")
+        env.setdefault("WORKBENCH_WAKE_SWEEP_SECONDS", "0")
         env.update(self.env_extra)
         self.proc = subprocess.Popen(
             [PYTHON, "-I", str(SERVER), "--host", "127.0.0.1", "--port", str(self.port)],

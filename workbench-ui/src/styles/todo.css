@@ -322,6 +322,29 @@
   outline: none;
 }
 
+.wb-todo-wake {
+  align-self: flex-start;
+  font-size: 10.5px;
+  line-height: 1.5;
+  padding: 1px 7px;
+  border-radius: 5px;
+  color: var(--wb-accent-2);
+  background: var(--wb-accent-weak);
+  border: 1px solid var(--wb-accent-border);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wb-todo-wake-error {
+  align-self: flex-start;
+  max-width: 100%;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--wb-danger);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
 .wb-todo-warn {
   font-size: 11px;
   color: var(--wb-danger);

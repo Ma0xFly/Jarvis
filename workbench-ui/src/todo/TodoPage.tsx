@@ -11,6 +11,7 @@ import {
   mergeTaskMetadata,
   updateTaskCard,
   updateTaskMetadata,
+  wakeTask,
   WorkbenchError,
   type Bucket,
   type TaskMetadata,
@@ -46,6 +47,49 @@ function errText(error: unknown): string {
 function acceptText(task: TaskWithMeta): string {
   const accept = task.metadata?.contract?.accept;
   return typeof accept === "string" ? accept.trim() : "";
+}
+
+function wakeAtOf(task: TaskWithMeta): number | null {
+  const wakeAt = task.metadata?.wake_at;
+  return typeof wakeAt === "number" && Number.isFinite(wakeAt) && wakeAt >= 0
+    ? wakeAt
+    : null;
+}
+
+/** 本地短时间戳：同一天只显示 HH:MM，跨天补 MM-DD。 */
+function shortStamp(ts: number): string {
+  const date = new Date(ts * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(
+    date.getMinutes(),
+  )}`;
+}
+
+/** 仓库卡唤醒 chip：同一天显示 HH:MM，跨天补日期，避免误读成今天。 */
+function wakeLabel(wakeAt: number | null): string {
+  if (wakeAt === null) return "";
+  const date = new Date(wakeAt * 1000);
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const hhmm = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  return sameDay ? `将于 ${hhmm} 唤醒` : `将于 ${shortStamp(wakeAt)} 唤醒`;
+}
+
+/** 服务端 wake_error + 下一次重试时间；缺验收和上游失败分开说。 */
+function wakeErrorLabel(code: string, nextTryAt: number | null): string {
+  const reason =
+    code === "missing_acceptance"
+      ? "缺验收，暂不能自动唤醒"
+      : code === "upstream_unavailable"
+        ? "上游暂不可用，将自动重试"
+        : "唤醒失败：" + code;
+  return nextTryAt !== null ? `${reason} · ${shortStamp(nextTryAt)} 重试` : reason;
 }
 
 /** 仓库卡：triage（旧卡）/ todo（旧仓库）/ scheduled（新仓库） + bucket；固定 created_at 倒序 */
@@ -397,6 +441,38 @@ export default function TodoPage({
     [showToast],
   );
 
+  /** 设置/清除唤醒时间：只写 workbench metadata，不派发。 */
+  const changeWake = useCallback(
+    async (task: TaskWithMeta, wakeAt: number | null) => {
+      mutationSeq.current += 1;
+      const metadata = await updateTaskMetadata(task.id, { wake_at: wakeAt });
+      setMetadataById((prev) => ({ ...prev, [task.id]: metadata }));
+      showToast(wakeAt === null ? "已取消唤醒" : "已设置唤醒时间");
+    },
+    [showToast],
+  );
+
+  /** 手动提前唤醒：与后台到点唤醒共用后端同一路径。 */
+  const wakeNow = useCallback(
+    async (task: TaskWithMeta) => {
+      mutationSeq.current += 1;
+      const result = await wakeTask(task.id);
+      // The drawer closes once the card leaves the repository, so the receipt
+      // (position/ETA) must live in the page-level toast.
+      const receipt =
+        result.status === "todo"
+          ? "有未完成 parent，已转入待执行"
+          : typeof result.position === "number"
+            ? `已唤醒，队列第 ${result.position} 位` +
+              (result.eta ? `，预计 ${result.eta}` : "")
+            : "已唤醒";
+      showToast(receipt);
+      await load();
+      return result;
+    },
+    [showToast, load],
+  );
+
   const handleBucketDragOver = (event: React.DragEvent<HTMLElement>, bucket: Bucket) => {
     event.preventDefault();
     event.dataTransfer.dropEffect = "move";
@@ -642,6 +718,15 @@ export default function TodoPage({
 
   const renderRepoCard = (task: TaskWithMeta): React.ReactElement => {
     const accept = acceptText(task);
+    const wakeText = wakeLabel(wakeAtOf(task));
+    const wakeError =
+      typeof task.metadata?.wake_error === "string" ? task.metadata.wake_error : "";
+    const wakeNextTryAt =
+      typeof task.metadata?.wake_next_try_at === "number" &&
+      Number.isFinite(task.metadata.wake_next_try_at) &&
+      task.metadata.wake_next_try_at >= 0
+        ? task.metadata.wake_next_try_at
+        : null;
     const editing = editingId === task.id;
     const dragBlocked = editing || savingId === task.id || dispatchingId === task.id;
     return (
@@ -715,6 +800,12 @@ export default function TodoPage({
             )}
           </div>
         )}
+        {wakeText ? <div className="wb-todo-wake">{wakeText}</div> : null}
+        {wakeError ? (
+          <div className="wb-todo-wake-error">
+            {wakeErrorLabel(wakeError, wakeNextTryAt)}
+          </div>
+        ) : null}
         {warnId === task.id ? (
           <div className="wb-todo-warn">先补一句怎样算做完</div>
         ) : null}
@@ -895,6 +986,8 @@ export default function TodoPage({
           onClose={() => setDetailId(null)}
           onVerify={onVerify}
           onOpenSession={onOpenSession}
+          onWakeChange={(wakeAt: number | null) => changeWake(detailTask, wakeAt)}
+          onWakeNow={() => wakeNow(detailTask)}
           onSave={async (patch: DetailEditPatch) => {
             const updated = await updateTaskCard(detailTask.id, {
               title: patch.title,

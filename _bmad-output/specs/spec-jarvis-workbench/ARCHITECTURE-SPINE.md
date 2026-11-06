@@ -1,7 +1,7 @@
 ---
 id: ARCH-jarvis-workbench
 status: final
-updated: 2026-11-05
+updated: 2026-11-06
 spec: SPEC.md
 ---
 
@@ -39,7 +39,7 @@ spec: SPEC.md
 
 | 路径 | 角色 | 能不能改 |
 |---|---|---|
-| `workbench-app/server.py` | FastAPI 外壳：挂载上游 kanban router；自有 `/api/workbench/*`（dispatch、metadata、inbox/count、verify、reviews/sweep）与 ready 闸门；只经回环 REST 碰任务 | **可改**，只加不改 |
+| `workbench-app/server.py` | FastAPI 外壳：挂载上游 kanban router；自有 `/api/workbench/*`（dispatch、metadata、inbox/count、verify、reviews/sweep、wake）与 ready 闸门；只经回环 REST 碰任务 | **可改**，只加不改 |
 | `workbench-app/defaults.json` | 全局预算 + `queue.minutes_per_task`（唯一默认源） | 可改 |
 | `workbench-app/workbench.db` | 工作台自有 `task_metadata`（运行期生成，gitignore） | 可改（只经 `server.py`） |
 | `workbench-app/tests/test_dispatch.py` | 派发/闸门/metadata 集成测试（临时库） | 可改 |
@@ -113,9 +113,10 @@ export const api = sdk ? sdk.fetchJSON : plainFetch
 | 方法 | 路径 | 关键字段 | 用途 |
 |---|---|---|---|
 | POST | `/dispatch/{task_id}` | `{}` | 派发：校验 `contract.accept` → 写 `contract_defaults` 快照 → `PATCH ready` → 回读落点/位次 |
-| GET | `/metadata?ids=a,b` | — | 读 `workbench.db` 的 `bucket` / `contract` / `contract_defaults`；>200 id 返回 400 `too_many_ids` |
-| PATCH | `/metadata/{task_id}` | `bucket` / `contract` | 合并写；`contract_defaults` 与未知键不可写 |
+| GET | `/metadata?ids=a,b` | — | 读 `workbench.db` 的 `bucket` / `contract` / `contract_defaults` / `wake_at` / `wake_error` / `wake_next_try_at`；>200 id 返回 400 `too_many_ids` |
+| PATCH | `/metadata/{task_id}` | `bucket` / `contract` / `wake_at?` | 合并写；`contract_defaults`、`wake_error`、`wake_next_try_at` 与未知键不可写 |
 | POST | `/tasks` | `title` `bucket` `idempotency_key?` | 建待办卡（上游 `triage=true`），再写默认 `bucket` + 空 `contract` |
+| POST | `/wake/{task_id}` | `{}` | 手动提前唤醒仓库卡：与后台到点共用 `wake_task`；无 parent → `ready`，有 parent → `todo` |
 | GET | `/inbox` | — | review 队列（纯读）：并行拉详情、按最早 `review_requested` 排序；失败详情进 `failed_ids` |
 | GET | `/inbox/count` | — | 顶栏计数：只读一次 `/board`（1s 短缓存 + in-flight 合并） |
 | POST | `/reviews/sweep` | `{}` | 48h 自动收扫描（同源 + JSON guard）；后台 5 分钟 sweeper 共用同一逻辑 |
@@ -170,7 +171,9 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
 | `solidified` | `task_runs.metadata`（最新 run） | P3 worker（`kanban_request_review`） | `{type: "routing"\|"skill_patch"\|"script", path, status: "pending"\|"verified"}`；workbench 读最新 run |
 | `self_report` | `task_runs.metadata`（最新 run） | P3 worker（`kanban_request_review`） | `{delivered, evidence, uncertain}`；workbench 读最新 run |
 | `solidified_verified` | workbench.db `task_metadata` | P3 workbench 手动标记 | `{path, verified_at}[]` overlay；与上游 pending 合并展示 |
-| `wake_at` | workbench.db `task_metadata` | P3 待办/详情设置 | epoch seconds；只处理带该键的卡，原生 `scheduled` 不受影响 |
+| `wake_at` | workbench.db `task_metadata` | P3 待办/详情设置（客户端） | epoch seconds（非负 int 或 null）；只处理带该键的卡，原生 `scheduled` 不受影响 |
+| `wake_error` | workbench.db `task_metadata` | P3 WakeScheduler（服务端） | `missing_acceptance` \| `upstream_unavailable`；客户端不可写 |
+| `wake_next_try_at` | workbench.db `task_metadata` | P3 WakeScheduler（服务端） | epoch seconds 退避截止；缺验收 +300s、上游失败 +60s；客户端不可写 |
 | `cost` | 尚未落地（deferred） | 后续成本故事 | `{minutes, tokens, usd, by_rule}` |
 | `hops` | 尚未落地（deferred） | 后续建子卡故事 | `int`，> 8 拒绝 |
 | `executor` | `routing.json` | P3 worker/routing | `"hermes"\|"claude_code"\|"dsh"\|"codex"` |
@@ -223,6 +226,14 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
      P3 在 accept 前读最新 run `metadata.solidified`，缺失返回 400 `missing_solidified`。
    - `POST /api/workbench/solidified/{task_id}/verify` —— P3：`{path}` 写
      workbench.db 的 `solidified_verified` overlay；不 PATCH 上游 run metadata。
+   - `POST /api/workbench/wake/{task_id}` —— P3 定时唤醒：读卡（必须仍在
+     triage/todo/scheduled，否则 409 `not_in_store`）→ 无验收 400
+     `missing_acceptance` 并写退避 → 有未完成 parent PATCH `todo` → 否则复用
+     `_dispatch_locked` 进 `ready`；成功后清空 `wake_at`/`wake_error`/
+     `wake_next_try_at`。后台 `WakeScheduler` 每 `WORKBENCH_WAKE_SWEEP_SECONDS`
+     （默认 30s，0 关闭）扫描 `MetadataStore.due_wake_tasks`，只处理带
+     `wake_at` 的 workbench metadata 行；Hermes 原生 `scheduled` 卡没有该键，
+     不会被读取/修改，也不使用上游 `not_before`。
    - `GET /api/workbench/cost/{task_id}` —— 读 `metadata.cost`（后续故事，P3）。
    实现方式：与现有 router 平级，**不要改 `plugin_api.py`**；dispatch 路径只经回环公开 REST。
 
@@ -279,6 +290,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/tasks \
 # 可重复测试（临时 HERMES_KANBAN_HOME / WORKBENCH_DB，不碰真实库）
 python3 workbench-app/tests/test_dispatch.py -v
 python3 workbench-app/tests/test_todo.py -v
+python3 workbench-app/tests/test_wake.py -v
 python3 workbench-app/tests/test_verify.py -v
 cd workbench-ui && npm run verify   # build + headless 三区探针 + 验收探针
 ```
@@ -311,6 +323,10 @@ cd workbench-ui && npm run verify   # build + headless 三区探针 + 验收探�
   不阻塞收卡，也不会单独退避重试（5 分钟退避只针对 PATCH/重读失败）。
 - 48h 判定取最近一次 `review_requested` 事件；没有该事件的卡永不自动收。
   后台 sweeper 每 5 分钟对全部 review 卡逐张拉详情（O(N)），单机单用户规模下可接受。
+- 定时唤醒只处理 workbench metadata 带 `wake_at` 的卡；Hermes 原生 `scheduled`
+  卡（无该键）保持原状。缺验收时卡留在 `scheduled` 并退避 5 分钟，上游失败退避
+  60 秒；手动提前唤醒不受退避窗口限制。扫描间隔
+  `WORKBENCH_WAKE_SWEEP_SECONDS`，默认 30 秒，设 0 关闭。
 
 ## 10. 版本基线
 

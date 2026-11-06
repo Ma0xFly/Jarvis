@@ -29,11 +29,20 @@ export interface ContractDefaults {
   deny_paths: string[];
 }
 
-/** workbench.db 中按 task_id 存的一份 metadata（不会出现在上游 /board 卡上） */
+/**
+ * workbench.db 中按 task_id 存的一份 metadata（不会出现在上游 /board 卡上）。
+ * `wake_at` 可由客户端写；`wake_error` / `wake_next_try_at` 只由服务端写。
+ */
 export interface TaskMetadata {
   bucket?: Bucket;
   contract?: WorkbenchContract;
   contract_defaults?: ContractDefaults;
+  /** 仓库卡到点唤醒时间（epoch seconds）；null/缺失表示未排期。 */
+  wake_at?: number | null;
+  /** 服务端写：唤醒失败原因（客户端不可写）。 */
+  wake_error?: string | null;
+  /** 服务端写：调度器退避截止（epoch seconds，客户端不可写）。 */
+  wake_next_try_at?: number | null;
   /** 手动把固化条目标记为 verified 的 workbench 自有 overlay。 */
   solidified_verified?: SolidifiedVerifiedEntry[];
   [key: string]: unknown;
@@ -60,6 +69,7 @@ export type WorkbenchErrorCode =
   | "upstream_unavailable"
   | "dispatch_failed"
   | "dispatch_timeout"
+  | "wake_failed"
   | "create_failed"
   | "metadata_failed"
   | "not_in_review"
@@ -98,6 +108,7 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "upstream_unavailable",
   "dispatch_failed",
   "dispatch_timeout",
+  "wake_failed",
   "create_failed",
   "metadata_failed",
   "not_in_review",
@@ -158,6 +169,8 @@ export interface CreateTaskResult {
 export interface TaskMetadataPatch {
   bucket?: Bucket;
   contract?: WorkbenchContract;
+  /** epoch seconds；传 null 清除唤醒。 */
+  wake_at?: number | null;
 }
 
 /** 编辑卡片：标题走上游 PATCH，验收/上下文并入 workbench metadata。 */
@@ -184,6 +197,7 @@ function isWorkbenchCode(value: unknown): value is WorkbenchErrorCode {
 
 type ErrorContext =
   | "dispatch"
+  | "wake"
   | "create"
   | "metadata"
   | "task"
@@ -207,11 +221,15 @@ function fallbackCode(status: number | undefined, context: ErrorContext): Workbe
   }
   switch (status) {
     case 400:
-      return context === "dispatch" ? "missing_acceptance" : "invalid_request";
+      return context === "dispatch" || context === "wake"
+        ? "missing_acceptance"
+        : "invalid_request";
     case 404:
       return "not_found";
     case 409:
-      return context === "task" ? "not_in_store" : "not_in_review";
+      return context === "task" || context === "wake"
+        ? "not_in_store"
+        : "not_in_review";
     case 500:
       if (context === "dispatch") return "invalid_defaults";
       if (context === "create") return "create_failed";
@@ -226,6 +244,7 @@ function fallbackCode(status: number | undefined, context: ErrorContext): Workbe
       return "metadata_unavailable";
     default:
       if (context === "dispatch") return "dispatch_failed";
+      if (context === "wake") return "wake_failed";
       if (context === "create") return "create_failed";
       if (context === "verify") return "verify_failed";
       if (context === "inbox") return "inbox_failed";
@@ -248,6 +267,8 @@ function toWorkbenchError(error: unknown, context: ErrorContext = "dispatch"): W
 
 /** 派发请求的最长等待时间；超时后放弃并让调用方清理 pending 状态。 */
 const DISPATCH_TIMEOUT_MS = 5000;
+/** 唤醒请求的最长等待时间；后端预算同样 <3s。 */
+const WAKE_TIMEOUT_MS = 5000;
 
 function isAbortError(error: unknown): boolean {
   return (
@@ -301,6 +322,63 @@ export async function dispatchTask(taskId: string): Promise<DispatchResult> {
       throw new WorkbenchError("dispatch_timeout", "派发超时，请刷新后重试");
     }
     throw toWorkbenchError(error, "dispatch");
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
+  }
+}
+
+export interface WakeResult {
+  ok: true;
+  /** ready（无 parent）或 todo（有未完成 parent）。 */
+  status: string;
+  /** 只有进 ready 时才有位次/ETA。 */
+  position?: number;
+  eta?: string | null;
+}
+
+/**
+ * 手动提前唤醒仓库卡。后端与后台调度器共用同一 wake 逻辑；卡片必须仍在
+ * 仓库（triage/todo/scheduled），否则 409 not_in_store。
+ * 与 dispatchTask 一样最多等 5s：后端可能做一次 detail 读 + dispatch，
+ * 挂起时必须 abort，否则详情里的唤醒按钮会永久禁用。
+ */
+export async function wakeTask(taskId: string): Promise<WakeResult> {
+  if (!taskId || !taskId.trim()) {
+    throw new WorkbenchError("wake_failed", "缺少任务 id");
+  }
+  const controller = new AbortController();
+  let timer: number | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      controller.abort();
+      reject(new WorkbenchError("wake_failed", "唤醒超时，请刷新后重试"));
+    }, WAKE_TIMEOUT_MS);
+  });
+  try {
+    const data = (await Promise.race([
+      api(WORKBENCH + "/wake/" + encodeURIComponent(taskId), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+        signal: controller.signal,
+      }),
+      timeout,
+    ])) as Partial<WakeResult> | null;
+    if (!data || data.ok !== true || typeof data.status !== "string") {
+      throw new WorkbenchError("wake_failed", "唤醒响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      status: data.status,
+      position: typeof data.position === "number" ? data.position : undefined,
+      eta: typeof data.eta === "string" ? data.eta : null,
+    };
+  } catch (error) {
+    if (error instanceof WorkbenchError) throw error;
+    if (isAbortError(error)) {
+      throw new WorkbenchError("wake_failed", "唤醒超时，请刷新后重试");
+    }
+    throw toWorkbenchError(error, "wake");
   } finally {
     if (timer !== undefined) window.clearTimeout(timer);
   }

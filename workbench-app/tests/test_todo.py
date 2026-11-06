@@ -642,9 +642,10 @@ class UpdateTaskTests(TodoBackendTestCase):
             self.assertEqual(body["error"], "invalid_title")
         self.assertEqual(self.server.task(task_id)["title"], "校验标题")
 
-        code, body = self.patch_task(task_id, {"body": "正文"})
-        self.assertEqual(code, 400, body)
-        self.assertEqual(body["error"], "invalid_request")
+        for patch in ({"body": "正文"}, {"wake_at": 123}):
+            code, body = self.patch_task(task_id, patch)
+            self.assertEqual(code, 400, body)
+            self.assertEqual(body["error"], "invalid_request")
         code, body = self.patch_task(task_id, {})
         self.assertEqual(code, 400, body)
         self.assertEqual(body["error"], "invalid_request")
@@ -749,6 +750,14 @@ class UpdateMetadataTests(TodoBackendTestCase):
                 "invalid_contract",
             ),
             ({"contract": {"budget": {"unknown": 1}}}, "invalid_contract"),
+            # Story 3.3: wake_at is epoch seconds; wake_error/next are server-owned.
+            ({"wake_at": "tomorrow"}, "invalid_metadata"),
+            ({"wake_at": True}, "invalid_metadata"),
+            ({"wake_at": -1}, "invalid_metadata"),
+            ({"wake_at": 1.5}, "invalid_metadata"),
+            ({"wake_at": [1]}, "invalid_metadata"),
+            ({"wake_error": "client-owned"}, "invalid_metadata"),
+            ({"wake_next_try_at": 1}, "invalid_metadata"),
         ]
         for patch, error in invalid:
             with self.subTest(patch=patch):
@@ -779,6 +788,21 @@ class UpdateMetadataTests(TodoBackendTestCase):
         self.assertEqual(defaults["max_minutes"], 30)
         self.assertEqual(defaults["deny_paths"], ["/tmp/only"])
         self.assertEqual(defaults["max_cost"], base.VALID_DEFAULTS["budget"]["max_cost"])
+
+    def test_patch_can_set_and_clear_wake_at(self):
+        code, created = self.create("唤醒时间")
+        task_id = created["task"]["id"]
+
+        code, body = self.patch_metadata(task_id, {"wake_at": 1700000000})
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["metadata"]["wake_at"], 1700000000)
+        self.assertNotIn("wake_error", body["metadata"])
+        self.assertNotIn("wake_next_try_at", body["metadata"])
+
+        # null is the explicit clear form and removes the key entirely.
+        code, body = self.patch_metadata(task_id, {"wake_at": None})
+        self.assertEqual(code, 200, body)
+        self.assertNotIn("wake_at", body["metadata"])
 
     def test_patch_unknown_task_is_404_and_writes_nothing(self):
         code, body = self.patch_metadata("t_orphan", {"bucket": "long"})

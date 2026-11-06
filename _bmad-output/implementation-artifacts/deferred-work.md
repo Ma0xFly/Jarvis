@@ -112,3 +112,13 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-2-solidified.md`
   summary: solidified 的 type/status 枚举在 server、UI、README、SKILL、spec 五处重复，缺少跨语言 schema 或 cross-check 测试。
   evidence: `workbench-app/server.py:141-142`、`workbench-ui/src/api/workbench.ts:490-491`、`workbench-app/README.md`、`~/.hermes/skills/workbench-conventions/SKILL.md`、`spec-3-2-solidified.md`；一侧新增类型不会自动让其他侧失败。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-3-wake.md`
+  summary: 增加 `POST /api/workbench/wake/sweep` 手动触发与成功唤醒日志，便于运维和测试不等 30s 调度 tick。
+  evidence: 当前只有后台 `WakeScheduler`；`wake_due` 成功不写日志。3.3 review R18，属可观测性增强。
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-3-wake.md`
+  summary: legacy triage/todo 卡缺验收时 wake 只返回 400，不停车到 scheduled，仍可能被上游 triage specifier/recompute_ready 接走。
+  evidence: `wake_task` 对 STORE_STATUSES 放行；缺验收不 PATCH；新仓库卡走 scheduled，遗留卡需迁移或额外 guard。3.3 review R19。
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-3-wake.md`
+  summary: 外部写入的 malformed `wake_at` 被 due query 静默跳过，无日志/清理。
+  evidence: `due_wake_tasks` 只选 integer；`_has_wake_at` 只用于清理；3.3 review R22。

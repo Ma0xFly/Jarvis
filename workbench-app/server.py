@@ -109,10 +109,14 @@ MAX_COST = 1000
 MAX_MINUTES_PER_TASK = 1440
 GATE_UPSTREAM_TIMEOUT = 0.75
 BUCKETS = ("today", "long")
-METADATA_PATCH_KEYS = ("bucket", "contract")
+METADATA_PATCH_KEYS = ("bucket", "contract", "wake_at")
+STORE_STATUSES = ("triage", "todo", "scheduled")
+WAKE_CLEAR_KEYS = ("wake_at", "wake_error", "wake_next_try_at")
 MAX_TITLE_CHARS = 500
 MAX_ACCEPT_CHARS = 2000
 MAX_INPUT_CHARS = 4000
+# 2100-01-01T00:00:00Z; also rejects epoch-millisecond values.
+MAX_WAKE_AT = 4102444800
 MAX_DENY_PATHS = 100
 MAX_REQUEST_BYTES = 64 * 1024
 MAX_IDEMPOTENCY_KEY = 128
@@ -135,6 +139,13 @@ AUTO_COLLECT_COMMENT = "48h 自动收"
 AUTO_COLLECT_AUDIT_SUMMARY = "48h 自动收（worker 自述保留在 review_requested 事件/run）"
 MAX_REJECT_REASON_CHARS = 2000
 VERIFY_AUTHOR = "workbench"
+# Scheduled wake (Story 3.3): repository cards may carry a top-level ``wake_at``
+# in workbench metadata. The background scheduler only scans that key, so a
+# native Hermes ``scheduled`` card is never touched. Failures keep the card in
+# the store and back off instead of retrying every sweep.
+WAKE_SWEEP_SECONDS = 30
+WAKE_RETRY_SECONDS = 60
+WAKE_MISSING_ACCEPTANCE_SECONDS = 5 * 60
 # Solidified handoff (Story 3.2): workers register reusable assets on the run
 # that closes the card. Only the latest run counts; invalid entries are ignored
 # so a malformed handoff never blocks reject/skip or the 48h auto-collect.
@@ -297,12 +308,30 @@ def build_contract_snapshot(defaults: dict[str, Any], metadata: Any) -> dict[str
     }
 
 
+def _clear_wake_failure_keys(patch: dict[str, Any]) -> None:
+    """Successful schedule/acceptance edits clear server-owned wake failure.
+
+    The client may not write ``wake_error`` / ``wake_next_try_at`` directly, so
+    the server adds the removal here. A new ``wake_at`` always resets the
+    previous failure; a non-empty ``contract.accept`` does too because the next
+    sweep can now dispatch.
+    """
+    contract = patch.get("contract")
+    accept = contract.get("accept") if isinstance(contract, dict) else None
+    if "wake_at" in patch or (isinstance(accept, str) and accept.strip()):
+        patch.setdefault("wake_error", None)
+        patch.setdefault("wake_next_try_at", None)
+
+
 def validate_metadata_patch(raw: Any) -> tuple[Optional[dict[str, Any]], Optional[str]]:
     """Validate a client metadata patch for ``task_metadata``.
 
-    Only ``bucket`` and ``contract`` are writable. ``contract_defaults`` is a
-    server-owned dispatch snapshot and must never be accepted from a client.
-    Returns ``(patch, None)`` on success or ``(None, error_code)``.
+    Only ``bucket``, ``contract`` and ``wake_at`` are writable.
+    ``contract_defaults`` is a server-owned dispatch snapshot and must never be
+    accepted from a client; ``wake_error`` / ``wake_next_try_at`` are likewise
+    server-owned scheduling bookkeeping. ``wake_at`` is epoch seconds (or
+    ``null`` to clear it). Returns ``(patch, None)`` on success or
+    ``(None, error_code)``.
     """
     if not isinstance(raw, dict) or not raw:
         return None, "invalid_metadata"
@@ -358,6 +387,22 @@ def validate_metadata_patch(raw: Any) -> tuple[Optional[dict[str, Any]], Optiona
             else:
                 return None, "invalid_contract"
         patch["contract"] = contract_patch
+
+    if "wake_at" in raw:
+        wake_at = raw["wake_at"]
+        if wake_at is not None:
+            if (
+                isinstance(wake_at, bool)
+                or not isinstance(wake_at, int)
+                or wake_at < 0
+                or wake_at > MAX_WAKE_AT
+            ):
+                return None, "invalid_metadata"
+            patch["wake_at"] = int(wake_at)
+        else:
+            # JSON Merge Patch (json_patch) removes a key when the value is
+            # null, so this is the explicit "clear wake time" form.
+            patch["wake_at"] = None
 
     if not patch:
         return None, "invalid_metadata"
@@ -489,6 +534,42 @@ class MetadataStore:
             if decoded is not None:
                 out[task_id] = decoded
         return out
+
+    def due_wake_tasks(self, now: int) -> list[str]:
+        """Task ids whose ``wake_at`` is due and not inside a retry backoff.
+
+        JSON1 predicates keep the scan inside SQLite: only rows with a real
+        integer ``wake_at`` are candidates (a native Hermes ``scheduled`` card
+        has no workbench metadata row, so it is never selected). A corrupt
+        ``wake_next_try_at`` type is treated as "no backoff" rather than
+        blocking the card forever.
+        """
+        cutoff = int(now)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id FROM task_metadata "
+                "WHERE json_valid(metadata) "
+                "AND CASE WHEN json_valid(metadata) "
+                "         THEN CASE WHEN json_type(metadata, '$.wake_at') = 'integer' "
+                "                   THEN json_extract(metadata, '$.wake_at') BETWEEN 0 AND ? "
+                "                   ELSE 0 END "
+                "         ELSE 0 END "
+                "AND CASE WHEN json_valid(metadata) "
+                "         THEN CASE WHEN json_type(metadata, '$.wake_next_try_at') = 'integer' "
+                "                   THEN json_extract(metadata, '$.wake_next_try_at') <= ? "
+                "                   ELSE 1 END "
+                "         ELSE 1 END "
+                "ORDER BY CASE WHEN json_valid(metadata) "
+                "              THEN json_extract(metadata, '$.wake_at') ELSE 0 END, task_id",
+                (cutoff, cutoff),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            self._ready = False
+            raise MetadataUnavailable(str(exc)) from exc
+        finally:
+            conn.close()
+        return [row[0] for row in rows]
 
     def merge(self, task_id: str, patch: dict[str, Any]) -> dict[str, Any]:
         """Merge a validated patch with ``json_patch`` (JSON1).
@@ -2768,7 +2849,7 @@ class WorkbenchService:
         return 200, {"ok": True, "task": fresh, "metadata": merged}
 
     def update_metadata(self, task_id: str, raw: Any) -> tuple[int, dict[str, Any]]:
-        """Validate and merge a client metadata patch (bucket / contract).
+        """Validate and merge a client metadata patch (bucket / contract / wake_at).
 
         The upstream task must exist (no arbitrary-id upsert). The per-task
         lock serialises this write with dispatch for the same card, so
@@ -2793,6 +2874,7 @@ class WorkbenchService:
             patch, error = validate_metadata_patch(raw)
             if patch is None:
                 return self._fail(400, error or "invalid_metadata")
+            _clear_wake_failure_keys(patch)
             try:
                 merged = self.store.merge(normalized, patch)
             except MetadataUnavailable:
@@ -2830,6 +2912,7 @@ class WorkbenchService:
             metadata_patch, error = validate_metadata_patch(metadata_raw)
             if metadata_patch is None:
                 return self._fail(400, error or "invalid_metadata")
+            _clear_wake_failure_keys(metadata_patch)
         if title is None and metadata_patch is None:
             return self._fail(400, "invalid_request")
 
@@ -2927,7 +3010,13 @@ class WorkbenchService:
         # concurrent update_metadata for this card cannot clear acceptance
         # after the gate has approved it.
         with self._task_lock(task_id):
-            return self._dispatch_locked(task_id)
+            result = self._dispatch_locked(task_id)
+            # A manual drag-dispatch also leaves the repository (or was already
+            # away); stale wake bookkeeping must not survive that move. Clear
+            # it only after a successful dispatch so a 409 keeps the schedule.
+            if result[0] == 200:
+                self._clear_wake_fields(task_id)
+            return result
 
     def _acceptance_after_landing(
         self, task_id: str, write: SnapshotWrite
@@ -3099,6 +3188,314 @@ class WorkbenchService:
         self._rollback(write)
         return self._landing_error(actual, task)
 
+    # -- scheduled wake (Story 3.3) ---------------------------------------
+
+    @staticmethod
+    def _has_wake_at(metadata: Any) -> bool:
+        if not isinstance(metadata, dict):
+            return False
+        wake_at = metadata.get("wake_at")
+        return (
+            isinstance(wake_at, int)
+            and not isinstance(wake_at, bool)
+            and wake_at >= 0
+        )
+
+    def _clear_wake_fields(self, task_id: str) -> bool:
+        """Remove ``wake_at`` and the server-owned retry bookkeeping.
+
+        ``json_patch`` treats null as "remove key", so the metadata response
+        stops advertising a wake schedule after the card leaves the store.
+        """
+        try:
+            current = self.store.get(task_id)
+            if not isinstance(current, dict) or not any(
+                key in current for key in WAKE_CLEAR_KEYS
+            ):
+                return True
+            self.store.merge(task_id, {key: None for key in WAKE_CLEAR_KEYS})
+            return True
+        except MetadataUnavailable as exc:
+            print(
+                f"workbench: wake field cleanup failed for {task_id}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+
+    def _set_wake_failure(
+        self, task_id: str, error: str, delay_seconds: int, now: float
+    ) -> None:
+        # wake_at stays untouched; only the scheduler-owned next-try gate moves.
+        try:
+            self.store.merge(
+                task_id,
+                {
+                    "wake_error": error,
+                    "wake_next_try_at": int(now) + int(delay_seconds),
+                },
+            )
+        except MetadataUnavailable as exc:
+            print(
+                f"workbench: wake backoff write failed for {task_id}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _wake_to_todo(
+        self, task_id: str, now: float, has_wake: bool
+    ) -> tuple[int, dict[str, Any]]:
+        """A due card with unfinished parents goes to ``todo``, not ``ready``."""
+        deadline = time.monotonic() + DISPATCH_BUDGET_SECONDS
+        try:
+            patched = self._patch_status(task_id, "todo", deadline)
+        except UpstreamUnavailable:
+            if has_wake:
+                self._set_wake_failure(
+                    task_id, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                )
+            return self._fail(502, "upstream_unavailable")
+        if patched.status == 404:
+            if has_wake:
+                self._clear_wake_fields(task_id)
+            return self._fail(404, "not_found")
+        if patched.status != 200:
+            if has_wake:
+                self._set_wake_failure(
+                    task_id, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                )
+            return self._fail(502, "upstream_unavailable")
+
+        # A 200 PATCH is not proof of the landing; re-read before clearing the
+        # schedule so a silent upstream refusal cannot lose the wake time.
+        try:
+            landed = self._get_task(
+                task_id, time.monotonic() + DISPATCH_BUDGET_SECONDS
+            )
+        except UpstreamUnavailable:
+            if has_wake:
+                self._set_wake_failure(
+                    task_id, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                )
+            return self._fail(502, "upstream_unavailable")
+        if landed.status == 404:
+            if has_wake:
+                self._clear_wake_fields(task_id)
+            return self._fail(404, "not_found")
+        landed_task = landed.data.get("task") if isinstance(landed.data, dict) else None
+        actual = landed_task.get("status") if isinstance(landed_task, dict) else None
+        if landed.status != 200 or actual != "todo":
+            if has_wake:
+                self._set_wake_failure(
+                    task_id, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                )
+            return self._fail(502, "upstream_unavailable")
+
+        if has_wake:
+            # The card is already home in todo; a metadata write failure only
+            # leaves stale bookkeeping for the next sweep to clear.
+            self._clear_wake_fields(task_id)
+        return 200, {"ok": True, "status": "todo"}
+
+    @staticmethod
+    def _wake_is_due(metadata: Any, now: float) -> bool:
+        """Re-check the schedule after the due scan, under the task lock.
+
+        The scan only returns ids; a user can clear or postpone ``wake_at``
+        between that read and this one, so the scheduler must not wake a card
+        whose schedule moved. A future or absent ``wake_at`` is "not due"; so
+        is an active ``wake_next_try_at`` backoff.
+        """
+        if not isinstance(metadata, dict):
+            return False
+        wake_at = metadata.get("wake_at")
+        if (
+            not isinstance(wake_at, int)
+            or isinstance(wake_at, bool)
+            or wake_at < 0
+            or wake_at > int(now)
+        ):
+            return False
+        next_try = metadata.get("wake_next_try_at")
+        if (
+            isinstance(next_try, int)
+            and not isinstance(next_try, bool)
+            and next_try > int(now)
+        ):
+            return False
+        return True
+
+    def wake_task(
+        self, task_id: str, *, require_due: bool = False
+    ) -> tuple[int, dict[str, Any]]:
+        """Wake one repository card now.
+
+        Shared by the due-card scheduler and ``POST /api/workbench/wake/{id}``:
+        the caller may invoke it before ``wake_next_try_at`` (manual "wake
+        now"). The scheduler passes ``require_due=True`` so a schedule cleared
+        or postponed after the scan is skipped under the task lock.
+        ``_dispatch_locked`` is reused because this method already holds the
+        per-task lock; calling ``dispatch()`` would re-enter a plain Lock.
+        """
+        normalized = task_id.strip() if isinstance(task_id, str) else ""
+        if not normalized:
+            return self._fail(400, "invalid_request")
+        with self._task_lock(normalized):
+            now = time.time()
+            try:
+                metadata = self.store.get(normalized)
+            except MetadataUnavailable:
+                return self._fail(503, "metadata_unavailable")
+            has_wake = self._has_wake_at(metadata)
+            if require_due and not self._wake_is_due(metadata, now):
+                return 200, {"ok": True, "skipped": "not_due"}
+
+            try:
+                # The full detail carries ``links``/``link_tasks`` (the task
+                # object alone does not), which is what parent detection needs.
+                detail = self._task_detail(
+                    normalized, time.monotonic() + DISPATCH_BUDGET_SECONDS
+                )
+            except TaskNotFound:
+                if has_wake:
+                    self._clear_wake_fields(normalized)
+                return self._fail(404, "not_found")
+            except UpstreamUnavailable:
+                if has_wake:
+                    self._set_wake_failure(
+                        normalized, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                    )
+                return self._fail(502, "upstream_unavailable")
+            task = detail.get("task")
+            if not isinstance(task, dict):
+                if has_wake:
+                    self._set_wake_failure(
+                        normalized, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                    )
+                return self._fail(502, "upstream_unavailable")
+            task = {
+                **task,
+                "links": detail.get("links")
+                if detail.get("links") is not None
+                else task.get("links"),
+                "link_tasks": detail.get("link_tasks")
+                if detail.get("link_tasks") is not None
+                else task.get("link_tasks"),
+            }
+
+            status = task.get("status")
+            if status not in STORE_STATUSES:
+                # Manual dispatch / upstream movement already took the card out
+                # of the repository; drop stale schedule fields so a repeated
+                # scan stays idempotent.
+                if has_wake:
+                    self._clear_wake_fields(normalized)
+                return self._fail(
+                    409, "not_in_store", status if isinstance(status, str) else None
+                )
+
+            if not extract_accept(metadata):
+                if has_wake:
+                    self._set_wake_failure(
+                        normalized,
+                        "missing_acceptance",
+                        WAKE_MISSING_ACCEPTANCE_SECONDS,
+                        now,
+                    )
+                return self._fail(400, "missing_acceptance")
+
+            if self._has_open_parents(task):
+                return self._wake_to_todo(normalized, now, has_wake)
+
+            status_code, payload = self._dispatch_locked(normalized)
+            if status_code == 200:
+                # The card already left the repository; a metadata write
+                # failure only leaves stale bookkeeping for the next sweep,
+                # so the wake itself still succeeded.
+                if has_wake:
+                    self._clear_wake_fields(normalized)
+                return status_code, payload
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if error == "missing_acceptance":
+                if has_wake:
+                    self._set_wake_failure(
+                        normalized,
+                        "missing_acceptance",
+                        WAKE_MISSING_ACCEPTANCE_SECONDS,
+                        now,
+                    )
+                return self._fail(400, "missing_acceptance")
+            if error == "blocked_by_parent":
+                return self._wake_to_todo(normalized, now, has_wake)
+            if error == "not_ready" and payload.get("status") == "todo":
+                # A race with upstream's parent gate can land the card in todo
+                # while the dispatch PATCH reports a refusal; that is the same
+                # outcome as an explicit todo wake.
+                if has_wake:
+                    self._clear_wake_fields(normalized)
+                return 200, {"ok": True, "status": "todo"}
+            if status_code == 404:
+                if has_wake:
+                    self._clear_wake_fields(normalized)
+                return self._fail(404, "not_found")
+            if status_code == 503:
+                # The metadata store is unavailable; the card never left the
+                # repository, so keep its schedule for the next sweep.
+                return status_code, payload
+            if status_code == 409:
+                # ``not_in_store`` means another path moved the card out;
+                # drop stale keys. Other 409s keep it scheduled, so preserve
+                # the schedule and back off instead of dropping it.
+                if error == "not_in_store":
+                    if has_wake:
+                        self._clear_wake_fields(normalized)
+                    return status_code, payload
+                if has_wake:
+                    self._set_wake_failure(
+                        normalized,
+                        error if isinstance(error, str) else "not_ready",
+                        WAKE_RETRY_SECONDS,
+                        now,
+                    )
+                return status_code, payload
+            if status_code == 500 and error == "invalid_defaults":
+                # A defaults configuration error will not fix itself on the
+                # next 30s tick; back off and surface the real error code.
+                if has_wake:
+                    self._set_wake_failure(
+                        normalized, "invalid_defaults", WAKE_RETRY_SECONDS, now
+                    )
+                return status_code, payload
+            if has_wake:
+                self._set_wake_failure(
+                    normalized, "upstream_unavailable", WAKE_RETRY_SECONDS, now
+                )
+            return self._fail(502, "upstream_unavailable")
+
+    def wake_due(self, now: Optional[float] = None) -> int:
+        """Run one scheduler pass; never raises (a daemon must keep ticking)."""
+        timestamp = int(time.time() if now is None else now)
+        try:
+            due = self.store.due_wake_tasks(timestamp)
+        except MetadataUnavailable as exc:
+            print(f"workbench: wake scan failed: {exc}", file=sys.stderr, flush=True)
+            return 0
+        attempted = 0
+        for task_id in due:
+            try:
+                _, payload = self.wake_task(task_id, require_due=True)
+            except Exception as exc:  # keep one bad card from stopping the sweep
+                print(
+                    f"workbench: wake failed for {task_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                continue
+            if isinstance(payload, dict) and payload.get("skipped"):
+                continue
+            attempted += 1
+        return attempted
+
 
 class ReviewSweeper:
     """Daemon thread that auto-accepts review cards older than 48h.
@@ -3139,6 +3536,39 @@ class ReviewSweeper:
                         self.service.sweep_reviews()
             except Exception as exc:  # a daemon thread must never die silently
                 print(f"workbench: review sweep failed: {exc}", file=sys.stderr, flush=True)
+
+
+class WakeScheduler:
+    """Daemon thread that wakes due repository cards.
+
+    It mirrors ``ReviewSweeper``: the first pass waits one interval, and one
+    failing card never stops the loop. Only workbench metadata rows with
+    ``wake_at`` are considered (see ``MetadataStore.due_wake_tasks``).
+    """
+
+    def __init__(self, service: WorkbenchService, interval_seconds: float) -> None:
+        self.service = service
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="workbench-wake-scheduler", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                self.service.wake_due()
+            except Exception as exc:  # a daemon thread must never die silently
+                print(f"workbench: wake sweep failed: {exc}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -3477,6 +3907,37 @@ def _env_sweep_seconds() -> float:
     return min(value, 86400.0)
 
 
+def _env_wake_sweep_seconds() -> float:
+    """Wake sweep interval: finite >0 (capped at a day), otherwise disabled.
+
+    An explicit ``0`` is the documented off switch; malformed or negative
+    values also disable the scheduler but log a warning, so a typo does not
+    look like a deliberate shutdown.
+    """
+    raw = os.environ.get("WORKBENCH_WAKE_SWEEP_SECONDS", "").strip()
+    if not raw:
+        return float(WAKE_SWEEP_SECONDS)
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"workbench: invalid WORKBENCH_WAKE_SWEEP_SECONDS={raw!r}; "
+            "wake scheduler disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0.0
+    if not math.isfinite(value) or value < 0:
+        print(
+            f"workbench: invalid WORKBENCH_WAKE_SWEEP_SECONDS={raw!r}; "
+            "wake scheduler disabled",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 0.0
+    return min(value, 86400.0)
+
+
 def _env_positive_int(name: str, default: int, *, minimum: int = 1, maximum: int = 1000) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -3636,6 +4097,15 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
         sweeper.start()
         app.router.add_event_handler("shutdown", sweeper.stop)
 
+    # Wake scheduling is independent of the review/notification lock: each
+    # wake takes the per-task lock through ``wake_task``.
+    wake_seconds = _env_wake_sweep_seconds()
+    wake_scheduler: Optional[WakeScheduler] = None
+    if wake_seconds > 0:
+        wake_scheduler = WakeScheduler(service, wake_seconds)
+        wake_scheduler.start()
+        app.router.add_event_handler("shutdown", wake_scheduler.stop)
+
     notification_engine = NotificationEngine(
         verify=service.verify,
         review_ttl_seconds=review_ttl_seconds,
@@ -3756,6 +4226,14 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
         if guard is not None:
             return guard
         status_code, payload = service.dispatch(task_id)
+        return JSONResponse(payload, status_code=status_code)
+
+    @app.post("/api/workbench/wake/{task_id}")
+    async def wake(task_id: str, request: Request) -> JSONResponse:
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        status_code, payload = await run_in_threadpool(service.wake_task, task_id)
         return JSONResponse(payload, status_code=status_code)
 
     @app.get("/api/workbench/metadata")

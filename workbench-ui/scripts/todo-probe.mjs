@@ -1931,6 +1931,260 @@ async function main() {
       )).data?.[createdCard.id]?.bucket === "today",
     );
 
+    // ---- 7d. 定时唤醒：chip / 设置 / 清除 / 提前唤醒 / 错误态 --------
+    const wakeCard = await createUpstream("定时唤醒卡");
+    setKanbanStatus(wakeCard, "scheduled");
+    await setMetadata(wakeCard, {
+      bucket: "today",
+      contract: { accept: "到点自动跑" },
+      wake_at: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const wakeErrorCard = await createUpstream("缺验收唤醒卡");
+    setKanbanStatus(wakeErrorCard, "scheduled");
+    await setMetadata(wakeErrorCard, {
+      bucket: "today",
+      contract: { input: "", accept: "", ready: false },
+      wake_at: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const wakeMetadata = async (taskId) =>
+      (await httpJson(
+        "GET",
+        `${base}/api/workbench/metadata?ids=${encodeURIComponent(taskId)}`,
+      )).data?.[taskId];
+
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) => node.textContent.includes('定时唤醒卡'))`,
+      12000,
+      "唤醒卡经轮询出现",
+    );
+    const wakeChip = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('定时唤醒卡'));
+      const chip = card?.querySelector('.wb-todo-wake');
+      return { text: chip?.textContent || '', hasChip: Boolean(chip) };
+    })()`);
+    check(
+      "仓库卡显示唤醒时间 chip",
+      wakeChip.hasChip === true &&
+        /^将于 (\d{2}-\d{2} )?\d{2}:\d{2} 唤醒$/.test(wakeChip.text),
+      JSON.stringify(wakeChip),
+    );
+    const noWakeChip = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('探针改名卡'));
+      return Boolean(card) && !card.querySelector('.wb-todo-wake');
+    })()`);
+    check("未设置 wake_at 的仓库卡无唤醒 chip", noWakeChip === true);
+
+    await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('定时唤醒卡'));
+      card?.querySelector('.wb-todo-title-link')?.click();
+      return true;
+    })()`);
+    await waitForEval("Boolean(document.querySelector('.wb-detail-wake'))", 5000, "唤醒详情区");
+    const wakePanel = await evaluate(`(() => ({
+      input: document.querySelector('.wb-detail-wake-input')?.value || '',
+      buttons: [...document.querySelectorAll('.wb-detail-wake button')]
+        .map((node) => node.textContent.trim()),
+      hint: document.querySelector('.wb-detail-wake-hint')?.textContent || '',
+    }))()`);
+    check(
+      "详情显示唤醒时间/快捷设置/清除/提前唤醒",
+      wakePanel.input.length > 0 &&
+        ["5 分钟后", "设置", "清除", "提前唤醒"].every((label) =>
+          wakePanel.buttons.includes(label),
+        ),
+      JSON.stringify(wakePanel),
+    );
+
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '5 分钟后')?.click(); true`,
+    );
+    const wakeSetFrom = Math.floor(Date.now() / 1000);
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '设置')?.click(); true`,
+    );
+    await waitFor(
+      async () => {
+        const meta = await wakeMetadata(wakeCard);
+        return (
+          typeof meta?.wake_at === "number" &&
+          meta.wake_at >= wakeSetFrom + 300 &&
+          meta.wake_at <= wakeSetFrom + 420
+        );
+      },
+      { timeout: 5000, label: "设置唤醒时间" },
+    );
+    const wakeSetMeta = await wakeMetadata(wakeCard);
+    check(
+      "详情「5 分钟后 + 设置」写入 wake_at",
+      typeof wakeSetMeta?.wake_at === "number",
+      JSON.stringify(wakeSetMeta),
+    );
+
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '清除')?.click(); true`,
+    );
+    await waitFor(
+      async () => {
+        const meta = await wakeMetadata(wakeCard);
+        return Boolean(meta) && !("wake_at" in meta) && !("wake_error" in meta);
+      },
+      { timeout: 5000, label: "清除唤醒时间" },
+    );
+    const clearedChip = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('定时唤醒卡'));
+      return Boolean(card) && !card.querySelector('.wb-todo-wake');
+    })()`);
+    check("清除后仓库卡 chip 消失", clearedChip === true);
+
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '5 分钟后')?.click(); true`,
+    );
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '设置')?.click(); true`,
+    );
+    await waitFor(
+      async () => typeof (await wakeMetadata(wakeCard))?.wake_at === "number",
+      { timeout: 5000, label: "再次设置唤醒时间" },
+    );
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '提前唤醒')?.click(); true`,
+    );
+    await waitForEval(
+      "(document.querySelector('.wb-toast')?.textContent || '').includes('队列第')",
+      5000,
+      "提前唤醒回执",
+    );
+    const wakeToast = await evaluate(
+      "document.querySelector('.wb-toast')?.textContent || ''",
+    );
+    check(
+      "提前唤醒回执显示位次/ETA",
+      wakeToast.includes("队列第"),
+      wakeToast,
+    );
+    await waitFor(
+      async () => {
+        const task = (await httpJson(
+          "GET",
+          `${base}/api/plugins/kanban/tasks/${encodeURIComponent(wakeCard)}`,
+        )).data?.task;
+        return task?.status === "ready";
+      },
+      { timeout: 8000, label: "提前唤醒进 ready" },
+    );
+    await waitFor(
+      async () => {
+        const meta = await wakeMetadata(wakeCard);
+        return Boolean(meta) && !("wake_at" in meta) && !("wake_next_try_at" in meta);
+      },
+      { timeout: 5000, label: "提前唤醒清空 wake 字段" },
+    );
+    const wokenMeta = await wakeMetadata(wakeCard);
+    check(
+      "提前唤醒进 ready 并清空 wake 字段",
+      wokenMeta?.contract_defaults !== undefined &&
+        !("wake_at" in wokenMeta) &&
+        !("wake_error" in wokenMeta),
+      JSON.stringify(wokenMeta),
+    );
+    if (await evaluate("Boolean(document.querySelector('.wb-detail-close'))")) {
+      await evaluate("document.querySelector('.wb-detail-close').click(); true");
+      await waitForEval("!Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "关闭唤醒详情");
+    }
+
+    await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('缺验收唤醒卡'));
+      card?.querySelector('.wb-todo-title-link')?.click();
+      return true;
+    })()`);
+    await waitForEval("Boolean(document.querySelector('.wb-detail-wake'))", 5000, "缺验收唤醒详情");
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-wake button')]
+        .find((node) => node.textContent.trim() === '提前唤醒')?.click(); true`,
+    );
+    await waitForEval(
+      "Boolean(document.querySelector('.wb-detail-wake-error'))",
+      5000,
+      "缺验收唤醒错误",
+    );
+    const wakeErrorState = await evaluate(`(() => ({
+      text: document.querySelector('.wb-detail-wake-error')?.textContent || '',
+      badge: document.querySelector('.wb-detail-badge')?.textContent || '',
+    }))()`);
+    check(
+      "缺验收提前唤醒显示警示且卡留仓库",
+      wakeErrorState.text.includes("缺验收") && wakeErrorState.badge.includes("已排期"),
+      JSON.stringify(wakeErrorState),
+    );
+    const wakeErrorMeta = await wakeMetadata(wakeErrorCard);
+    const wakeErrorStatus = (await httpJson(
+      "GET",
+      `${base}/api/plugins/kanban/tasks/${encodeURIComponent(wakeErrorCard)}`,
+    )).data?.task?.status;
+    check(
+      "缺验收唤醒写 wake_error 并退避，不派发",
+      wakeErrorStatus === "scheduled" &&
+        wakeErrorMeta?.wake_error === "missing_acceptance" &&
+        typeof wakeErrorMeta?.wake_at === "number" &&
+        typeof wakeErrorMeta?.wake_next_try_at === "number",
+      JSON.stringify({ status: wakeErrorStatus, metadata: wakeErrorMeta }),
+    );
+    await evaluate("document.querySelector('.wb-detail-close').click(); true");
+    await waitForEval("!Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "关闭缺验收详情");
+
+    // The error now comes from server metadata, not the local click handler:
+    // the repository card must show it, and reopening the drawer must render
+    // the same server-owned wake_error without another action.
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-todo-repo-card')]
+        .some((node) =>
+          node.textContent.includes('缺验收唤醒卡') &&
+          node.querySelector('.wb-todo-wake-error')
+        )`,
+      5000,
+      "仓库卡 wake_error",
+    );
+    const cardWakeError = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('缺验收唤醒卡'));
+      return card?.querySelector('.wb-todo-wake-error')?.textContent || '';
+    })()`);
+    check(
+      "仓库卡显示 wake_error 和下次重试时间",
+      cardWakeError.includes("缺验收") && /\d{2}:\d{2}/.test(cardWakeError),
+      cardWakeError,
+    );
+
+    await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('缺验收唤醒卡'));
+      card?.querySelector('.wb-todo-title-link')?.click();
+      return true;
+    })()`);
+    await waitForEval("Boolean(document.querySelector('.wb-detail-wake-error'))", 5000, "重开缺验收详情");
+    const reopenedWakeError = await evaluate(
+      "document.querySelector('.wb-detail-wake-error')?.textContent || ''",
+    );
+    check(
+      "重开详情仍显示服务端 wake_error",
+      reopenedWakeError.includes("缺验收"),
+      reopenedWakeError,
+    );
+    await evaluate("document.querySelector('.wb-detail-close').click(); true");
+    await waitForEval("!Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "再次关闭缺验收详情");
+
     // ---- 8. 409 result re-check (dispatch + live receipt done in 5c) --
     check(
       "409 卡回到仓库（等 parent）",
