@@ -154,6 +154,19 @@ export interface TaskMetadataPatch {
   contract?: WorkbenchContract;
 }
 
+/** 编辑卡片：标题走上游 PATCH，验收/上下文并入 workbench metadata。 */
+export interface TaskCardPatch {
+  title?: string;
+  bucket?: Bucket;
+  contract?: WorkbenchContract;
+}
+
+export interface TaskCardUpdateResult {
+  ok: true;
+  task: CreatedTask;
+  metadata: TaskMetadata;
+}
+
 interface ApiErrorLike extends Error {
   code?: unknown;
   status?: unknown;
@@ -167,6 +180,7 @@ type ErrorContext =
   | "dispatch"
   | "create"
   | "metadata"
+  | "task"
   | "verify"
   | "inbox"
   | "sweep"
@@ -343,6 +357,43 @@ export async function updateTaskMetadata(
     return data.metadata as TaskMetadata;
   } catch (error) {
     throw toWorkbenchError(error, "metadata");
+  }
+}
+
+/**
+ * 编辑一张卡：标题 + 验收/上下文一次提交。后端先 PATCH 上游标题（未变化
+ * 则跳过），再把 contract 并入 workbench.db；返回更新后的 task 与 metadata。
+ */
+export async function updateTaskCard(
+  taskId: string,
+  patch: TaskCardPatch,
+): Promise<TaskCardUpdateResult> {
+  if (!taskId || !taskId.trim()) {
+    throw new WorkbenchError("metadata_failed", "缺少任务 id");
+  }
+  try {
+    const data = (await api(WORKBENCH + "/tasks/" + encodeURIComponent(taskId), {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    })) as Partial<TaskCardUpdateResult> | null;
+    if (
+      !data ||
+      data.ok !== true ||
+      !data.task ||
+      typeof data.task.id !== "string" ||
+      !data.metadata ||
+      typeof data.metadata !== "object"
+    ) {
+      throw new WorkbenchError("metadata_failed", "编辑响应格式不正确", 200);
+    }
+    return {
+      ok: true,
+      task: data.task,
+      metadata: data.metadata as TaskMetadata,
+    };
+  } catch (error) {
+    throw toWorkbenchError(error, "task");
   }
 }
 

@@ -5,6 +5,7 @@ Covers the workbench-owned write endpoints introduced for the todo page:
 
 * ``POST /api/workbench/tasks`` — upstream store card (scheduled) + default metadata
 * ``PATCH /api/workbench/metadata/{task_id}`` — bucket / contract merge
+* ``PATCH /api/workbench/tasks/{task_id}`` — title + contract edit for the drawer
 
 The kanban + workbench DBs are throwaway temp files (see ``test_dispatch``),
 so nothing here touches the user's real kanban.db / workbench.db.
@@ -122,6 +123,13 @@ class TodoBackendTestCase(unittest.TestCase):
         return base.http_json(
             "PATCH",
             self.server.base + "/api/workbench/metadata/" + urlparse.quote(task_id, safe=""),
+            patch,
+        )
+
+    def patch_task(self, task_id: str, patch):
+        return base.http_json(
+            "PATCH",
+            self.server.base + "/api/workbench/tasks/" + urlparse.quote(task_id, safe=""),
             patch,
         )
 
@@ -447,6 +455,82 @@ class CreateTaskTests(TodoBackendTestCase):
         self.assertEqual(names, [])
         self.assertNotIn("metadata", columns)
         self.assertEqual(integrity, "ok")
+
+
+class UpdateTaskTests(TodoBackendTestCase):
+    def test_edit_title_and_contract_persist(self):
+        code, created = self.create("原始标题", bucket="today")
+        self.assertEqual(code, 200, created)
+        task_id = created["task"]["id"]
+
+        code, body = self.patch_task(
+            task_id,
+            {
+                "title": "  改名后的卡  ",
+                "contract": {"accept": "跑通测试", "input": "需求单"},
+            },
+        )
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["task"]["title"], "改名后的卡")
+        self.assertEqual(body["metadata"]["contract"]["accept"], "跑通测试")
+        self.assertEqual(body["metadata"]["contract"]["input"], "需求单")
+        # The title lives upstream, the contract stays workbench-owned.
+        self.assertEqual(self.server.task(task_id)["title"], "改名后的卡")
+        self.assertEqual(self.metadata(task_id)["contract"]["accept"], "跑通测试")
+
+    def test_title_only_keeps_bucket_and_contract(self):
+        code, created = self.create("只改标题", bucket="long")
+        self.assertEqual(code, 200, created)
+        task_id = created["task"]["id"]
+        code, _ = self.patch_metadata(task_id, {"contract": {"accept": "保留验收"}})
+        self.assertEqual(code, 200)
+
+        code, body = self.patch_task(task_id, {"title": "新标题"})
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["task"]["title"], "新标题")
+        self.assertEqual(body["metadata"]["bucket"], "long")
+        self.assertEqual(body["metadata"]["contract"]["accept"], "保留验收")
+        # No contract keys were sent: the merge must not drop siblings.
+        self.assertEqual(body["metadata"]["contract"]["input"], "")
+
+    def test_contract_only_does_not_require_title(self):
+        code, created = self.create("只改验收")
+        self.assertEqual(code, 200, created)
+        task_id = created["task"]["id"]
+
+        code, body = self.patch_task(task_id, {"contract": {"accept": "新验收"}})
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["task"]["title"], "只改验收")
+        self.assertEqual(self.metadata(task_id)["contract"]["accept"], "新验收")
+
+    def test_invalid_title_and_unknown_keys_are_400(self):
+        code, created = self.create("校验标题")
+        task_id = created["task"]["id"]
+
+        for patch in (
+            {"title": ""},
+            {"title": "   "},
+            {"title": "x" * 501},
+            {"title": 123},
+        ):
+            code, body = self.patch_task(task_id, patch)
+            self.assertEqual(code, 400, (patch, body))
+            self.assertEqual(body["error"], "invalid_title")
+        self.assertEqual(self.server.task(task_id)["title"], "校验标题")
+
+        code, body = self.patch_task(task_id, {"body": "正文"})
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body["error"], "invalid_request")
+        code, body = self.patch_task(task_id, {})
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body["error"], "invalid_request")
+
+    def test_unknown_task_is_404_and_writes_nothing(self):
+        before = self.metadata("t_missing")
+        code, body = self.patch_task("t_missing", {"title": "不存在的卡"})
+        self.assertEqual(code, 404, body)
+        self.assertEqual(body["error"], "not_found")
+        self.assertEqual(self.metadata("t_missing"), before)
 
 
 class UpdateMetadataTests(TodoBackendTestCase):

@@ -163,6 +163,45 @@
   word-break: break-word;
 }
 
+/* 仓库卡编辑：与只读正文同样的字号，输入控件保持 007 的低装饰。 */
+.wb-detail-input,
+.wb-detail-textarea {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--wb-fg);
+  background: var(--wb-card);
+  border: 1px solid var(--wb-border);
+  border-radius: 7px;
+  padding: 7px 9px;
+  outline: none;
+}
+.wb-detail-input:focus-visible,
+.wb-detail-textarea:focus-visible {
+  border-color: var(--wb-accent);
+  outline: 2px solid color-mix(in srgb, var(--wb-accent) 22%, transparent);
+  outline-offset: 0;
+}
+.wb-detail-input::placeholder,
+.wb-detail-textarea::placeholder {
+  color: var(--wb-faint);
+}
+.wb-detail-textarea {
+  resize: vertical;
+  min-height: 74px;
+}
+.wb-detail-error {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--wb-danger);
+}
+.wb-detail-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 .wb-detail-actions {
   flex: 0 0 auto;
   display: flex;

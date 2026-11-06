@@ -80,6 +80,7 @@ MAX_MINUTES_PER_TASK = 1440
 GATE_UPSTREAM_TIMEOUT = 0.75
 BUCKETS = ("today", "long")
 METADATA_PATCH_KEYS = ("bucket", "contract")
+MAX_TITLE_CHARS = 500
 MAX_ACCEPT_CHARS = 2000
 MAX_INPUT_CHARS = 4000
 MAX_DENY_PATHS = 100
@@ -2530,6 +2531,101 @@ class WorkbenchService:
                 return self._fail(503, "metadata_unavailable")
             return 200, {"ok": True, "metadata": merged}
 
+    def update_task(self, task_id: str, raw: Any) -> tuple[int, dict[str, Any]]:
+        """Edit a card's title and/or workbench metadata in one request.
+
+        The title lives upstream (kanban PATCH); ``bucket``/``contract`` stay
+        in workbench.db. The per-task lock serialises this write with dispatch,
+        exactly like ``update_metadata``. A metadata failure after a successful
+        title PATCH returns 503 plus the task id; retrying the same edit skips
+        the upstream write (title already matches) and finishes the merge.
+        """
+        normalized = task_id.strip() if isinstance(task_id, str) else ""
+        if not normalized:
+            return self._fail(400, "invalid_request")
+        if not isinstance(raw, dict) or not raw:
+            return self._fail(400, "invalid_request")
+        if set(raw) - {"title", "bucket", "contract"}:
+            return self._fail(400, "invalid_request")
+
+        title: Optional[str] = None
+        if "title" in raw:
+            value = raw["title"]
+            stripped = value.strip() if isinstance(value, str) else ""
+            if not stripped or len(stripped) > MAX_TITLE_CHARS:
+                return self._fail(400, "invalid_title")
+            title = stripped
+
+        metadata_patch: Optional[dict[str, Any]] = None
+        metadata_raw = {key: raw[key] for key in ("bucket", "contract") if key in raw}
+        if metadata_raw:
+            metadata_patch, error = validate_metadata_patch(metadata_raw)
+            if metadata_patch is None:
+                return self._fail(400, error or "invalid_metadata")
+        if title is None and metadata_patch is None:
+            return self._fail(400, "invalid_request")
+
+        with self._task_lock(normalized):
+            try:
+                fetched = self._get_task(
+                    normalized, time.monotonic() + GATE_UPSTREAM_TIMEOUT
+                )
+            except UpstreamUnavailable:
+                return self._fail(502, "upstream_unavailable")
+            if fetched.status == 404:
+                return self._fail(404, "not_found")
+            if (
+                fetched.status != 200
+                or not isinstance(fetched.data, dict)
+                or not isinstance(fetched.data.get("task"), dict)
+            ):
+                return self._fail(502, "upstream_unavailable")
+            task = fetched.data["task"]
+
+            # Only forward a real change: an unchanged title must not emit an
+            # upstream ``edited`` event on every drawer save.
+            if title is not None and title != task.get("title"):
+                try:
+                    patched = self._patch_task(
+                        normalized,
+                        {"title": title},
+                        time.monotonic() + GATE_UPSTREAM_TIMEOUT,
+                    )
+                except UpstreamUnavailable:
+                    return self._fail(502, "upstream_unavailable")
+                if patched.status == 404:
+                    return self._fail(404, "not_found")
+                if 400 <= patched.status < 500:
+                    detail = self._upstream_detail(patched.data)
+                    body: dict[str, Any] = {
+                        "ok": False,
+                        "error": "invalid_title",
+                        "upstream_status": patched.status,
+                    }
+                    if detail:
+                        body["detail"] = detail
+                    return 400, body
+                if patched.status != 200 or not isinstance(patched.data, dict):
+                    return self._fail(502, "upstream_unavailable")
+                patched_task = patched.data.get("task")
+                task = (
+                    patched_task
+                    if isinstance(patched_task, dict) and patched_task.get("id") == normalized
+                    else {**task, "title": title}
+                )
+
+            try:
+                existing = self.store.get(normalized)
+            except MetadataUnavailable:
+                return self._fail(503, "metadata_unavailable")
+            if metadata_patch is None:
+                return 200, {"ok": True, "task": task, "metadata": existing or {}}
+            try:
+                merged = self.store.merge(normalized, metadata_patch)
+            except MetadataUnavailable:
+                return self._fail(503, "metadata_unavailable")
+            return 200, {"ok": True, "task": task, "metadata": merged}
+
     def _landing_error(
         self, actual: str, task: dict[str, Any], detail: str = ""
     ) -> tuple[int, dict[str, Any]]:
@@ -3429,6 +3525,19 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
             payload.get("bucket", "today"),
             payload.get("idempotency_key"),
         )
+        return JSONResponse(body, status_code=status_code)
+
+    @app.patch("/api/workbench/tasks/{task_id}")
+    async def update_task(task_id: str, request: Request) -> JSONResponse:
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        payload, body_error = await _request_json_object(request)
+        if body_error is not None:
+            if body_error == "payload_too_large":
+                return _json_error(413, "payload_too_large")
+            return _json_error(400, "invalid_request")
+        status_code, body = await run_in_threadpool(service.update_task, task_id, payload)
         return JSONResponse(body, status_code=status_code)
 
     @app.get("/api/workbench/notifications")

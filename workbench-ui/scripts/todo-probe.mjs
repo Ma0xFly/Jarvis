@@ -625,6 +625,39 @@ async function main() {
         return true;
       })()`);
 
+    /** 分区右上角「＋ 新建」：打开该分区内的创建信息卡。 */
+    const openCreateCard = (storeLabel) =>
+      evaluate(`(async () => {
+        const section = [...document.querySelectorAll('.wb-todo-plane')]
+          .find((node) => node.querySelector('.wb-todo-cname')?.textContent === ${JSON.stringify(storeLabel)});
+        const button = section?.querySelector('.wb-todo-newbtn');
+        if (!button) return false;
+        button.click();
+        await new Promise((resolveWait) => setTimeout(resolveWait, 80));
+        return Boolean(section.querySelector('.wb-todo-create-card'));
+      })()`);
+
+    /** 新建卡字段：input/textarea 都走原生 setter + input 事件。 */
+    const setCreateField = (selector, value) =>
+      evaluate(`(() => {
+        const node = document.querySelector(${JSON.stringify(selector)});
+        if (!node) return false;
+        const proto = node.tagName === 'TEXTAREA'
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(node, ${JSON.stringify(value)});
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      })()`);
+
+    const submitCreateCard = () =>
+      evaluate(`(() => {
+        const button = document.querySelector('.wb-todo-create-btn.primary');
+        if (!button) return false;
+        button.click();
+        return true;
+      })()`);
+
     /** 看板：把卡片拖到指定列，返回 dragover 是否被接收（preventDefault）。 */
     const dragBoardCardToColumn = (title, columnLabel) =>
       evaluate(`(async () => {
@@ -844,7 +877,7 @@ async function main() {
       JSON.stringify(navViews),
     );
 
-    // 从看板点「新建待办」：切回待办并聚焦 composer。
+    // 从看板点「新建待办」：切回待办并打开今日新建信息卡。
     await evaluate(`(() => {
       const button = [...document.querySelectorAll('.wb-nav-btn')].find(
         (node) => node.querySelector('span')?.textContent === '看板',
@@ -855,16 +888,25 @@ async function main() {
     await new Promise((resolveWait) => setTimeout(resolveWait, 150));
     await evaluate("document.querySelector('.wb-newbtn').click(); true");
     await waitForEval(
-      "document.querySelector('.wb-pane:not(.wb-pane-hidden) .wb-todo-wrap') !== null && document.activeElement === document.querySelector('.wb-todo-composer input')",
+      "document.querySelector('.wb-pane:not(.wb-pane-hidden) .wb-todo-create-card') !== null && document.activeElement === document.querySelector('.wb-todo-create-title')",
       5000,
-      "新建待办聚焦 composer",
+      "新建待办打开今日新建卡",
     );
-    check("新建待办切到待办并聚焦 composer", true);
+    check("新建待办切到待办并打开今日新建卡", true);
     check(
       "新建待办后待办入口为 aria-current",
       (await evaluate(
         "document.querySelector('.wb-nav-btn[aria-current=\"page\"]')?.querySelector('span')?.textContent || ''",
       )) === "待办",
+    );
+    // 收起草稿，避免影响后续卡片计数与互拖用例。
+    await evaluate(
+      " [...document.querySelectorAll('.wb-todo-create-btn')].find((node) => node.textContent.trim() === '取消')?.click(); true",
+    );
+    await waitForEval(
+      "!document.querySelector('.wb-todo-create-card')",
+      3000,
+      "关闭侧栏新建卡",
     );
 
     // 验收 0：入口仍然在，打开后必须停在空态，而不是 3 秒后像消失。
@@ -937,7 +979,7 @@ async function main() {
     check(
       "仓库卡只有标题 + 验收一行",
       repoCard && repoCard.children.length === 2 &&
-        repoCard.children[0] === "wb-todo-title" &&
+        repoCard.children[0].startsWith("wb-todo-title") &&
         repoCard.children[1].includes("wb-todo-accept"),
       JSON.stringify(repoCard),
     );
@@ -1556,31 +1598,28 @@ async function main() {
     );
     check("超过 RECEIPT_MS 后回执自动消失", true);
 
-    // ---- 6. create card lands in today, not dispatched ---------------
+    // ---- 6. create info card lands in today, not dispatched -----------
+    check("今日分区右上角有新建按钮", (await openCreateCard("今日")) === true);
     const emptyTitle = await evaluate(`(async () => {
       window.__wbProbe.create = 0;
-      const input = document.querySelector('.wb-todo-composer input');
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(input, '   ');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      await new Promise((resolveWait) => setTimeout(resolveWait, 30));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+      document.querySelector('.wb-todo-create-title').focus();
+      document.querySelector('.wb-todo-create-title').dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+      );
       await new Promise((resolveWait) => setTimeout(resolveWait, 150));
-      return window.__wbProbe.create;
+      return {
+        create: window.__wbProbe.create,
+        error: document.querySelector('.wb-todo-create-error')?.textContent || '',
+      };
     })()`);
-    check("空标题不建卡", emptyTitle === 0, String(emptyTitle));
+    check("空标题不建卡", emptyTitle.create === 0, JSON.stringify(emptyTitle));
+    check("空标题就地提示", emptyTitle.error.includes("先写一句"), emptyTitle.error);
 
-    await evaluate(`(async () => {
-      window.__wbProbe.create = 0;
-      window.__wbProbe.dispatch = 0;
-      const input = document.querySelector('.wb-todo-composer input');
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(input, '探针新建卡');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      await new Promise((resolveWait) => setTimeout(resolveWait, 30));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
-      return true;
-    })()`);
+    await evaluate("window.__wbProbe.create = 0; window.__wbProbe.dispatch = 0;");
+    check("创建卡可填标题", (await setCreateField(".wb-todo-create-title", "探针新建卡")) === true);
+    check("创建卡可填上下文", (await setCreateField(".wb-todo-create-input", "来自今日新建卡")) === true);
+    check("创建卡可填验收", (await setCreateField(".wb-todo-create-accept", "跑通测试")) === true);
+    check("创建卡提交", (await submitCreateCard()) === true);
     await waitForEval("window.__wbProbe.create === 1", 5000, "建卡请求");
     await waitForEval(
       `[...document.querySelectorAll('.wb-todo-repo-card')]
@@ -1595,12 +1634,14 @@ async function main() {
       return {
         inToday: planes[0].contains(card),
         inLong: planes[1].contains(card),
-        acceptEmpty: card.querySelector('.wb-todo-accept').classList.contains('empty'),
+        accept: card.querySelector('.wb-todo-accept')?.textContent || '',
+        open: Boolean(document.querySelector('.wb-todo-create-card')),
         dispatch: window.__wbProbe.dispatch,
       };
     })()`);
     check("新建卡落今日", createdInfo.inToday === true && createdInfo.inLong === false);
-    check("新建卡验收空警示", createdInfo.acceptEmpty === true);
+    check("新建卡保留验收信息", createdInfo.accept.includes("跑通测试"), createdInfo.accept);
+    check("建卡后收起创建卡", createdInfo.open === false);
     check("新建卡不自动派发", createdInfo.dispatch === 0, String(createdInfo.dispatch));
 
     const boardAfterCreate = (await httpJson("GET", `${base}/api/plugins/kanban/board?include_archived=true`)).data;
@@ -1613,6 +1654,11 @@ async function main() {
       `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
     )).data?.[createdCard.id];
     check("新建卡 metadata bucket=today", createdMeta?.bucket === "today", JSON.stringify(createdMeta));
+    check(
+      "创建卡写入验收/上下文",
+      createdMeta?.contract?.accept === "跑通测试" && createdMeta?.contract?.input === "来自今日新建卡",
+      JSON.stringify(createdMeta?.contract),
+    );
 
     // ---- 7. 5s polling must not steal the acceptance input focus -----
     await evaluate(`(async () => {
@@ -1655,6 +1701,109 @@ async function main() {
       cancelState.inputs === 0 && cancelState.metadata === 0,
       JSON.stringify(cancelState),
     );
+
+    // ---- 7b. repository card detail: edit title/accept/context ------
+    const openedStoreDetail = await evaluate(`(() => {
+      const card = [...document.querySelectorAll('.wb-todo-repo-card')]
+        .find((node) => node.textContent.includes('探针新建卡'));
+      const title = card?.querySelector('.wb-todo-title-link');
+      if (!title) return false;
+      title.click();
+      return true;
+    })()`);
+    await waitForEval("Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "仓库卡详情");
+    const storeDetail = await evaluate(`(() => ({
+      title: document.querySelector('.wb-detail-title')?.textContent || '',
+      badge: document.querySelector('.wb-detail-badge')?.textContent || '',
+      text: document.querySelector('.wb-detail-drawer')?.textContent || '',
+      edit: Boolean(
+        [...document.querySelectorAll('.wb-detail-btn')].find(
+          (node) => node.textContent.trim() === '编辑',
+        ),
+      ),
+    }))()`);
+    check("仓库卡点标题打开详情", openedStoreDetail === true);
+    check(
+      "仓库卡详情显示已排期/验收/编辑入口",
+      storeDetail.title.includes("探针新建卡") &&
+        storeDetail.badge.includes("已排期") &&
+        storeDetail.text.includes("跑通测试") &&
+        storeDetail.edit === true,
+      JSON.stringify(storeDetail),
+    );
+
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-btn')].find((node) => node.textContent.trim() === '编辑')?.click(); true`,
+    );
+    await waitForEval("Boolean(document.querySelector('.wb-detail-input'))", 3000, "仓库卡进入编辑");
+    const editPrefilled = await evaluate(`(() => ({
+      title: document.querySelector('.wb-detail-input')?.value || '',
+      values: [...document.querySelectorAll('.wb-detail-textarea')].map((node) => node.value),
+    }))()`);
+    check(
+      "编辑表单带出原值",
+      editPrefilled.title === "探针新建卡" &&
+        editPrefilled.values.includes("跑通测试") &&
+        editPrefilled.values.includes("来自今日新建卡"),
+      JSON.stringify(editPrefilled),
+    );
+
+    await evaluate(`(() => {
+      const setValue = (node, value) => {
+        const proto = node.tagName === 'TEXTAREA'
+          ? HTMLTextAreaElement.prototype
+          : HTMLInputElement.prototype;
+        Object.getOwnPropertyDescriptor(proto, 'value').set.call(node, value);
+        node.dispatchEvent(new Event('input', { bubbles: true }));
+      };
+      setValue(document.querySelector('.wb-detail-input'), '探针改名卡');
+      const areas = [...document.querySelectorAll('.wb-detail-textarea')];
+      setValue(areas[0], '改名后验收');
+      setValue(areas[1], '详情编辑上下文');
+      return true;
+    })()`);
+    await evaluate(
+      `[...document.querySelectorAll('.wb-detail-btn')].find((node) => node.textContent.trim() === '保存')?.click(); true`,
+    );
+    await waitForEval("!document.querySelector('.wb-detail-input')", 8000, "保存后退出编辑");
+    await waitForEval(
+      `document.querySelector('.wb-detail-title')?.textContent.includes('探针改名卡')`,
+      8000,
+      "详情标题刷新",
+    );
+    const savedDetail = await evaluate(`(() => ({
+      title: document.querySelector('.wb-detail-title')?.textContent || '',
+      text: document.querySelector('.wb-detail-drawer')?.textContent || '',
+    }))()`);
+    check(
+      "详情保存后显示新标题/验收",
+      savedDetail.title.includes("探针改名卡") && savedDetail.text.includes("改名后验收"),
+      JSON.stringify(savedDetail),
+    );
+    check(
+      "详情保存后仓库卡改名",
+      (await evaluate(
+        `[...document.querySelectorAll('.wb-todo-repo-card')].some((node) => node.textContent.includes('探针改名卡'))`,
+      )) === true,
+    );
+    const renamedBoard = (await httpJson("GET", `${base}/api/plugins/kanban/board?include_archived=true`)).data;
+    const renamedTask = renamedBoard.columns
+      .flatMap((column) => column.tasks)
+      .find((task) => task.id === createdCard.id);
+    const renamedMeta = (await httpJson(
+      "GET",
+      `${base}/api/workbench/metadata?ids=${encodeURIComponent(createdCard.id)}`,
+    )).data?.[createdCard.id];
+    check("详情编辑标题写回上游", renamedTask?.title === "探针改名卡", String(renamedTask?.title));
+    check(
+      "详情编辑写回验收/上下文",
+      renamedMeta?.contract?.accept === "改名后验收" &&
+        renamedMeta?.contract?.input === "详情编辑上下文",
+      JSON.stringify(renamedMeta?.contract),
+    );
+    await evaluate("document.querySelector('.wb-detail-close').click(); true");
+    await waitForEval("!Boolean(document.querySelector('.wb-detail-drawer'))", 5000, "关闭仓库卡详情");
+    check("仓库卡详情可关闭", true);
 
     // ---- 8. 409 result re-check (dispatch + live receipt done in 5c) --
     check(
@@ -1783,7 +1932,8 @@ async function main() {
     await cdp.send("Emulation.clearDeviceMetricsOverride");
 
     // ---- 10. external create appears through polling while focused ----
-    await evaluate("document.querySelector('.wb-todo-composer input').focus()");
+    check("外部建卡前打开今日新建卡", (await openCreateCard("今日")) === true);
+    await evaluate("document.querySelector('.wb-todo-create-title').focus()");
     const externalCard = await createUpstream("外部轮询卡");
     await setMetadata(externalCard, {
       bucket: "today",
@@ -1796,9 +1946,13 @@ async function main() {
       "外部建卡经 5s 轮询出现",
     );
     const focusHeld = await evaluate(
-      "document.activeElement === document.querySelector('.wb-todo-composer input')",
+      "document.activeElement === document.querySelector('.wb-todo-create-title')",
     );
     check("外部建卡 6s 内轮询出现且不抢输入焦点", focusHeld === true);
+    await evaluate(
+      "[...document.querySelectorAll('.wb-todo-create-btn')].find((node) => node.textContent.trim() === '取消')?.click(); true",
+    );
+    await waitForEval("!document.querySelector('.wb-todo-create-card')", 3000, "关闭外部建卡用例的新建卡");
 
     // ---- 11. today/long lists sort by created_at desc -----------------
     const seedRepoCard = async (title, bucket) => {
@@ -1843,25 +1997,26 @@ async function main() {
       JSON.stringify(order.long),
     );
 
-    // ---- 12. composer bucket toggle reaches 长期 ----------------------
-    await evaluate(`(async () => {
-      window.__wbProbe.create = 0;
-      const buttons = [...document.querySelectorAll('.wb-todo-bucket')];
-      buttons.find((node) => node.textContent.trim() === '长期').click();
-      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-      const input = document.querySelector('.wb-todo-composer input');
-      input.focus();
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(input, '探针长期卡');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      await new Promise((resolveWait) => setTimeout(resolveWait, 30));
-      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
-      return true;
+    // ---- 12. 长期分区右上角新建，落 long bucket -----------------------
+    check("长期分区右上角有新建按钮", (await openCreateCard("长期")) === true);
+    const createPlacement = await evaluate(`(() => {
+      const planes = [...document.querySelectorAll('.wb-todo-plane')];
+      return {
+        inLong: Boolean(planes[1].querySelector('.wb-todo-create-card')),
+        inToday: Boolean(planes[0].querySelector('.wb-todo-create-card')),
+        label: document.querySelector('.wb-todo-create-bucket')?.textContent || '',
+      };
     })()`);
-    const longToggleOn = await evaluate(
-      `[...document.querySelectorAll('.wb-todo-bucket')].find((node) => node.textContent.trim() === '长期').classList.contains('on')`,
+    check(
+      "新建卡开在长期分区",
+      createPlacement.inLong === true &&
+        createPlacement.inToday === false &&
+        createPlacement.label.includes("长期"),
+      JSON.stringify(createPlacement),
     );
-    check("切到长期并高亮", longToggleOn === true);
+    await evaluate("window.__wbProbe.create = 0;");
+    check("长期新建卡可填标题", (await setCreateField(".wb-todo-create-title", "探针长期卡")) === true);
+    check("长期新建卡提交", (await submitCreateCard()) === true);
     await waitForEval("window.__wbProbe.create === 1", 5000, "长期建卡请求");
     await waitForEval(
       `[...document.querySelectorAll('.wb-todo-plane')[1].querySelectorAll('.wb-todo-repo-card')]
@@ -1878,19 +2033,14 @@ async function main() {
       `${base}/api/workbench/metadata?ids=${encodeURIComponent(longTask.id)}`,
     )).data?.[longTask.id];
     check(
-      "composer 建卡落长期 bucket",
+      "长期分区建卡落长期 bucket",
       longTask?.status === "scheduled" && longMeta?.bucket === "long",
       JSON.stringify({ status: longTask?.status, metadata: longMeta }),
     );
 
-    // ---- 13. tab switching keeps TodoPage draft state ----------------
-    await evaluate(`(() => {
-      const input = document.querySelector('.wb-todo-composer input');
-      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-      setter.call(input, '跨 tab 草稿');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
-    })()`);
+    // ---- 13. tab switching keeps the open create card draft ----------
+    check("切 tab 前打开今日新建卡", (await openCreateCard("今日")) === true);
+    check("切 tab 前填写草稿", (await setCreateField(".wb-todo-create-title", "跨 tab 草稿")) === true);
     const tabLabels = await evaluate(
       "[...document.querySelectorAll('.wb-tab')].map((node) => node.querySelector('.wb-tab-label')?.textContent || node.textContent)",
     );
@@ -1949,7 +2099,8 @@ async function main() {
       return {
         displays: panes.map((node) => getComputedStyle(node).display),
         columns: document.querySelectorAll('.wb-todo-col').length,
-        draft: document.querySelector('.wb-todo-composer input').value,
+        draft: document.querySelector('.wb-todo-create-title')?.value || '',
+        createOpen: Boolean(document.querySelector('.wb-todo-create-card')),
       };
     })()`);
     check(
@@ -1957,10 +2108,15 @@ async function main() {
       todoView.displays.length === 2 &&
         todoView.displays[0] === "flex" &&
         todoView.displays[1] === "none" &&
-        todoView.draft === "跨 tab 草稿",
+        todoView.draft === "跨 tab 草稿" &&
+        todoView.createOpen === true,
       JSON.stringify(todoView),
     );
     check("待办三列仍在", todoView.columns === 3, String(todoView.columns));
+    await evaluate(
+      "[...document.querySelectorAll('.wb-todo-create-btn')].find((node) => node.textContent.trim() === '取消')?.click(); true",
+    );
+    await waitForEval("!document.querySelector('.wb-todo-create-card')", 3000, "关闭跨 tab 草稿");
 
     // ---- 14. counts still equal rendered cards after all additions ----
     const finalCounts = await evaluate(`(() => {

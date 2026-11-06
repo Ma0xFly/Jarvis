@@ -61,7 +61,7 @@ export default function App(): React.ReactElement {
   const [notifyCounts, setNotifyCounts] = useState({ p0: 0, p1: 0, p2: 0, total: 0 });
   const [todoCounts, setTodoCounts] = useState({ today: 0, long: 0 });
   const [boardStats, setBoardStats] = useState({ running: 0, done: 0 });
-  const [composerFocus, setComposerFocus] = useState(0);
+  const [createSignal, setCreateSignal] = useState(0);
   const [verifyOpen, setVerifyOpen] = useState(false);
   const [verifyStartId, setVerifyStartId] = useState<string | null>(null);
   // 会话抽屉独立于验收覆盖层：验收页和看板完成卡共用同一份状态。
@@ -146,10 +146,10 @@ export default function App(): React.ReactElement {
     [],
   );
 
-  /** 新建不是全局入口：切到待办并聚焦 composer，不新增 N 快捷键。 */
+  /** 新建不是全局入口：切到待办并打开今日新建卡，不新增 N 快捷键。 */
   const newTodo = useCallback(() => {
     setTab("todo");
-    setComposerFocus((value) => value + 1);
+    setCreateSignal((value) => value + 1);
   }, []);
 
   const todoTotal = todoCounts.today + todoCounts.long;
@@ -276,7 +276,7 @@ export default function App(): React.ReactElement {
                 onVerify={openVerify}
                 onOpenSession={openSession}
                 onCounts={handleTodoCounts}
-                focusComposer={composerFocus}
+                createSignal={createSignal}
                 active={tab === "todo"}
               />
             </div>

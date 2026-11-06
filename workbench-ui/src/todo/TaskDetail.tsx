@@ -1,10 +1,11 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { Task } from "../board/Board";
 import type { TaskMetadata, WorkbenchContractBudget } from "../api/workbench";
 
 /**
- * 流水线卡详情抽屉（只读 + 两个出口：去验收 / 查看执行会话）。
- * 数据来自待办页已经合并好的 board task + workbench metadata，不新增请求。
+ * 卡片详情抽屉：流水线卡只读 + 两个出口（去验收 / 查看执行会话）；
+ * 仓库卡（triage/todo/scheduled）可编辑标题、验收与上下文。
+ * 数据来自待办页已经合并好的 board task + workbench metadata，不新增读取请求。
  */
 
 const STATUS_LABEL: Record<string, string> = {
@@ -17,6 +18,8 @@ const STATUS_LABEL: Record<string, string> = {
   review: "待验收",
   done: "已完成",
 };
+
+const STORE_STATUSES = new Set(["triage", "todo", "scheduled"]);
 
 function clock(ts?: number | null): string {
   if (!ts) return "—";
@@ -38,8 +41,18 @@ function budgetText(budget?: WorkbenchContractBudget | null): string {
   return parts.length > 0 ? parts.join(" · ") : "未设置";
 }
 
+function errText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 export interface DetailTask extends Task {
   metadata?: TaskMetadata;
+}
+
+export interface DetailEditPatch {
+  title: string;
+  input: string;
+  accept: string;
 }
 
 interface TaskDetailProps {
@@ -49,6 +62,8 @@ interface TaskDetailProps {
   onClose: () => void;
   onVerify?: (taskId?: string) => void;
   onOpenSession?: (taskId: string, title?: string) => void;
+  /** 仓库卡编辑保存；不传则整张卡只读。 */
+  onSave?: (patch: DetailEditPatch) => Promise<void>;
 }
 
 export default function TaskDetail({
@@ -57,10 +72,49 @@ export default function TaskDetail({
   onClose,
   onVerify,
   onOpenSession,
+  onSave,
 }: TaskDetailProps): React.ReactElement {
   const closeRef = useRef<HTMLButtonElement | null>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+  const editingRef = useRef(false);
+
+  const contract = task.metadata?.contract || {};
+  const accept = typeof contract.accept === "string" ? contract.accept.trim() : "";
+  const input = typeof contract.input === "string" ? contract.input.trim() : "";
+  const budget = contract.budget;
+  const status = STATUS_LABEL[task.status] || task.status;
+  const canEdit = STORE_STATUSES.has(task.status) && Boolean(onSave);
+  const sessionAvailable =
+    task.status !== "ready" &&
+    task.status !== "triage" &&
+    task.status !== "todo" &&
+    task.status !== "scheduled";
+  const canVerify = task.status === "review" && Boolean(onVerify);
+
+  const [editing, setEditing] = useState(false);
+  const [titleDraft, setTitleDraft] = useState(task.title);
+  const [acceptDraft, setAcceptDraft] = useState(accept);
+  const [inputDraft, setInputDraft] = useState(input);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  editingRef.current = editing;
+
+  // Polling keeps replacing the task object; never clobber an active edit.
+  useEffect(() => {
+    if (editing) return;
+    setTitleDraft(task.title);
+    setAcceptDraft(accept);
+    setInputDraft(input);
+  }, [task.id, task.title, accept, input, editing]);
+
+  // The card may leave the store (dispatch) while the drawer is open.
+  useEffect(() => {
+    if (!canEdit && editing) {
+      setEditing(false);
+      setSaveError("");
+    }
+  }, [canEdit, editing]);
 
   useEffect(() => {
     const previousFocus = document.activeElement as HTMLElement | null;
@@ -68,8 +122,12 @@ export default function TaskDetail({
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      if (editingRef.current) {
+        setEditing(false);
+        setSaveError("");
+      } else {
         onCloseRef.current();
       }
     };
@@ -83,24 +141,50 @@ export default function TaskDetail({
     };
   }, []);
 
-  const contract = task.metadata?.contract || {};
-  const accept = typeof contract.accept === "string" ? contract.accept.trim() : "";
-  const input = typeof contract.input === "string" ? contract.input.trim() : "";
-  const budget = contract.budget;
-  const status = STATUS_LABEL[task.status] || task.status;
-  const sessionAvailable =
-    task.status !== "ready" && task.status !== "triage" && task.status !== "todo";
-  const canVerify = task.status === "review" && Boolean(onVerify);
+  const beginEdit = () => {
+    setTitleDraft(task.title);
+    setAcceptDraft(accept);
+    setInputDraft(input);
+    setSaveError("");
+    setEditing(true);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+    setSaveError("");
+  };
+
+  const submitEdit = async () => {
+    if (saving || !onSave) return;
+    const nextTitle = titleDraft.trim();
+    if (!nextTitle) {
+      setSaveError("标题不能为空");
+      return;
+    }
+    setSaving(true);
+    setSaveError("");
+    try {
+      await onSave({ title: nextTitle, input: inputDraft, accept: acceptDraft });
+      setEditing(false);
+    } catch (error) {
+      setSaveError("保存失败：" + errText(error));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   return (
     <div
       className="wb-detail-scrim"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
+        if (event.target === event.currentTarget) {
+          if (editing) cancelEdit();
+          else onClose();
+        }
       }}
     >
       <aside
-        className="wb-detail-drawer"
+        className={"wb-detail-drawer" + (editing ? " editing" : "")}
         role="dialog"
         aria-modal="true"
         aria-labelledby="wb-detail-title"
@@ -112,7 +196,7 @@ export default function TaskDetail({
               <span className="wb-detail-position">队列第 {position} 位</span>
             ) : null}
             <h2 className="wb-detail-title" id="wb-detail-title">
-              {task.title}
+              {editing ? titleDraft.trim() || task.title : task.title}
             </h2>
             <span className="wb-detail-id">{task.id}</span>
           </div>
@@ -120,28 +204,70 @@ export default function TaskDetail({
             ref={closeRef}
             className="wb-detail-close"
             type="button"
-            onClick={onClose}
-            aria-label="关闭卡片详情"
-            title="关闭（Esc）"
+            onClick={editing ? cancelEdit : onClose}
+            aria-label={editing ? "取消编辑" : "关闭卡片详情"}
+            title={editing ? "取消编辑（Esc）" : "关闭（Esc）"}
           >
             ✕
           </button>
         </header>
 
         <div className="wb-detail-body">
-          <section className="wb-detail-section">
-            <h3>验收标准</h3>
-            <p className={"wb-detail-value" + (accept ? "" : " empty")}>
-              {accept || "未写验收。派发前必须补一句怎样算做完。"}
-            </p>
-          </section>
+          {editing ? (
+            <>
+              <section className="wb-detail-section">
+                <h3>标题</h3>
+                <input
+                  className="wb-detail-input"
+                  value={titleDraft}
+                  maxLength={500}
+                  autoFocus
+                  onChange={(event) => setTitleDraft(event.target.value)}
+                  placeholder="要做什么？"
+                />
+              </section>
 
-          <section className="wb-detail-section">
-            <h3>输入 / 上下文</h3>
-            <p className={"wb-detail-value" + (input ? "" : " empty")}>
-              {input || "未填写"}
-            </p>
-          </section>
+              <section className="wb-detail-section">
+                <h3>验收标准</h3>
+                <textarea
+                  className="wb-detail-textarea"
+                  rows={4}
+                  maxLength={2000}
+                  value={acceptDraft}
+                  onChange={(event) => setAcceptDraft(event.target.value)}
+                  placeholder="怎样算做完？派发前必须有一句。"
+                />
+              </section>
+
+              <section className="wb-detail-section">
+                <h3>输入 / 上下文</h3>
+                <textarea
+                  className="wb-detail-textarea"
+                  rows={4}
+                  maxLength={4000}
+                  value={inputDraft}
+                  onChange={(event) => setInputDraft(event.target.value)}
+                  placeholder="背景、链接、约束（可选）"
+                />
+              </section>
+            </>
+          ) : (
+            <>
+              <section className="wb-detail-section">
+                <h3>验收标准</h3>
+                <p className={"wb-detail-value" + (accept ? "" : " empty")}>
+                  {accept || "未写验收。派发前必须补一句怎样算做完。"}
+                </p>
+              </section>
+
+              <section className="wb-detail-section">
+                <h3>输入 / 上下文</h3>
+                <p className={"wb-detail-value" + (input ? "" : " empty")}>
+                  {input || "未填写"}
+                </p>
+              </section>
+            </>
+          )}
 
           {task.latest_summary ? (
             <section className="wb-detail-section">
@@ -181,39 +307,72 @@ export default function TaskDetail({
               ) : null}
             </dl>
           </section>
+
+          {saveError ? (
+            <div className="wb-detail-error" role="alert">
+              {saveError}
+            </div>
+          ) : null}
         </div>
 
         <footer className="wb-detail-actions">
-          {canVerify ? (
-            <button
-              className="wb-detail-btn primary"
-              type="button"
-              onClick={() => {
-                onVerify?.(task.id);
-                onClose();
-              }}
-            >
-              去验收
-            </button>
-          ) : null}
-          {onOpenSession && sessionAvailable ? (
-            <button
-              className="wb-detail-btn"
-              type="button"
-              onClick={() => onOpenSession(task.id, task.title)}
-            >
-              查看执行会话
-            </button>
+          {editing ? (
+            <>
+              <button
+                className="wb-detail-btn primary"
+                type="button"
+                onClick={() => void submitEdit()}
+                disabled={saving}
+              >
+                {saving ? "保存中…" : "保存"}
+              </button>
+              <button
+                className="wb-detail-btn"
+                type="button"
+                onClick={cancelEdit}
+                disabled={saving}
+              >
+                取消
+              </button>
+              <span className="wb-detail-session-hint">Esc 取消编辑</span>
+            </>
           ) : (
-            <span className="wb-detail-session-hint">
-              {task.status === "ready" || task.status === "todo" || task.status === "triage"
-                ? "执行后才有会话"
-                : ""}
-            </span>
+            <>
+              {canEdit ? (
+                <button className="wb-detail-btn" type="button" onClick={beginEdit}>
+                  编辑
+                </button>
+              ) : null}
+              {canVerify ? (
+                <button
+                  className="wb-detail-btn primary"
+                  type="button"
+                  onClick={() => {
+                    onVerify?.(task.id);
+                    onClose();
+                  }}
+                >
+                  去验收
+                </button>
+              ) : null}
+              {onOpenSession && sessionAvailable ? (
+                <button
+                  className="wb-detail-btn"
+                  type="button"
+                  onClick={() => onOpenSession(task.id, task.title)}
+                >
+                  查看执行会话
+                </button>
+              ) : (
+                <span className="wb-detail-session-hint">
+                  {sessionAvailable ? "" : "执行后才有会话"}
+                </span>
+              )}
+              <button className="wb-detail-btn" type="button" onClick={onClose}>
+                关闭
+              </button>
+            </>
           )}
-          <button className="wb-detail-btn" type="button" onClick={onClose}>
-            关闭
-          </button>
         </footer>
       </aside>
     </div>

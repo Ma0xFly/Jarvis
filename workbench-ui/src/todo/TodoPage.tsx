@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, KANBAN } from "../platform";
 import type { Task } from "../board/Board";
-import TaskDetail from "./TaskDetail";
+import TaskDetail, { type DetailEditPatch } from "./TaskDetail";
 import "../styles/detail.css";
 import {
   createTask,
@@ -9,6 +9,7 @@ import {
   getTaskMetadata,
   hasAcceptance,
   mergeTaskMetadata,
+  updateTaskCard,
   updateTaskMetadata,
   WorkbenchError,
   type Bucket,
@@ -79,8 +80,8 @@ interface TodoPageProps {
   onOpenSession?: (taskId: string, title?: string) => void;
   /** 外壳侧栏计数：今日 + 长期仓库卡数量。 */
   onCounts?: (counts: { today: number; long: number }) => void;
-  /** 每次自增表示「切到待办并聚焦 composer」；0 表示首屏不抢焦点。 */
-  focusComposer?: number;
+  /** 每次自增表示「切到待办并打开今日新建卡」；0 表示首屏不自动打开。 */
+  createSignal?: number;
   /** 当前是否为可见 tab；切走时关闭详情，避免 body 锁留在隐藏面板里。 */
   active?: boolean;
 }
@@ -89,7 +90,7 @@ export default function TodoPage({
   onVerify,
   onOpenSession,
   onCounts,
-  focusComposer,
+  createSignal,
   active = true,
 }: TodoPageProps): React.ReactElement {
   const [board, setBoard] = useState<BoardData | null>(null);
@@ -107,12 +108,16 @@ export default function TodoPage({
   const [editText, setEditText] = useState("");
   const [savingId, setSavingId] = useState<string | null>(null);
   const [dispatchingId, setDispatchingId] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
-  const [draftBucket, setDraftBucket] = useState<Bucket>("today");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createBucket, setCreateBucket] = useState<Bucket>("today");
+  const [createTitle, setCreateTitle] = useState("");
+  const [createInput, setCreateInput] = useState("");
+  const [createAccept, setCreateAccept] = useState("");
+  const [createError, setCreateError] = useState("");
   const [creating, setCreating] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
 
-  const composerRef = useRef<HTMLInputElement | null>(null);
+  const createTitleRef = useRef<HTMLInputElement | null>(null);
   const toastTimer = useRef<number | null>(null);
   const shakeTimer = useRef<number | null>(null);
   const warnTimer = useRef<number | null>(null);
@@ -126,7 +131,8 @@ export default function TodoPage({
   const savingCardsRef = useRef<Set<string>>(new Set());
   // 全局串行派发：一次只允许一张卡在途，回执只属于最近一次尝试。
   const dispatchInFlightRef = useRef(false);
-  const draftAttemptRef = useRef<{ key: string; title: string; bucket: Bucket } | null>(null);
+  const createKeyRef = useRef<{ key: string; title: string; bucket: Bucket } | null>(null);
+  const createdTaskRef = useRef<string | null>(null);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -248,12 +254,20 @@ export default function TodoPage({
     onCounts?.({ today: today.length, long: long.length });
   }, [today.length, long.length, onCounts]);
 
-  // 新建按钮只切 tab + 自增信号；composer 挂载（loaded）且不在建卡中才聚焦。
+  // 侧栏「新建待办」：切到待办并打开今日新建卡（每次都是新草稿）。
   useEffect(() => {
-    if (!focusComposer || !loaded || creating) return;
-    const frame = window.requestAnimationFrame(() => composerRef.current?.focus());
+    if (!createSignal) return;
+    setCreateOpen(true);
+    setCreateBucket("today");
+    setCreateTitle("");
+    setCreateInput("");
+    setCreateAccept("");
+    setCreateError("");
+    createKeyRef.current = null;
+    createdTaskRef.current = null;
+    const frame = window.requestAnimationFrame(() => createTitleRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [focusComposer, loaded, creating]);
+  }, [createSignal]);
 
   const flowLists = FLOW_SEGMENTS.map((segment) => ({
     ...segment,
@@ -352,7 +366,14 @@ export default function TodoPage({
   const moveTaskBucket = useCallback(
     async (task: TaskWithMeta, bucket: Bucket) => {
       if (task.metadata?.bucket === bucket) return;
-      if (task.status !== "triage" && task.status !== "todo") return;
+      // 仓库卡现在稳定落在 scheduled；triage/todo 仅用于兼容旧卡。
+      if (
+        task.status !== "triage" &&
+        task.status !== "todo" &&
+        task.status !== "scheduled"
+      ) {
+        return;
+      }
       if (savingCardsRef.current.has(task.id)) return;
       savingCardsRef.current.add(task.id);
       setSavingId(task.id);
@@ -450,30 +471,170 @@ export default function TodoPage({
     void commitAccept(task);
   };
 
-  const submitDraft = useCallback(async () => {
-    const title = draft.trim();
-    if (!title || creating) return;
-    const previous = draftAttemptRef.current;
-    const key =
-      previous && previous.title === title && previous.bucket === draftBucket
-        ? previous.key
-        : newIdempotencyKey();
-    draftAttemptRef.current = { key, title, bucket: draftBucket };
+  /** 打开分区内的新建信息卡；已在建卡时切分区不丢已填内容。 */
+  const openCreate = (bucket: Bucket) => {
+    if (!createOpen) {
+      setCreateTitle("");
+      setCreateInput("");
+      setCreateAccept("");
+      setCreateError("");
+      createKeyRef.current = null;
+      createdTaskRef.current = null;
+    }
+    setCreateBucket(bucket);
+    setCreateOpen(true);
+    window.requestAnimationFrame(() => createTitleRef.current?.focus());
+  };
+
+  const closeCreate = () => {
+    if (creating) return;
+    setCreateOpen(false);
+    setCreateTitle("");
+    setCreateInput("");
+    setCreateAccept("");
+    setCreateError("");
+    createKeyRef.current = null;
+    createdTaskRef.current = null;
+  };
+
+  const submitCreate = useCallback(async () => {
+    const title = createTitle.trim();
+    if (creating) return;
+    if (!title) {
+      setCreateError("先写一句要做什么");
+      return;
+    }
+    const previous = createKeyRef.current;
+    let key = previous?.key;
+    if (!previous || previous.title !== title || previous.bucket !== createBucket) {
+      key = newIdempotencyKey();
+      createKeyRef.current = { key, title, bucket: createBucket };
+    }
+    if (!key) return;
     setCreating(true);
+    setCreateError("");
     try {
-      await createTask(title, draftBucket, key);
-      draftAttemptRef.current = null;
+      const input = createInput;
+      const accept = createAccept.trim();
+      let taskId = createdTaskRef.current;
+      if (!taskId) {
+        const created = await createTask(title, createBucket, key);
+        taskId = created.task.id;
+        createdTaskRef.current = taskId;
+        // 创建成功但信息保存失败时保留 taskId：重试只补信息，不会再建一张卡。
+        if (input.trim() || accept) {
+          await updateTaskCard(taskId, { contract: { input, accept } });
+        }
+      } else {
+        // 部分成功后的重试：顺带把改过的标题也补上。
+        await updateTaskCard(taskId, {
+          title,
+          bucket: createBucket,
+          contract: { input, accept },
+        });
+      }
       mutationSeq.current += 1;
-      setDraft("");
-      showToast(draftBucket === "today" ? "已加到今日" : "已加到长期");
+      setCreateOpen(false);
+      setCreateTitle("");
+      setCreateInput("");
+      setCreateAccept("");
+      setCreateError("");
+      createKeyRef.current = null;
+      createdTaskRef.current = null;
+      showToast(createBucket === "today" ? "已加到今日" : "已加到长期");
       void load();
     } catch (error) {
-      // Keep draftAttemptRef so a retry reuses the same upstream idempotency key.
-      showToast("建卡失败，请重试（" + errText(error) + "）");
+      setCreateError(
+        createdTaskRef.current
+          ? "卡已创建，信息保存失败，请重试（" + errText(error) + "）"
+          : "建卡失败，请重试（" + errText(error) + "）",
+      );
     } finally {
       setCreating(false);
     }
-  }, [draft, draftBucket, creating, showToast, load]);
+  }, [createTitle, createInput, createAccept, createBucket, creating, showToast, load]);
+
+  const renderCreateCard = (): React.ReactElement => (
+    <div className="wb-todo-create-card" role="group" aria-label={"新建" + (createBucket === "today" ? "今日" : "长期") + "待办"}>
+      <div className="wb-todo-create-head">
+        <span className="wb-todo-create-name">新建待办</span>
+        <span className={"wb-todo-create-bucket " + createBucket}>
+          {createBucket === "today" ? "今日" : "长期"}
+        </span>
+      </div>
+      <input
+        ref={createTitleRef}
+        className="wb-todo-create-title"
+        value={createTitle}
+        maxLength={500}
+        disabled={creating}
+        placeholder="要做什么？"
+        aria-label="待办标题"
+        onChange={(event) => setCreateTitle(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+          event.preventDefault();
+          void submitCreate();
+        }}
+      />
+      <textarea
+        className="wb-todo-create-input"
+        rows={2}
+        maxLength={4000}
+        value={createInput}
+        disabled={creating}
+        placeholder="上下文 / 输入（可选）"
+        aria-label="上下文或输入"
+        onChange={(event) => setCreateInput(event.target.value)}
+        onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+            event.preventDefault();
+            void submitCreate();
+          }
+        }}
+      />
+      <textarea
+        className="wb-todo-create-accept"
+        rows={2}
+        maxLength={2000}
+        value={createAccept}
+        disabled={creating}
+        placeholder="怎样算做完（可选，之后也能补）"
+        aria-label="验收标准"
+        onChange={(event) => setCreateAccept(event.target.value)}
+        onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+            event.preventDefault();
+            void submitCreate();
+          }
+        }}
+      />
+      {createError ? (
+        <div className="wb-todo-create-error" role="alert">
+          {createError}
+        </div>
+      ) : null}
+      <div className="wb-todo-create-actions">
+        <span className="wb-todo-create-hint">创建后只进仓库 · ⌘↵ 提交</span>
+        <button
+          className="wb-todo-create-btn"
+          type="button"
+          onClick={closeCreate}
+          disabled={creating}
+        >
+          取消
+        </button>
+        <button
+          className="wb-todo-create-btn primary"
+          type="button"
+          onClick={() => void submitCreate()}
+          disabled={creating}
+        >
+          {creating ? "创建中…" : "创建"}
+        </button>
+      </div>
+    </div>
+  );
 
   const renderRepoCard = (task: TaskWithMeta): React.ReactElement => {
     const accept = acceptText(task);
@@ -502,7 +663,21 @@ export default function TodoPage({
         }}
         title={task.title}
       >
-        <div className="wb-todo-title">{task.title}</div>
+        <div
+          className="wb-todo-title wb-todo-title-link"
+          role="button"
+          tabIndex={0}
+          title="打开卡片详情 / 编辑"
+          onClick={() => setDetailId(task.id)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              setDetailId(task.id);
+            }
+          }}
+        >
+          {task.title}
+        </div>
         {editing ? (
           <input
             className="wb-todo-accept-input"
@@ -658,10 +833,20 @@ export default function TodoPage({
             <span className="wb-todo-cname">今日</span>
             <span className="wb-todo-count">{today.length}</span>
             <span className="wb-todo-hint">只存信息 · 可互拖</span>
+            <button
+              className="wb-todo-newbtn"
+              type="button"
+              onClick={() => openCreate("today")}
+              aria-expanded={createOpen && createBucket === "today"}
+              title="新建今日待办"
+            >
+              ＋ 新建
+            </button>
           </div>
           <div className="wb-todo-body">
+            {createOpen && createBucket === "today" ? renderCreateCard() : null}
             <div className="wb-todo-list">{today.map(renderRepoCard)}</div>
-            {today.length === 0 ? (
+            {today.length === 0 && !(createOpen && createBucket === "today") ? (
               <div className="wb-todo-empty">还没有今日卡</div>
             ) : null}
           </div>
@@ -677,51 +862,24 @@ export default function TodoPage({
             <span className="wb-todo-cname">长期</span>
             <span className="wb-todo-count">{long.length}</span>
             <span className="wb-todo-hint">冷存储 · 可互拖</span>
+            <button
+              className="wb-todo-newbtn"
+              type="button"
+              onClick={() => openCreate("long")}
+              aria-expanded={createOpen && createBucket === "long"}
+              title="新建长期待办"
+            >
+              ＋ 新建
+            </button>
           </div>
           <div className="wb-todo-body">
+            {createOpen && createBucket === "long" ? renderCreateCard() : null}
             <div className="wb-todo-list">{long.map(renderRepoCard)}</div>
-            {long.length === 0 ? <div className="wb-todo-empty">还没有长期卡</div> : null}
+            {long.length === 0 && !(createOpen && createBucket === "long") ? (
+              <div className="wb-todo-empty">还没有长期卡</div>
+            ) : null}
           </div>
         </section>
-      </div>
-
-      <div className="wb-todo-composer">
-        <span className="wb-todo-composer-icon" aria-hidden="true">
-          ✎
-        </span>
-        <div className="wb-todo-buckets" role="group" aria-label="新建卡归属">
-          <button
-            type="button"
-            className={"wb-todo-bucket" + (draftBucket === "today" ? " on" : "")}
-            disabled={creating}
-            onClick={() => setDraftBucket("today")}
-          >
-            今日
-          </button>
-          <button
-            type="button"
-            className={"wb-todo-bucket" + (draftBucket === "long" ? " on" : "")}
-            disabled={creating}
-            onClick={() => setDraftBucket("long")}
-          >
-            长期
-          </button>
-        </div>
-        <input
-          ref={composerRef}
-          value={draft}
-          disabled={creating}
-          placeholder="一句话记下来，回车新建"
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
-            event.preventDefault();
-            void submitDraft();
-          }}
-        />
-        <span className="wb-todo-composer-hint">
-          默认落{draftBucket === "today" ? "今日" : "长期"} <kbd>↵</kbd>
-        </span>
       </div>
 
       {toast ? <div className="wb-toast">{toast}</div> : null}
@@ -733,6 +891,19 @@ export default function TodoPage({
           onClose={() => setDetailId(null)}
           onVerify={onVerify}
           onOpenSession={onOpenSession}
+          onSave={async (patch: DetailEditPatch) => {
+            const updated = await updateTaskCard(detailTask.id, {
+              title: patch.title,
+              contract: { input: patch.input, accept: patch.accept },
+            });
+            mutationSeq.current += 1;
+            setMetadataById((previous) => ({
+              ...previous,
+              [detailTask.id]: updated.metadata,
+            }));
+            showToast("已保存");
+            await load();
+          }}
         />
       ) : null}
     </div>
