@@ -327,7 +327,7 @@ async function main() {
         throw new Error(`上传附件失败 ${taskId}: ${response.status} ${await response.text()}`);
       }
     };
-    const seedReview = async (title, accept, input) => {
+    const seedReview = async (title, accept, input, selfReport) => {
       const card = await createUpstream(title);
       await setMetadata(card, {
         bucket: "today",
@@ -341,10 +341,16 @@ async function main() {
       if (dispatched.status !== 200) {
         throw new Error(`派发失败 ${title}: ${dispatched.status} ${JSON.stringify(dispatched.data)}`);
       }
+      // kanban_request_review writes metadata onto the closing run; seeding it
+      // through the same PATCH keeps the run shape the workbench reads.
       const reviewed = await httpJson(
         "PATCH",
         `${base}/api/plugins/kanban/tasks/${encodeURIComponent(card)}`,
-        { status: "review", summary: `完成：${title}` },
+        {
+          status: "review",
+          summary: `完成：${title}`,
+          ...(selfReport ? { metadata: { self_report: selfReport } } : {}),
+        },
       );
       if (reviewed.status !== 200) {
         throw new Error(`转 review 失败 ${title}: ${reviewed.status} ${JSON.stringify(reviewed.data)}`);
@@ -356,11 +362,20 @@ async function main() {
     const titleB = "验收探针乙";
     const titleC = "验收探针丙";
     const titleD = "验收探针丁";
-    const cardA = await seedReview(titleA, "甲的标准：跑通测试", "甲的输入");
+    const cardA = await seedReview(titleA, "甲的标准：跑通测试", "甲的输入", {
+      delivered: "改了验收页与后端",
+      evidence: "test_verify 全绿",
+      uncertain: "没跑真机",
+    });
     await uploadAttachment(cardA, "probe-note.txt", "probe attachment", "text/plain");
     await uploadAttachment(cardA, "pixel.png", PNG_PIXEL, "image/png");
     updateKanban("UPDATE tasks SET result=? WHERE id=?", cardA, "实际产出文本");
-    const cardB = await seedReview(titleB, "乙的标准：交付文档", "乙的输入");
+    // Uncertain present but blank: the UI must warn「未填写」without blocking.
+    const cardB = await seedReview(titleB, "乙的标准：交付文档", "乙的输入", {
+      delivered: "交付文档",
+      evidence: "文档路径",
+      uncertain: "   ",
+    });
     const cardC = await seedReview(titleC, "丙的标准：人工确认", "丙的输入");
     const cardD = await seedReview(titleD, "丁的标准：抽查", "丁的输入");
     // Deterministic oldest-first order: 甲 > 乙 > 丙 > 丁.
@@ -508,8 +523,15 @@ async function main() {
       texts: [...document.querySelectorAll('.wb-verify-text')].map((node) => node.textContent),
       file: document.querySelector('.wb-verify-file-name')?.textContent || '',
       img: document.querySelector('.wb-verify-figure img')?.getAttribute('src') || '',
-      run: Boolean(document.querySelector('.wb-verify-run')),
-      runSummary: document.querySelector('.wb-verify-run')?.textContent || '',
+      run: Boolean(
+        document.querySelector('.wb-verify-session-slot')
+          ?.closest('.wb-verify-section')
+          ?.querySelector('.wb-verify-run'),
+      ),
+      runSummary:
+        document.querySelector('.wb-verify-session-slot')
+          ?.closest('.wb-verify-section')
+          ?.querySelector('.wb-verify-run')?.textContent || '',
       session: document.querySelector('.wb-verify-session-slot')?.textContent || '',
       countdown: document.querySelector('.wb-verify-countdown')?.textContent || '',
       keys: [...document.querySelectorAll('.wb-verify-key')].map((node) => node.textContent.trim()),
@@ -536,6 +558,56 @@ async function main() {
       "底部键位 A/R/S",
       JSON.stringify(cardState.keys) === JSON.stringify(["A 收", "R 不收", "S 跳过"]),
       JSON.stringify(cardState.keys),
+    );
+
+    const selfReportA = await evaluate(`(async () => {
+      const accept = document.querySelector('.wb-verify-accept');
+      const standard = accept?.querySelector('.wb-verify-standard');
+      const block = accept?.querySelector('.wb-verify-self-report');
+      const rows = block ? [...block.querySelectorAll('.wb-verify-self dd')] : [];
+      const uncertain = block?.querySelector('.wb-verify-self-uncertain');
+      const sibling = rows[0] || null;
+      const root = document.documentElement;
+      const emphasis = {};
+      for (const theme of ['light', 'dark']) {
+        root.dataset.theme = theme;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+        const u = uncertain ? getComputedStyle(uncertain) : null;
+        const s = sibling ? getComputedStyle(sibling) : null;
+        emphasis[theme] = {
+          color: Boolean(u && s && u.color !== s.color),
+          weight: Boolean(u && s && u.fontWeight !== s.fontWeight),
+        };
+      }
+      root.dataset.theme = 'dark';
+      return {
+        inAccept: Boolean(block && accept && accept.contains(block)),
+        afterStandard: Boolean(
+          standard &&
+            block &&
+            (standard.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING),
+        ),
+        labels: block ? [...block.querySelectorAll('dt')].map((n) => n.textContent) : [],
+        values: rows.map((n) => n.textContent),
+        emphasized: uncertain?.textContent || '',
+        missing: Boolean(block?.querySelector('.wb-verify-note.warn')),
+        emphasis,
+      };
+    })()`);
+    check(
+      "右侧验收标准之后的自述三行：交付 / 依据 / 没底，没底明暗均强调",
+      selfReportA.inAccept &&
+        selfReportA.afterStandard &&
+        JSON.stringify(selfReportA.labels) === JSON.stringify(["交付", "依据", "没底"]) &&
+        JSON.stringify(selfReportA.values) ===
+          JSON.stringify(["改了验收页与后端", "test_verify 全绿", "没跑真机"]) &&
+        selfReportA.emphasized === "没跑真机" &&
+        selfReportA.missing === false &&
+        selfReportA.emphasis.light.color &&
+        selfReportA.emphasis.light.weight &&
+        selfReportA.emphasis.dark.color &&
+        selfReportA.emphasis.dark.weight,
+      JSON.stringify(selfReportA),
     );
 
     const verifyTheme = await evaluate(`(async () => {
@@ -598,6 +670,24 @@ async function main() {
     );
 
     // ---- 3. R reason panel: Esc, typing a/r/s, Ctrl+Enter -------------
+    await waitForEval(
+      `document.querySelector('.wb-verify-title')?.textContent === ${JSON.stringify(titleB)}`,
+      10000,
+      "B 卡详情加载",
+    );
+    const selfReportB = await evaluate(`(() => {
+      const block = document.querySelector('.wb-verify-accept .wb-verify-self-report');
+      return {
+        uncertain: block?.querySelector('.wb-verify-self dd.wb-verify-note.warn')?.textContent || '',
+        emphasized: Boolean(block?.querySelector('.wb-verify-self-uncertain')),
+      };
+    })()`);
+    check(
+      "没底为空显示「未填写」警示",
+      selfReportB.uncertain === "未填写" && selfReportB.emphasized === false,
+      JSON.stringify(selfReportB),
+    );
+
     await pressKey("r");
     await waitForEval("Boolean(document.querySelector('#wb-verify-reason-input'))", 5000, "理由输入");
     const emptyDisabled = await evaluate(
@@ -738,6 +828,19 @@ async function main() {
       "无验收标准警示",
     );
     check("无验收标准时显示警示", (await verifyCount()) === "1/1");
+
+    const selfReportMissing = await evaluate(`(() => {
+      const block = document.querySelector('.wb-verify-accept .wb-verify-self-report');
+      return {
+        text: block?.textContent || '',
+        rows: block ? block.querySelectorAll('.wb-verify-self dd').length : -1,
+      };
+    })()`);
+    check(
+      "无 self_report 显示「自述缺失」且不伪造",
+      selfReportMissing.rows === 0 && selfReportMissing.text.includes("自述缺失"),
+      JSON.stringify(selfReportMissing),
+    );
 
     const warnContrast = await evaluate(`(() => {
       const parse = (value) => {

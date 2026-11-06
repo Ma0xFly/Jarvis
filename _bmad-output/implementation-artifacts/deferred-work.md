@@ -101,3 +101,7 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-visual-align-007.md`
   summary: 把已完成视图的 `/board` 读取、列 key 与完成日分组并入共享 board 数据层。
   evidence: （BH9）`Board` 在 standalone 常驻并 5s 轮询，`DonePage` 打开时再起一份 5s `/board`；两处各自定义 `BoardData/BoardColumn`，`DonePage` 用字面量 `"done"` 匹配列。spec 明确 DonePage 只在激活时挂载，故本次按设计实现，共享数据层留后续。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-1-self-report.md`
+  summary: 在 Hermes `kanban_request_review` tool schema 的 metadata 描述中加入 self_report 三行契约。
+  evidence: 当前 tool schema 只列 changed_files/tests_run/commit/decisions；self_report 只能从 workbench-conventions skill 发现。修改 `~/.hermes/hermes-agent/tools/kanban_tools_schemas.py` 属上游改动，超出 3.1 的“上游零改动”边界；仓库内已补 README 契约说明，待上游愿意改 schema 时再补。

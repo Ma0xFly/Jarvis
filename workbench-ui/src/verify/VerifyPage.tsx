@@ -139,7 +139,10 @@ function sortQueue(items: QueueItem[]): QueueItem[] {
 
 function latestRun(runs: VerifyRun[] | undefined): VerifyRun | null {
   if (!runs || runs.length === 0) return null;
-  return [...runs].sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0))[0];
+  // Same order as the server: started_at, then run id.
+  return [...runs].sort(
+    (a, b) => (b.started_at ?? 0) - (a.started_at ?? 0) || b.id - a.id,
+  )[0];
 }
 
 function latestReviewEvent(events: VerifyEvent[] | undefined): VerifyEvent | null {
@@ -489,6 +492,7 @@ export default function VerifyPage({
   const accept = current?.metadata?.contract?.accept?.trim() || "";
   const input = current?.metadata?.contract?.input?.trim() || "";
   const reviewAt = current?.review_requested_at ?? null;
+  const selfReport = current?.self_report ?? null;
 
   const closeButton = (
     <button className="wb-btn wb-verify-close" type="button" onClick={onClose}>
@@ -611,11 +615,11 @@ export default function VerifyPage({
             {detailError ? <div className="wb-verify-note warn">{detailError}</div> : null}
 
             <div className="wb-verify-section">
-              <h2>本轮自述</h2>
+              <h2>运行摘要</h2>
               {summary ? (
                 <pre className="wb-verify-text">{summary}</pre>
               ) : (
-                <div className="wb-verify-note">worker 没有留下自述</div>
+                <div className="wb-verify-note">worker 没有留下运行摘要</div>
               )}
             </div>
 
@@ -675,6 +679,28 @@ export default function VerifyPage({
               )}
             </div>
 
+            <div className="wb-verify-section wb-verify-self-report">
+              <h2>worker 自述</h2>
+              {selfReport ? (
+                <dl className="wb-verify-run wb-verify-self">
+                  <dt>交付</dt>
+                  <dd>{selfReport.delivered || "—"}</dd>
+                  <dt>依据</dt>
+                  <dd>{selfReport.evidence || "—"}</dd>
+                  <dt>没底</dt>
+                  <dd
+                    className={
+                      selfReport.uncertain ? "wb-verify-self-uncertain" : "wb-verify-note warn"
+                    }
+                  >
+                    {selfReport.uncertain || "未填写"}
+                  </dd>
+                </dl>
+              ) : (
+                <p className="wb-verify-note warn">自述缺失</p>
+              )}
+            </div>
+
             {input ? (
               <div className="wb-verify-section">
                 <h2>输入 / 需求</h2>
@@ -702,7 +728,7 @@ export default function VerifyPage({
                   </dd>
                   {run.summary ? (
                     <>
-                      <dt>自述</dt>
+                      <dt>运行摘要</dt>
                       <dd className="wb-verify-run-text">{run.summary}</dd>
                     </>
                   ) : null}

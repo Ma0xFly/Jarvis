@@ -1284,6 +1284,39 @@ class WorkbenchService:
             return []
         return [value for value in parents if isinstance(value, str) and value]
 
+    SELF_REPORT_FIELDS = ("delivered", "evidence", "uncertain")
+
+    @classmethod
+    def _latest_self_report(cls, detail: dict[str, Any]) -> Optional[dict[str, str]]:
+        """The newest run's ``metadata.self_report``, normalized, or None.
+
+        Workers write the three-line handoff through
+        ``kanban_request_review(metadata={"self_report": ...})`` and Hermes
+        stores it on the run row. Only the latest run counts — no cross-round
+        stitching. Missing or malformed values degrade to None so the verify
+        page can show a warning without blocking A/R/S.
+        """
+        runs = cls._ordered_runs(detail)
+        if not runs:
+            return None
+        metadata = runs[0].get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        report = metadata.get("self_report")
+        if not isinstance(report, dict):
+            return None
+        fields: dict[str, str] = {}
+        for key in cls.SELF_REPORT_FIELDS:
+            value = report.get(key)
+            if not isinstance(value, str):
+                return None
+            fields[key] = value.strip()
+        # 交付/依据 blank is malformed, not a valid handoff. 没底 blank is
+        # meaningful: the UI renders it as "未填写" and keeps A/R/S enabled.
+        if not fields["delivered"] or not fields["evidence"]:
+            return None
+        return fields
+
     def _inbox_item(
         self, task_id: str, detail: dict[str, Any], metadata: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1300,6 +1333,7 @@ class WorkbenchService:
             "completed_at": task.get("completed_at"),
             "result": task.get("result"),
             "latest_summary": task.get("latest_summary"),
+            "self_report": self._latest_self_report(detail),
             "metadata": metadata,
             "review_requested_at": review_at,
             "review_age_seconds": age,

@@ -168,8 +168,10 @@ curl -s http://127.0.0.1:8787/api/workbench/inbox
 #      "tasks":[{"id":"t_…","title":"…","status":"review",
 #                "metadata":{"contract":{"accept":"…","input":"…"}},
 #                "result":null,"latest_summary":"…",
+#                "self_report":{"delivered":"…","evidence":"…","uncertain":""},
 #                "review_requested_at":1730000000,"review_age_seconds":120,
 #                "auto_collect_due":false,"auto_collect_error":null}, …],
+#      # self_report 只取最新 run；缺失/畸形时为 null（仍返回 200，不阻断验收）
 #      "failed_ids":[]}
 # 502 upstream_unavailable / 503 metadata_unavailable
 
@@ -214,6 +216,13 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
   窗口内 sweeper 不再重试，inbox item 暴露 `auto_collect_due` 与
   `auto_collect_error:{message,attempts,retry_in_seconds}`。
 - 队列顺序：最早进入 review 的在前；无 `review_requested` 的卡排在最后。
+- **worker 自述契约**：worker 调 `kanban_request_review` 时在
+  `metadata.self_report` 写 `{"delivered": "...", "evidence": "...", "uncertain": "..."}`
+  三个字符串（交付 / 依据 / 没底）。inbox 只读**最新 run** 的该字段，不跨轮拼接：
+  `delivered` / `evidence` 去空白后为空按缺失处理；`uncertain` 为空字符串是合法值
+  （验收页显示「未填写」）；缺失或畸形时为 `null`（验收页显示「自述缺失」）。
+  两种降级都只警示，不阻断 A/R/S。本仓库不改上游 Hermes 工具 schema；完整约定见
+  `~/.hermes/skills/workbench-conventions/SKILL.md`。
 - 环境变量覆盖（均为有限正数，非法值回落默认）：
   - `WORKBENCH_REVIEW_TTL_SECONDS` 自动收窗口，默认 `172800`（48h）
   - `WORKBENCH_REVIEW_SWEEP_SECONDS` 后台扫描间隔，默认 `300`；`0`/非法值关闭
@@ -373,8 +382,9 @@ curl -s -X POST \
   ETA 是队列槽位近似：位次 1 = 7 分钟，不扣除卡已运行时间。底部输入框回车
   建卡，今日/长期可切换（默认今日），不自动派发。
 - **验收**（独立版全屏覆盖层，不是 tab）：右上角「验收 N」与流水线「待收」
-  段/行进入。一张一屏显示验收标准、输入、worker 自述、`result`、附件
-  （文本/图片内联）与本轮运行信息（profile/状态/耗时/自述/错误）；顶栏
+  段/行进入。一张一屏显示验收标准、输入、运行摘要、worker 三行自述
+  （交付/依据/没底）、`result`、附件（文本/图片内联）与本轮运行信息
+  （profile/状态/耗时/运行摘要/错误）；顶栏
   `1/N`、进度与后端 `review_ttl_seconds` 倒计时。`A` 收、`R` 不收（理由必填，
   Ctrl/Cmd+Enter 提交）、`S` 跳过、`Esc` 退出；清空后展示本批统计并约 3 秒
   自动返回。队列 5s 轮询，跳过卡不会被重新加回；新 review 卡会自动追加。

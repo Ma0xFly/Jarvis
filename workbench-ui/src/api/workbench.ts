@@ -473,6 +473,16 @@ export interface AutoCollectError {
   retry_in_seconds?: number;
 }
 
+/** worker 在 `kanban_request_review` metadata 里写的三行自述；只读最新 run。 */
+export interface SelfReport {
+  /** 交付了什么 */
+  delivered: string;
+  /** 依据是什么 */
+  evidence: string;
+  /** 哪里没底；空白表示 worker 没填 */
+  uncertain: string;
+}
+
 /** 验收队列的一张 review 卡；`review_age_seconds` 缺失 = 无 review_requested 事件。 */
 export interface InboxTask {
   id: string;
@@ -484,6 +494,8 @@ export interface InboxTask {
   completed_at?: number | null;
   result?: string | null;
   latest_summary?: string | null;
+  /** 最新 run 的 metadata.self_report；缺失/畸形为 null，不阻断验收。 */
+  self_report?: SelfReport | null;
   metadata: TaskMetadata;
   review_requested_at?: number | null;
   review_age_seconds?: number | null;

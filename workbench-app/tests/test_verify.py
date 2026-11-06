@@ -74,6 +74,7 @@ def fake_task(
     block_recurrences: int = 0,
     links: dict | None = None,
     progress: dict | None = None,
+    runs: list[dict] | None = None,
 ) -> dict:
     now = int(time.time())
     events = [
@@ -106,7 +107,27 @@ def fake_task(
         "events": events,
         "comments": list(comments or []),
         "attachments": [],
-        "runs": [],
+        "runs": list(runs or []),
+    }
+
+
+def fake_run(
+    run_id: int,
+    *,
+    metadata: object | None = None,
+    started_at: int | None = None,
+) -> dict:
+    started = int(time.time()) if started_at is None else started_at
+    return {
+        "id": run_id,
+        "profile": "probe",
+        "status": "done",
+        "outcome": "completed",
+        "started_at": started,
+        "ended_at": started + 30,
+        "summary": "完成",
+        "metadata": metadata,
+        "error": None,
     }
 
 
@@ -560,6 +581,29 @@ class InboxTests(VerifyBackendTestCase):
         self.assertGreaterEqual(item["review_age_seconds"], 5)
         self.assertLess(item["review_age_seconds"], 60)
 
+    def test_self_report_lands_on_the_latest_run_via_review_handoff(self):
+        """Dashboard PATCH review -> kanban_db.request_review lands metadata on the run.
+
+        The worker tool wrapper (``kanban_request_review``) is not importable
+        here; this covers the same ``request_review`` path the dashboard calls.
+        """
+        card = self.server.create_task("自述链路", triage=True)
+        self.server.seed_metadata(card, {"contract": {"accept": "ok"}})
+        code, body = self.server.dispatch(card)
+        self.assertEqual(code, 200, body)
+        report = {
+            "delivered": "改了验收页",
+            "evidence": "test_verify 全绿",
+            "uncertain": "没跑真机",
+        }
+        code, body = self.server.patch_status(
+            card, "review", summary="完成", metadata={"self_report": report}
+        )
+        self.assertEqual(code, 200, body)
+        item = self.inbox_item(card)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["self_report"], report)
+
     def test_inbox_count_matches_inbox_and_never_reads_details(self):
         self.seed_review("计数卡")
         with fake_kanban(
@@ -651,6 +695,204 @@ class InboxTests(VerifyBackendTestCase):
                 self.assertEqual(body, {"ok": False, "error": "upstream_unavailable"})
             finally:
                 server.stop()
+
+
+class InboxSelfReportTests(unittest.TestCase):
+    """The inbox surfaces only the newest run's normalized ``self_report``."""
+
+    def _item(self, runs: list[dict]) -> dict:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with fake_kanban(
+            [fake_task("t1", review_events=[(1, int(time.time()) - 60)], runs=runs)]
+        ) as fake:
+            server = start_server(Path(tmp.name) / "srv", upstream=fake.base)
+            try:
+                code, body = base.http_json(
+                    "GET", server.base + "/api/workbench/inbox"
+                )
+            finally:
+                server.stop()
+        self.assertEqual(code, 200, body)
+        items = [item for item in body["tasks"] if item["id"] == "t1"]
+        self.assertEqual(len(items), 1, body)
+        return items[0]
+
+    def test_complete_self_report_is_normalized(self):
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": "  改了验收页  ",
+                            "evidence": "test_verify 全绿",
+                            "uncertain": "没跑真机",
+                        }
+                    },
+                )
+            ]
+        )
+        self.assertEqual(
+            item["self_report"],
+            {
+                "delivered": "改了验收页",
+                "evidence": "test_verify 全绿",
+                "uncertain": "没跑真机",
+            },
+        )
+
+    def test_blank_uncertain_stays_an_empty_string(self):
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": "交付",
+                            "evidence": "依据",
+                            "uncertain": "   ",
+                        }
+                    },
+                )
+            ]
+        )
+        self.assertEqual(item["self_report"]["uncertain"], "")
+
+    def test_missing_or_malformed_self_report_is_none(self):
+        cases = {
+            "no runs": [],
+            "no metadata": [fake_run(1)],
+            "metadata not dict": [fake_run(1, metadata="self_report")],
+            "no self_report": [fake_run(1, metadata={"worker_session_id": "s"})],
+            "self_report not dict": [
+                fake_run(1, metadata={"self_report": "交付 / 依据 / 没底"})
+            ],
+            "field not string": [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": 1,
+                            "evidence": "e",
+                            "uncertain": "u",
+                        }
+                    },
+                )
+            ],
+            "missing field": [
+                fake_run(1, metadata={"self_report": {"delivered": "d", "evidence": "e"}})
+            ],
+            "blank delivered": [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": "   ",
+                            "evidence": "e",
+                            "uncertain": "",
+                        }
+                    },
+                )
+            ],
+            "blank evidence": [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": "d",
+                            "evidence": " ",
+                            "uncertain": "",
+                        }
+                    },
+                )
+            ],
+            "all blank": [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": " ",
+                            "evidence": "",
+                            "uncertain": "  ",
+                        }
+                    },
+                )
+            ],
+        }
+        for label, runs in cases.items():
+            with self.subTest(label):
+                self.assertIsNone(self._item(runs)["self_report"])
+
+    def test_only_the_newest_run_counts(self):
+        now = int(time.time())
+        old = {
+            "self_report": {
+                "delivered": "旧轮",
+                "evidence": "旧依据",
+                "uncertain": "旧没底",
+            }
+        }
+        # Older run has a report, newer run is missing it or malformed: no
+        # backtracking to the older round.
+        malformed = {
+            "self_report": {"delivered": 7, "evidence": "e", "uncertain": "u"}
+        }
+        for label, newest in (
+            ("missing", fake_run(2, started_at=now - 60)),
+            ("malformed", fake_run(2, started_at=now - 60, metadata=malformed)),
+        ):
+            for runs in (
+                [fake_run(1, started_at=now - 600, metadata=old), newest],
+                [newest, fake_run(1, started_at=now - 600, metadata=old)],
+            ):
+                with self.subTest(label=label):
+                    self.assertIsNone(self._item(runs)["self_report"])
+
+        # Newest report wins even when an older one exists.
+        item = self._item(
+            [
+                fake_run(1, started_at=now - 600, metadata=old),
+                fake_run(
+                    2,
+                    started_at=now - 60,
+                    metadata={
+                        "self_report": {
+                            "delivered": "新轮",
+                            "evidence": "新依据",
+                            "uncertain": "新没底",
+                        }
+                    },
+                ),
+            ]
+        )
+        self.assertEqual(item["self_report"]["delivered"], "新轮")
+
+    def test_equal_timestamps_break_by_run_id(self):
+        now = int(time.time())
+        old = {
+            "self_report": {
+                "delivered": "旧轮",
+                "evidence": "旧依据",
+                "uncertain": "旧没底",
+            }
+        }
+        item = self._item(
+            [
+                fake_run(1, started_at=now - 60, metadata={}),
+                fake_run(2, started_at=now - 60, metadata=old),
+            ]
+        )
+        self.assertEqual(item["self_report"]["delivered"], "旧轮")
+
+        # Higher id without a report wins the tie: still no backtracking.
+        item = self._item(
+            [
+                fake_run(1, started_at=now - 60, metadata=old),
+                fake_run(2, started_at=now - 60, metadata={}),
+            ]
+        )
+        self.assertIsNone(item["self_report"])
 
 
 class VerifyActionTests(VerifyBackendTestCase):

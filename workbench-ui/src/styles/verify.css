@@ -171,6 +171,14 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* worker 三行自述复用 .wb-verify-run 网格；只补换行与没底强调 */
+.wb-verify-self dd {
+  white-space: pre-wrap;
+}
+.wb-verify-self-uncertain {
+  color: var(--wb-wait);
+  font-weight: 600;
+}
 .wb-verify-text {
   margin: 0;
   padding: 11px 13px;
