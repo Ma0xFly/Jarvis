@@ -179,6 +179,53 @@
   color: var(--wb-wait);
   font-weight: 600;
 }
+/* 固化登记：类型 / 路径 / 状态 + 手动 verified（overlay 只改显示） */
+.wb-verify-solidified-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.wb-verify-solidified-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 7px 9px;
+  border: 1px solid var(--wb-border);
+  border-radius: 8px;
+  background: var(--wb-card);
+  font-size: 11.5px;
+}
+.wb-verify-solidified-type {
+  color: var(--wb-muted);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.wb-verify-solidified-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wb-verify-solidified-status {
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.wb-verify-solidified-status.pending {
+  color: var(--wb-wait);
+}
+.wb-verify-solidified-status.verified {
+  color: color-mix(in srgb, var(--wb-ok) 76%, var(--wb-fg));
+}
+.wb-verify-solidified-verify {
+  grid-column: 1 / -1;
+  justify-self: start;
+  font-size: 11px;
+  padding: 2px 9px;
+}
 .wb-verify-text {
   margin: 0;
   padding: 11px 13px;

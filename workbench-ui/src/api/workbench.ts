@@ -34,6 +34,8 @@ export interface TaskMetadata {
   bucket?: Bucket;
   contract?: WorkbenchContract;
   contract_defaults?: ContractDefaults;
+  /** 手动把固化条目标记为 verified 的 workbench 自有 overlay。 */
+  solidified_verified?: SolidifiedVerifiedEntry[];
   [key: string]: unknown;
 }
 
@@ -62,6 +64,7 @@ export type WorkbenchErrorCode =
   | "metadata_failed"
   | "not_in_review"
   | "not_in_store"
+  | "missing_solidified"
   | "reason_required"
   | "reason_too_long"
   | "stale_review"
@@ -99,6 +102,7 @@ const ERROR_CODES: readonly WorkbenchErrorCode[] = [
   "metadata_failed",
   "not_in_review",
   "not_in_store",
+  "missing_solidified",
   "reason_required",
   "reason_too_long",
   "stale_review",
@@ -483,6 +487,23 @@ export interface SelfReport {
   uncertain: string;
 }
 
+export type SolidifiedType = "routing" | "skill_patch" | "script";
+export type SolidifiedStatus = "pending" | "verified";
+
+/** worker 随 review 登记的可复用件；只读最新 run 的 `metadata.solidified`。 */
+export interface SolidifiedEntry {
+  type: SolidifiedType;
+  path: string;
+  status: SolidifiedStatus;
+}
+
+/** 手动「标记已验证」写进 workbench metadata 的 overlay 条目。 */
+export interface SolidifiedVerifiedEntry {
+  path: string;
+  /** epoch seconds */
+  verified_at: number;
+}
+
 /** 验收队列的一张 review 卡；`review_age_seconds` 缺失 = 无 review_requested 事件。 */
 export interface InboxTask {
   id: string;
@@ -496,6 +517,8 @@ export interface InboxTask {
   latest_summary?: string | null;
   /** 最新 run 的 metadata.self_report；缺失/畸形为 null，不阻断验收。 */
   self_report?: SelfReport | null;
+  /** 最新 run 的 metadata.solidified；缺失/全非法为空数组，阻断 accept。 */
+  solidified?: SolidifiedEntry[];
   metadata: TaskMetadata;
   review_requested_at?: number | null;
   review_age_seconds?: number | null;
@@ -651,6 +674,50 @@ export async function verifyTask(
       status: typeof data.status === "string" ? data.status : "",
       comment_written: data.comment_written === true,
     };
+  } catch (error) {
+    throw toWorkbenchError(error, "verify");
+  }
+}
+
+/**
+ * 手动标记一条固化为 verified。只写 workbench.db 的 overlay，不改上游 run
+ * metadata；按 path 幂等（重复调用返回同一份 overlay）。
+ */
+export async function markSolidifiedVerified(
+  taskId: string,
+  path: string,
+): Promise<SolidifiedVerifiedEntry[]> {
+  if (!taskId || !taskId.trim()) {
+    throw new WorkbenchError("verify_failed", "缺少任务 id");
+  }
+  const trimmedPath = path.trim();
+  if (!trimmedPath) {
+    throw new WorkbenchError("invalid_request", "缺少固化路径");
+  }
+  try {
+    const data = (await api(
+      WORKBENCH + "/solidified/" + encodeURIComponent(taskId) + "/verify",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: trimmedPath }),
+      },
+    )) as { ok?: unknown; solidified_verified?: unknown } | null;
+    if (!data || data.ok !== true || !Array.isArray(data.solidified_verified)) {
+      throw new WorkbenchError("verify_failed", "固化验证响应格式不正确", 200);
+    }
+    return data.solidified_verified
+      .filter((entry): entry is { path: string; verified_at: number } => {
+        if (!entry || typeof entry !== "object") return false;
+        const source = entry as { path?: unknown; verified_at?: unknown };
+        return (
+          typeof source.path === "string" &&
+          source.path.length > 0 &&
+          typeof source.verified_at === "number" &&
+          Number.isFinite(source.verified_at)
+        );
+      })
+      .map((entry) => ({ path: entry.path, verified_at: entry.verified_at }));
   } catch (error) {
     throw toWorkbenchError(error, "verify");
   }

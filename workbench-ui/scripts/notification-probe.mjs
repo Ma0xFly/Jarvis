@@ -354,9 +354,23 @@ async function main() {
       await dispatch(taskId);
       return taskId;
     };
-    const seedReview = async (title, { parents, age }) => {
+    const seedReview = async (title, { parents, age, solidified = true }) => {
       const taskId = await seedReady(title, parents);
-      await patchStatus(taskId, "review", { summary: `完成：${title}` });
+      await patchStatus(taskId, "review", {
+        summary: `完成：${title}`,
+        ...(solidified
+          ? {
+              // 3.2 accept gate: review probe cards need a valid registration.
+              metadata: {
+                solidified: {
+                  type: "script",
+                  path: "scripts/notification-probe.mjs",
+                  status: "pending",
+                },
+              },
+            }
+          : {}),
+      });
       setReviewEventAge(taskId, age);
       return taskId;
     };
@@ -658,6 +672,11 @@ async function main() {
 
     // ---- new card after mount + external sweep + 5s UI poll -----------
     await seedReview("轮询新验收", { age: 30 });
+    // No solidified registration: accept must be blocked (3.2 gate).
+    const noSolid = await seedReview("缺固化验收", {
+      age: 20,
+      solidified: false,
+    });
     await sweep();
     await waitForEval(
       `[...document.querySelectorAll('.wb-notify-item')]
@@ -666,6 +685,12 @@ async function main() {
       "5s 轮询出现新 review 卡",
     );
     check("挂载后新 review 卡经 5s 轮询出现", true);
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-notify-item')]
+        .some((node) => node.textContent.includes("缺固化验收"))`,
+      12000,
+      "缺固化卡出现在通知中心",
+    );
 
     // ---- two-phase logger: non-zero exit surfaces desktop.last_error ----
     writeFileSync(notifyFailFlag, "1");
@@ -760,6 +785,25 @@ async function main() {
       { timeout: 8000, interval: 150, label: "不收后通知移除" },
     );
     check("通知内不收 → comment + triage + 移除通知", true);
+
+    // ---- accept blocked without a valid solidified registration --------
+    const blockedAccept = await clickInItem("缺固化验收", "收");
+    check(
+      "点击缺固化 review 卡的收",
+      blockedAccept.ok === true,
+      JSON.stringify(blockedAccept),
+    );
+    await waitForEval(
+      `[...document.querySelectorAll('.wb-notify-error')].some(
+        (node) => node.textContent.includes("没有可用的固化记录"),
+      )`,
+      8000,
+      "缺固化收被阻断提示",
+    );
+    check(
+      "缺固化在通知中心收被阻断，卡留在 review",
+      (await httpJson("GET", taskUrl(noSolid))).data?.task?.status === "review",
+    );
 
     // ---- accept sibling review ----------------------------------------
     const acceptClick = await clickInItem("兄弟卡甲", "收");

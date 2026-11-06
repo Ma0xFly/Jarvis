@@ -135,6 +135,13 @@ AUTO_COLLECT_COMMENT = "48h 自动收"
 AUTO_COLLECT_AUDIT_SUMMARY = "48h 自动收（worker 自述保留在 review_requested 事件/run）"
 MAX_REJECT_REASON_CHARS = 2000
 VERIFY_AUTHOR = "workbench"
+# Solidified handoff (Story 3.2): workers register reusable assets on the run
+# that closes the card. Only the latest run counts; invalid entries are ignored
+# so a malformed handoff never blocks reject/skip or the 48h auto-collect.
+SOLIDIFIED_TYPES = ("routing", "skill_patch", "script")
+SOLIDIFIED_STATUSES = ("pending", "verified")
+MAX_SOLIDIFIED_ENTRIES = 50
+MAX_SOLIDIFIED_PATH_CHARS = 500
 
 # Session trace (Story 2.3). The Hermes runtime owns ``~/.hermes/state.db``;
 # the workbench only opens it read-only to render one worker session. Nothing
@@ -1317,12 +1324,106 @@ class WorkbenchService:
             return None
         return fields
 
+    @staticmethod
+    def _normalize_solidified(value: Any) -> list[dict[str, str]]:
+        """Normalize ``metadata.solidified`` to valid ``{type,path,status}``.
+
+        Accepts a single object or a list. Anything malformed is dropped rather
+        than raising: "no valid record" is a normal, visible state (the accept
+        gate then answers ``missing_solidified``).
+        """
+        if isinstance(value, dict):
+            candidates: list[Any] = [value]
+        elif isinstance(value, list):
+            candidates = value
+        else:
+            return []
+        entries: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in candidates[:MAX_SOLIDIFIED_ENTRIES]:
+            if not isinstance(candidate, dict):
+                continue
+            entry_type = candidate.get("type")
+            path = candidate.get("path")
+            status = candidate.get("status")
+            if entry_type not in SOLIDIFIED_TYPES:
+                continue
+            if not isinstance(path, str) or not path.strip():
+                continue
+            if status not in SOLIDIFIED_STATUSES:
+                continue
+            stripped = path.strip()
+            if len(stripped) > MAX_SOLIDIFIED_PATH_CHARS:
+                continue
+            key = (entry_type, stripped)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"type": entry_type, "path": stripped, "status": status})
+            if len(entries) >= MAX_SOLIDIFIED_ENTRIES:
+                break
+        return entries
+
+    @classmethod
+    def _latest_solidified(cls, detail: dict[str, Any]) -> list[dict[str, str]]:
+        """The newest run's ``metadata.solidified``, normalized; [] if absent.
+
+        Workers write it through ``kanban_request_review(metadata={"solidified":
+        ...})`` and Hermes stores it on ``task_runs.metadata``. Like the
+        self-report, only the latest run is read (no cross-round stitching).
+        """
+        runs = cls._ordered_runs(detail)
+        if not runs:
+            return []
+        metadata = runs[0].get("metadata")
+        if not isinstance(metadata, dict):
+            return []
+        return cls._normalize_solidified(metadata.get("solidified"))
+
+    @staticmethod
+    def _normalize_solidified_verified(value: Any) -> list[dict[str, Any]]:
+        """Read the workbench-owned ``solidified_verified`` overlay defensively.
+
+        Stored as ``{path, verified_at}[]``; a corrupt row degrades to [] so a
+        broken overlay cannot fail the verify page or the endpoint.
+        """
+        if not isinstance(value, list):
+            return []
+        entries: list[dict[str, Any]] = []
+        for candidate in value:
+            if not isinstance(candidate, dict):
+                continue
+            path = candidate.get("path")
+            verified_at = candidate.get("verified_at")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            # NaN/Infinity survive Python's permissive JSON decoder but cannot
+            # be int()'d; an int too large for float also overflows inside
+            # math.isfinite. A corrupt overlay must degrade, not 500.
+            try:
+                valid_timestamp = _is_number(verified_at)
+            except OverflowError:
+                valid_timestamp = False
+            if not valid_timestamp:
+                continue
+            entries.append({"path": path.strip(), "verified_at": int(verified_at)})
+        return entries
+
     def _inbox_item(
         self, task_id: str, detail: dict[str, Any], metadata: dict[str, Any]
     ) -> dict[str, Any]:
         task = self._detail_task(detail)
         review_at = self._latest_review_requested_at(detail)
         age = self._review_age_seconds(review_at, time.time())
+        # The overlay is workbench-owned, but a corrupt row (NaN/Infinity,
+        # junk entries) must not make the inbox unserializable.
+        safe_metadata = dict(metadata)
+        if "solidified_verified" in safe_metadata:
+            safe_metadata["solidified_verified"] = (
+                self._normalize_solidified_verified(
+                    safe_metadata["solidified_verified"]
+                )
+            )
         return {
             "id": task_id,
             "title": task.get("title") if isinstance(task.get("title"), str) else "",
@@ -1334,7 +1435,8 @@ class WorkbenchService:
             "result": task.get("result"),
             "latest_summary": task.get("latest_summary"),
             "self_report": self._latest_self_report(detail),
-            "metadata": metadata,
+            "solidified": self._latest_solidified(detail),
+            "metadata": safe_metadata,
             "review_requested_at": review_at,
             "review_age_seconds": age,
             "auto_collect_due": age is not None and age >= self.review_ttl_seconds,
@@ -1889,6 +1991,12 @@ class WorkbenchService:
                 }
 
             if action == "accept":
+                if not self._latest_solidified(detail):
+                    return 400, {
+                        "ok": False,
+                        "error": "missing_solidified",
+                        "comment_written": False,
+                    }
                 try:
                     patched = self._patch_task(
                         normalized,
@@ -1936,6 +2044,70 @@ class WorkbenchService:
             return self._verify_patch_response(
                 normalized, patched, "reject", "triage", comment_written
             )
+
+    def mark_solidified_verified(
+        self, task_id: str, path: Any
+    ) -> tuple[int, dict[str, Any]]:
+        """Record a manual ``pending -> verified`` overlay in workbench.db.
+
+        The upstream run metadata is never patched: it stays the worker's
+        original registration. ``verified`` is a workbench-only judgement,
+        keyed by ``path`` and idempotent (repeat clicks neither duplicate the
+        entry nor move its timestamp). Only cards still in ``review`` qualify,
+        and a path that is not registered on the latest run is rejected with
+        ``missing_solidified``.
+        """
+        normalized_id = task_id.strip() if isinstance(task_id, str) else ""
+        if not normalized_id:
+            return self._fail(400, "invalid_request")
+        normalized_path = path.strip() if isinstance(path, str) else ""
+        if not normalized_path:
+            return self._fail(400, "invalid_request")
+
+        with self._task_lock(normalized_id):
+            try:
+                detail = self._task_detail(
+                    normalized_id, time.monotonic() + REVIEW_BUDGET_SECONDS
+                )
+            except TaskNotFound:
+                return self._fail(404, "not_found")
+            except UpstreamUnavailable:
+                return self._fail(502, "upstream_unavailable")
+
+            current = self._detail_task(detail).get("status")
+            if current != REVIEW_STATUS:
+                return self._fail(
+                    409,
+                    "not_in_review",
+                    current if isinstance(current, str) else None,
+                )
+
+            registered = self._latest_solidified(detail)
+            if not any(entry["path"] == normalized_path for entry in registered):
+                return self._fail(400, "missing_solidified")
+
+            try:
+                metadata = self.store.get(normalized_id) or {}
+            except MetadataUnavailable:
+                return self._fail(503, "metadata_unavailable")
+            overlay = self._normalize_solidified_verified(
+                metadata.get("solidified_verified")
+            )
+            if not any(entry["path"] == normalized_path for entry in overlay):
+                overlay.append(
+                    {"path": normalized_path, "verified_at": int(time.time())}
+                )
+                try:
+                    self.store.merge(
+                        normalized_id, {"solidified_verified": overlay}
+                    )
+                except MetadataUnavailable:
+                    return self._fail(503, "metadata_unavailable")
+            return 200, {
+                "ok": True,
+                "path": normalized_path,
+                "solidified_verified": overlay,
+            }
 
     # -- session trace (Story 2.3) ----------------------------------------
 
@@ -3650,6 +3822,22 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
             payload.get("action"),
             payload.get("reason"),
             payload.get("expected_review_at"),
+        )
+        return JSONResponse(body, status_code=status_code)
+
+    @app.post("/api/workbench/solidified/{task_id}/verify")
+    async def solidified_verify(task_id: str, request: Request) -> JSONResponse:
+        """Manual ``pending -> verified`` overlay; never PATCHes upstream runs."""
+        guard = _request_guard(request)
+        if guard is not None:
+            return guard
+        payload, body_error = await _request_json_object(request)
+        if body_error is not None:
+            if body_error == "payload_too_large":
+                return _json_error(413, "payload_too_large")
+            return _json_error(400, "invalid_request")
+        status_code, body = await run_in_threadpool(
+            service.mark_solidified_verified, task_id, payload.get("path")
         )
         return JSONResponse(body, status_code=status_code)
 

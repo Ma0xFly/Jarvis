@@ -9,6 +9,8 @@
  * Covered:
  *   - count-only header, full-screen open, focus/trap, 1/N, countdown tokens
  *   - text + image attachments, result/summary/run info, session entry
+ *   - solidified: single/array display, manual verified overlay (idempotent),
+ *     missing registration blocks accept with missing_solidified
  *   - key repeat ignored; A accept; R reason rules (Esc, typing a/r/s,
  *     Ctrl+Enter); S skip with a remaining card; 5s poll does not re-add skip
  *   - batch stats, ~3s auto-exit, appended card during stats/poll
@@ -327,7 +329,7 @@ async function main() {
         throw new Error(`上传附件失败 ${taskId}: ${response.status} ${await response.text()}`);
       }
     };
-    const seedReview = async (title, accept, input, selfReport) => {
+    const seedReview = async (title, accept, input, selfReport, solidified) => {
       const card = await createUpstream(title);
       await setMetadata(card, {
         bucket: "today",
@@ -341,6 +343,9 @@ async function main() {
       if (dispatched.status !== 200) {
         throw new Error(`派发失败 ${title}: ${dispatched.status} ${JSON.stringify(dispatched.data)}`);
       }
+      const metadata = {};
+      if (selfReport) metadata.self_report = selfReport;
+      if (solidified !== undefined) metadata.solidified = solidified;
       // kanban_request_review writes metadata onto the closing run; seeding it
       // through the same PATCH keeps the run shape the workbench reads.
       const reviewed = await httpJson(
@@ -349,7 +354,7 @@ async function main() {
         {
           status: "review",
           summary: `完成：${title}`,
-          ...(selfReport ? { metadata: { self_report: selfReport } } : {}),
+          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
         },
       );
       if (reviewed.status !== 200) {
@@ -362,22 +367,65 @@ async function main() {
     const titleB = "验收探针乙";
     const titleC = "验收探针丙";
     const titleD = "验收探针丁";
-    const cardA = await seedReview(titleA, "甲的标准：跑通测试", "甲的输入", {
-      delivered: "改了验收页与后端",
-      evidence: "test_verify 全绿",
-      uncertain: "没跑真机",
-    });
+    const SOLID_A = {
+      type: "script",
+      path: "scripts/verify-probe-a.sh",
+      status: "pending",
+    };
+    const SOLID_B = [
+      { type: "routing", path: "routing.json#verify-probe", status: "verified" },
+      {
+        type: "skill_patch",
+        path: "skills/workbench-conventions/SKILL.md",
+        status: "pending",
+      },
+    ];
+    const SOLID_D = {
+      type: "script",
+      path: "scripts/verify-probe-d.sh",
+      status: "pending",
+    };
+    // Upstream `verified` only: accept must still pass without a manual overlay.
+    const SOLID_E = {
+      type: "routing",
+      path: "routing.json#verify-probe-e",
+      status: "verified",
+    };
+    const cardA = await seedReview(
+      titleA,
+      "甲的标准：跑通测试",
+      "甲的输入",
+      {
+        delivered: "改了验收页与后端",
+        evidence: "test_verify 全绿",
+        uncertain: "没跑真机",
+      },
+      SOLID_A,
+    );
     await uploadAttachment(cardA, "probe-note.txt", "probe attachment", "text/plain");
     await uploadAttachment(cardA, "pixel.png", PNG_PIXEL, "image/png");
     updateKanban("UPDATE tasks SET result=? WHERE id=?", cardA, "实际产出文本");
     // Uncertain present but blank: the UI must warn「未填写」without blocking.
-    const cardB = await seedReview(titleB, "乙的标准：交付文档", "乙的输入", {
-      delivered: "交付文档",
-      evidence: "文档路径",
-      uncertain: "   ",
-    });
+    const cardB = await seedReview(
+      titleB,
+      "乙的标准：交付文档",
+      "乙的输入",
+      {
+        delivered: "交付文档",
+        evidence: "文档路径",
+        uncertain: "   ",
+      },
+      SOLID_B,
+    );
+    // No solidified on purpose: accept must be blocked with missing_solidified.
     const cardC = await seedReview(titleC, "丙的标准：人工确认", "丙的输入");
-    const cardD = await seedReview(titleD, "丁的标准：抽查", "丁的输入");
+    const cardD = await seedReview(
+      titleD,
+      "丁的标准：抽查",
+      "丁的输入",
+      undefined,
+      SOLID_D,
+    );
     // Deterministic oldest-first order: 甲 > 乙 > 丙 > 丁.
     setReviewEventAge(cardA, 400);
     setReviewEventAge(cardB, 300);
@@ -610,6 +658,93 @@ async function main() {
       JSON.stringify(selfReportA),
     );
 
+    const solidifiedA = await evaluate(`(() => {
+      const accept = document.querySelector('.wb-verify-accept');
+      const self = accept?.querySelector('.wb-verify-self-report');
+      const block = accept?.querySelector('.wb-verify-solidified');
+      const item = block?.querySelector('.wb-verify-solidified-item');
+      return {
+        inAccept: Boolean(block && accept && accept.contains(block)),
+        afterSelfReport: Boolean(
+          self &&
+            block &&
+            (self.compareDocumentPosition(block) & Node.DOCUMENT_POSITION_FOLLOWING),
+        ),
+        type: item?.querySelector('.wb-verify-solidified-type')?.textContent || '',
+        typeKey:
+          item?.querySelector('.wb-verify-solidified-type')?.getAttribute('data-type') || '',
+        path: item?.querySelector('.wb-verify-solidified-path')?.textContent || '',
+        status: item?.querySelector('.wb-verify-solidified-status')?.textContent || '',
+        button: item?.querySelector('.wb-verify-solidified-verify')?.textContent || '',
+        missing: Boolean(block?.querySelector('.wb-verify-note.warn')),
+      };
+    })()`);
+    check(
+      "固化块位于自述之后：类型/路径/状态 + 标记按钮",
+      solidifiedA.inAccept &&
+        solidifiedA.afterSelfReport &&
+        solidifiedA.typeKey === "script" &&
+        solidifiedA.type === "脚本" &&
+        solidifiedA.path === SOLID_A.path &&
+        solidifiedA.status === "待验证" &&
+        solidifiedA.button === "标记已验证" &&
+        solidifiedA.missing === false,
+      JSON.stringify(solidifiedA),
+    );
+
+    const clickedVerify = await click(
+      ".wb-verify-solidified-item .wb-verify-solidified-verify",
+    );
+    check("点击标记已验证", clickedVerify === true);
+    await waitForEval(
+      "document.querySelector('.wb-verify-solidified-status')?.textContent === '已验证'",
+      8000,
+      "固化变为已验证",
+    );
+    const markedState = await evaluate(`(() => ({
+      status: document.querySelector('.wb-verify-solidified-status')?.textContent || '',
+      button: Boolean(document.querySelector('.wb-verify-solidified-verify')),
+    }))()`);
+    const inboxAfterMark = await httpJson("GET", `${base}/api/workbench/inbox`);
+    const itemAfterMark = inboxAfterMark.data.tasks.find((task) => task.id === cardA);
+    check(
+      "手动 verified 写 workbench overlay，按钮消失",
+      markedState.status === "已验证" &&
+        markedState.button === false &&
+        itemAfterMark?.metadata?.solidified_verified?.length === 1 &&
+        itemAfterMark.metadata.solidified_verified[0].path === SOLID_A.path,
+      JSON.stringify({
+        markedState,
+        verified: itemAfterMark?.metadata?.solidified_verified,
+      }),
+    );
+
+    const repeated = await httpJson(
+      "POST",
+      `${base}/api/workbench/solidified/${encodeURIComponent(cardA)}/verify`,
+      { path: SOLID_A.path },
+    );
+    check(
+      "重复标记幂等（overlay 仍一条）",
+      repeated.status === 200 &&
+        repeated.data.solidified_verified.filter(
+          (entry) => entry.path === SOLID_A.path,
+        ).length === 1,
+      JSON.stringify(repeated),
+    );
+    const upstreamA = await taskDetail(cardA);
+    const upstreamRegistered = (upstreamA?.runs || [])
+      .map((run) => run?.metadata?.solidified)
+      .filter(Boolean)
+      .flat();
+    check(
+      "上游 run 固化保持 pending（overlay 不 PATCH 上游）",
+      upstreamRegistered.some(
+        (entry) => entry.path === SOLID_A.path && entry.status === "pending",
+      ),
+      JSON.stringify(upstreamRegistered),
+    );
+
     const verifyTheme = await evaluate(`(async () => {
       const root = document.documentElement;
       const overlay = document.querySelector('.wb-verify-overlay');
@@ -686,6 +821,39 @@ async function main() {
       "没底为空显示「未填写」警示",
       selfReportB.uncertain === "未填写" && selfReportB.emphasized === false,
       JSON.stringify(selfReportB),
+    );
+
+    const solidifiedB = await evaluate(`(() => {
+      const items = [...document.querySelectorAll(
+        '.wb-verify-accept .wb-verify-solidified-item',
+      )];
+      return {
+        count: items.length,
+        types: items.map(
+          (item) => item.querySelector('.wb-verify-solidified-type')?.getAttribute('data-type'),
+        ),
+        paths: items.map(
+          (item) => item.querySelector('.wb-verify-solidified-path')?.textContent,
+        ),
+        statuses: items.map(
+          (item) => item.querySelector('.wb-verify-solidified-status')?.textContent,
+        ),
+        buttons: items.map((item) =>
+          Boolean(item.querySelector('.wb-verify-solidified-verify')),
+        ),
+      };
+    })()`);
+    check(
+      "数组固化逐条展示，上游 verified 不显示标记按钮",
+      solidifiedB.count === 2 &&
+        JSON.stringify(solidifiedB.types) ===
+          JSON.stringify(SOLID_B.map((entry) => entry.type)) &&
+        JSON.stringify(solidifiedB.paths) ===
+          JSON.stringify(SOLID_B.map((entry) => entry.path)) &&
+        JSON.stringify(solidifiedB.statuses) ===
+          JSON.stringify(["已验证", "待验证"]) &&
+        JSON.stringify(solidifiedB.buttons) === JSON.stringify([false, true]),
+      JSON.stringify(solidifiedB),
     );
 
     await pressKey("r");
@@ -842,6 +1010,39 @@ async function main() {
       JSON.stringify(selfReportMissing),
     );
 
+    const solidifiedC = await evaluate(`(() => {
+      const block = document.querySelector('.wb-verify-accept .wb-verify-solidified');
+      return {
+        items: block ? block.querySelectorAll('.wb-verify-solidified-item').length : -1,
+        text: block?.textContent || '',
+      };
+    })()`);
+    check(
+      "无固化时显示阻断原因",
+      solidifiedC.items === 0 && solidifiedC.text.includes("没有可用的固化记录"),
+      JSON.stringify(solidifiedC),
+    );
+
+    const countBeforeBlocked = await verifyCount();
+    await pressKey("a");
+    await waitForEval(
+      `Boolean([...document.querySelectorAll('.wb-verify-error')].find(
+        (node) => node.textContent.includes('没有可用的固化记录'),
+      ))`,
+      5000,
+      "缺固化按 A 被阻断提示",
+    );
+    check(
+      "缺固化按 A 返回 missing_solidified，卡留在 review",
+      (await verifyTitle()) === titleC &&
+        (await verifyCount()) === countBeforeBlocked &&
+        (await taskStatus(cardC)) === "review",
+      JSON.stringify({
+        count: await verifyCount(),
+        status: await taskStatus(cardC),
+      }),
+    );
+
     const warnContrast = await evaluate(`(() => {
       const parse = (value) => {
         const rgba = value.match(/^rgba?\\(([^)]+)\\)$/);
@@ -915,7 +1116,13 @@ async function main() {
     // A new review card appears while the overlay is open: the 5s poll must
     // append it to the queue and keep the countdown working.
     const titleE = "追加验收卡";
-    const cardE = await seedReview(titleE, "追加标准", "追加输入");
+    const cardE = await seedReview(
+      titleE,
+      "追加标准",
+      "追加输入",
+      undefined,
+      SOLID_E,
+    );
     await waitFor(
       async () => (await verifyCount()) === "1/2",
       { timeout: 10000, interval: 200, label: "轮询追加新卡" },
@@ -964,6 +1171,21 @@ async function main() {
       "外部改状态后 A 收 409 并移到下一张",
       triageState.dispatched === true && (await taskStatus(cardC)) === "triage",
       JSON.stringify(triageState),
+    );
+
+    const solidifiedE = await evaluate(`(() => {
+      const item = document.querySelector(
+        '.wb-verify-accept .wb-verify-solidified-item',
+      );
+      return {
+        status: item?.querySelector('.wb-verify-solidified-status')?.textContent || '',
+        button: Boolean(item?.querySelector('.wb-verify-solidified-verify')),
+      };
+    })()`);
+    check(
+      "上游 verified 记录无需手动标记（accept 不被阻断）",
+      solidifiedE.status === "已验证" && solidifiedE.button === false,
+      JSON.stringify(solidifiedE),
     );
 
     // ---- 7. accept the appended card → stats + auto-exit -------------

@@ -169,9 +169,12 @@ curl -s http://127.0.0.1:8787/api/workbench/inbox
 #                "metadata":{"contract":{"accept":"…","input":"…"}},
 #                "result":null,"latest_summary":"…",
 #                "self_report":{"delivered":"…","evidence":"…","uncertain":""},
+#                "solidified":[{"type":"script","path":"scripts/x.sh",
+#                               "status":"pending"}],
 #                "review_requested_at":1730000000,"review_age_seconds":120,
 #                "auto_collect_due":false,"auto_collect_error":null}, …],
-#      # self_report 只取最新 run；缺失/畸形时为 null（仍返回 200，不阻断验收）
+#      # self_report / solidified 都只取最新 run；缺失/畸形降级（自述 null、
+#      # 固化 []），不 500；固化 [] 会让 accept 被 400 阻断
 #      "failed_ids":[]}
 # 502 upstream_unavailable / 503 metadata_unavailable
 
@@ -186,6 +189,8 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/reviews/sweep \
 curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
   -H 'content-type: application/json' -d '{"action":"accept"}'
 # 200 {"ok":true,"action":"accept","status":"done","comment_written":false}
+# accept 额外要求最新 run 至少一条合法 solidified，否则：
+#   400 {"ok":false,"error":"missing_solidified","comment_written":false}
 # reject 必填 reason（trim 后 1–2000 字）：
 #   {"action":"reject","reason":"没跑测试"}
 #   200 {"ok":true,"action":"reject","status":"triage","comment_written":true}
@@ -193,6 +198,14 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
 #   404 not_found（带 comment_written）
 #   409 not_in_review（重读后卡已离开 review）
 #   502 upstream_unavailable（重读后卡仍在 review；带 comment_written）
+
+# 手动「标记已验证」：只写 workbench.db overlay，不 PATCH 上游 run metadata
+curl -s -X POST http://127.0.0.1:8787/api/workbench/solidified/<task_id>/verify \
+  -H 'content-type: application/json' -d '{"path":"scripts/x.sh"}'
+# 200 {"ok":true,"path":"scripts/x.sh",
+#      "solidified_verified":[{"path":"scripts/x.sh","verified_at":1730000000}]}
+# 400 invalid_request（path 空）/ missing_solidified（path 不在最新 run）
+# 404 not_found / 502 upstream_unavailable / 503 metadata_unavailable
 ```
 
 规则：
@@ -223,6 +236,17 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/verify/<task_id> \
   （验收页显示「未填写」）；缺失或畸形时为 `null`（验收页显示「自述缺失」）。
   两种降级都只警示，不阻断 A/R/S。本仓库不改上游 Hermes 工具 schema；完整约定见
   `~/.hermes/skills/workbench-conventions/SKILL.md`。
+- **固化登记契约**：worker 在 `kanban_request_review(metadata={...})` 里写
+  `solidified`（单条对象或数组），每条形如
+  `{"type":"routing|skill_patch|script","path":"...","status":"pending|verified"}`。
+  工作台只读**最新 run** 的该字段；`path` 非空、`type`/`status` 在枚举内才算合法，
+  非法项忽略，全部非法按缺失处理（返回 `[]`，不 500）。`path` 只作不透明标识
+  （工作台不读取/不编辑对应文件），单条 ≤500 字符；最多读取前 50 条，按
+  `type:path` 去重。accept 要求至少一条合法
+  记录，否则 400 `missing_solidified` 且卡留在 review；reject/skip 与 48h 自动收
+  不受影响。手动「标记已验证」按 `path` 幂等写 workbench.db 的
+  `task_metadata.solidified_verified`（`{path, verified_at}[]`），不 PATCH 上游
+  run metadata——上游 `pending` 保留为原始登记，overlay 只负责验收页显示。
 - 环境变量覆盖（均为有限正数，非法值回落默认）：
   - `WORKBENCH_REVIEW_TTL_SECONDS` 自动收窗口，默认 `172800`（48h）
   - `WORKBENCH_REVIEW_SWEEP_SECONDS` 后台扫描间隔，默认 `300`；`0`/非法值关闭
@@ -337,6 +361,8 @@ curl -s -X POST \
 #     review_requested 不一致时拒绝，避免旧通知操作新一轮 review）
 # accept/reject 直接调用 2.1 verify：
 #   200 {"ok":true,"action":"accept","status":"done","comment_written":false}
+#   400 missing_solidified（accept 时最新 run 无合法固化；卡留在 review，
+#       通知也保留，用户可改走不收/打回）
 #   verify 失败按 2.1 状态码回传，通知保留以便重试
 ```
 
@@ -420,7 +446,7 @@ curl -s -X POST \
 | `workbench.db` | 运行期生成的工作台 metadata 库（已 gitignore） |
 | `tests/test_dispatch.py` | 派发/闸门/metadata 的可重复集成测试（临时库，不碰真实数据） |
 | `tests/test_todo.py` | 待办建卡 / metadata 写端点的可重复集成测试 |
-| `tests/test_verify.py` | inbox / count / sweep / verify / 48h 自动收与退避的可重复集成测试 |
+| `tests/test_verify.py` | inbox / count / sweep / verify / solidified 归一化与 accept 门禁 / overlay / 48h 自动收与退避的可重复集成测试 |
 | `tests/test_notifications.py` | 通知分类/攒批/升级/日报/槽/动作/snooze/命令失败/后台 10s 的测试 |
 | `tests/test_session.py` | 会话解析/只读 state.db/窗口与过滤/截断/脱敏/no-store 的集成测试 |
 | `web/index.js` / `web/style.css` | `workbench-ui` 的构建产物（禁止手改） |
@@ -476,6 +502,12 @@ done/archived、running、非法 defaults 与卡覆盖、metadata 201-id 返回
 与回执/徽标对比度、窄视口与双 tab 状态保持；并覆盖看板拖到就绪走 dispatch
 （快照/位次/中文闸门提示）、dispatch 5s 超时清理 pending 与串行锁、插件宿主
 SDK stub（只读就绪列、其他列仍可 PATCH、缺少 `fetchJSON` 的宿主报错）。
+`npm run probe:verify` 覆盖全屏验收：单条/数组固化展示、手动「标记已验证」
+overlay（幂等、上游保持 pending）、缺固化时 accept 阻断提示、上游
+`verified` 记录直接收，以及原有 A/R/S、附件、自述、轮询、外部状态变化与
+插件宿主无入口。accept 门禁是共用路径：`test_notifications.py`、
+`npm run probe:notify`、`npm run probe:session` 的 review 夹具同样带合法
+solidified，`probe:notify` 另覆盖缺固化时通知中心收被阻断。
 `npm run probe:notify` 覆盖通知中心：P0 置顶、P1 面板、P2 日报、验收槽/
 排队、倒计时数值、remind/不收/收、桌面通知失败提示、挂载后新卡 5s 轮询，
 以及插件宿主无通知中心/无轮询。

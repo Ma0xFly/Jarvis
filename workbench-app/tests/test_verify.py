@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Integration tests for Story 2.1 (full-screen verification).
+"""Integration tests for full-screen verification (2.1 + 3.2).
 
 Covers ``GET /api/workbench/inbox`` (pure read, parallel detail reads,
 ``failed_ids``), ``GET /api/workbench/inbox/count``,
-``POST /api/workbench/reviews/sweep``, ``POST /api/workbench/verify/{id}`` and
-the 48h review policy. The workbench server runs as an isolated subprocess with
-throwaway kanban / workbench DBs (see ``test_dispatch``).
+``POST /api/workbench/reviews/sweep``, ``POST /api/workbench/verify/{id}``
+(including the ``missing_solidified`` accept gate),
+``POST /api/workbench/solidified/{id}/verify`` and the 48h review policy.
+The workbench server runs as an isolated subprocess with throwaway kanban /
+workbench DBs (see ``test_dispatch``).
 
 Run with::
 
@@ -35,6 +37,11 @@ import test_dispatch as base  # noqa: E402
 
 REVIEW_TTL = 48 * 60 * 60
 AUTO_PREFIX = "48h 自动收"
+DEFAULT_SOLIDIFIED = {
+    "type": "script",
+    "path": "workbench-app/tests/test_verify.py",
+    "status": "pending",
+}
 
 
 def make_defaults(root: Path) -> Path:
@@ -383,6 +390,7 @@ class VerifyBackendTestCase(unittest.TestCase):
         accept: str = "跑通测试",
         input_text: str = "需求单",
         summary: str | None = None,
+        solidified: object = DEFAULT_SOLIDIFIED,
     ) -> str:
         card = self.server.create_task(title, triage=True)
         self.server.seed_metadata(
@@ -394,8 +402,12 @@ class VerifyBackendTestCase(unittest.TestCase):
         )
         code, body = self.server.dispatch(card)
         self.assertEqual(code, 200, body)
+        extra = {"metadata": {"solidified": solidified}} if solidified is not None else {}
         code, body = self.server.patch_status(
-            card, "review", summary=summary if summary is not None else "完成 " + title
+            card,
+            "review",
+            summary=summary if summary is not None else "完成 " + title,
+            **extra,
         )
         self.assertEqual(code, 200, body)
         if review_age is not None:
@@ -457,6 +469,17 @@ class VerifyBackendTestCase(unittest.TestCase):
             + "/api/workbench/verify/"
             + urlparse.quote(task_id, safe=""),
             payload,
+        )
+
+    def mark_verified(self, task_id: str, path, server=None):
+        target = server or self.server
+        return base.http_json(
+            "POST",
+            target.base
+            + "/api/workbench/solidified/"
+            + urlparse.quote(task_id, safe="")
+            + "/verify",
+            {"path": path},
         )
 
     def detail(self, task_id: str, server=None) -> dict:
@@ -603,6 +626,26 @@ class InboxTests(VerifyBackendTestCase):
         item = self.inbox_item(card)
         self.assertIsNotNone(item)
         self.assertEqual(item["self_report"], report)
+
+    def test_solidified_lands_on_the_latest_run_via_review_handoff(self):
+        """The same ``request_review`` path carries ``solidified`` to the run."""
+        card = self.server.create_task("固化链路", triage=True)
+        self.server.seed_metadata(card, {"contract": {"accept": "ok"}})
+        code, body = self.server.dispatch(card)
+        self.assertEqual(code, 200, body)
+        solidified = [
+            {"type": "script", "path": "scripts/x.sh", "status": "pending"}
+        ]
+        code, body = self.server.patch_status(
+            card,
+            "review",
+            summary="完成",
+            metadata={"solidified": solidified},
+        )
+        self.assertEqual(code, 200, body)
+        item = self.inbox_item(card)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["solidified"], solidified)
 
     def test_inbox_count_matches_inbox_and_never_reads_details(self):
         self.seed_review("计数卡")
@@ -895,6 +938,303 @@ class InboxSelfReportTests(unittest.TestCase):
         self.assertIsNone(item["self_report"])
 
 
+class InboxSolidifiedTests(unittest.TestCase):
+    """The inbox surfaces only the newest run's normalized ``solidified``."""
+
+    def _item(self, runs: list[dict]) -> dict:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with fake_kanban(
+            [fake_task("t1", review_events=[(1, int(time.time()) - 60)], runs=runs)]
+        ) as fake:
+            server = start_server(Path(tmp.name) / "srv", upstream=fake.base)
+            try:
+                code, body = base.http_json(
+                    "GET", server.base + "/api/workbench/inbox"
+                )
+            finally:
+                server.stop()
+        self.assertEqual(code, 200, body)
+        items = [item for item in body["tasks"] if item["id"] == "t1"]
+        self.assertEqual(len(items), 1, body)
+        return items[0]
+
+    def test_single_object_is_normalized_to_a_list(self):
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "solidified": {
+                            "type": "script",
+                            "path": "  scripts/a.sh  ",
+                            "status": "pending",
+                        }
+                    },
+                )
+            ]
+        )
+        self.assertEqual(
+            item["solidified"],
+            [{"type": "script", "path": "scripts/a.sh", "status": "pending"}],
+        )
+
+    def test_list_keeps_valid_entries_and_drops_malformed_ones(self):
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "solidified": [
+                            {
+                                "type": "routing",
+                                "path": "routing.json",
+                                "status": "verified",
+                            },
+                            "junk",
+                            None,
+                            {"type": "bogus", "path": "x", "status": "pending"},
+                            {"type": "script", "path": "   ", "status": "pending"},
+                            {"type": "script", "path": "scripts/b.sh", "status": "bogus"},
+                            {
+                                "type": "skill_patch",
+                                "path": " skills/SKILL.md ",
+                                "status": "pending",
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+        self.assertEqual(
+            item["solidified"],
+            [
+                {"type": "routing", "path": "routing.json", "status": "verified"},
+                {
+                    "type": "skill_patch",
+                    "path": "skills/SKILL.md",
+                    "status": "pending",
+                },
+            ],
+        )
+
+    def test_dedupes_by_type_and_path(self):
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "solidified": [
+                            {"type": "script", "path": "a.sh", "status": "pending"},
+                            {"type": "script", "path": " a.sh ", "status": "verified"},
+                            {"type": "routing", "path": "a.sh", "status": "pending"},
+                        ]
+                    },
+                )
+            ]
+        )
+        self.assertEqual(
+            item["solidified"],
+            [
+                {"type": "script", "path": "a.sh", "status": "pending"},
+                {"type": "routing", "path": "a.sh", "status": "pending"},
+            ],
+        )
+
+    def test_caps_entries_at_fifty(self):
+        entries = [
+            {"type": "script", "path": f"scripts/{index}.sh", "status": "pending"}
+            for index in range(60)
+        ]
+        item = self._item([fake_run(1, metadata={"solidified": entries})])
+        self.assertEqual(len(item["solidified"]), 50)
+        self.assertEqual(item["solidified"][-1]["path"], "scripts/49.sh")
+
+    def test_path_length_cap(self):
+        max_path = "a" * 500
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "solidified": [
+                            {"type": "script", "path": max_path, "status": "pending"},
+                            {
+                                "type": "script",
+                                "path": "a" * 501,
+                                "status": "pending",
+                            },
+                        ]
+                    },
+                )
+            ]
+        )
+        self.assertEqual([entry["path"] for entry in item["solidified"]], [max_path])
+
+    def test_missing_or_all_invalid_is_an_empty_list(self):
+        cases = {
+            "no runs": [],
+            "no metadata": [fake_run(1)],
+            "metadata not dict": [fake_run(1, metadata="solidified")],
+            "no solidified": [fake_run(1, metadata={"self_report": {}})],
+            "solidified not object/list": [fake_run(1, metadata={"solidified": "x"})],
+            "empty list": [fake_run(1, metadata={"solidified": []})],
+            "empty object": [fake_run(1, metadata={"solidified": {}})],
+            "all invalid": [
+                fake_run(
+                    1,
+                    metadata={
+                        "solidified": [
+                            {"type": "routing", "path": "", "status": "pending"},
+                            {"type": "routing", "path": "r", "status": "done"},
+                            {"type": "unknown", "path": "r", "status": "pending"},
+                            42,
+                        ]
+                    },
+                )
+            ],
+        }
+        for label, runs in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._item(runs)["solidified"], [])
+
+    def test_only_the_newest_run_counts(self):
+        now = int(time.time())
+        old = {
+            "solidified": [
+                {"type": "script", "path": "scripts/old.sh", "status": "pending"}
+            ]
+        }
+        new = {
+            "solidified": [
+                {"type": "script", "path": "scripts/new.sh", "status": "verified"}
+            ]
+        }
+        cases = {
+            "newest missing": (
+                [fake_run(1, started_at=now - 600, metadata=old), fake_run(2, started_at=now - 60)],
+                [],
+            ),
+            "newest invalid": (
+                [
+                    fake_run(1, started_at=now - 600, metadata=old),
+                    fake_run(2, started_at=now - 60, metadata={"solidified": "junk"}),
+                ],
+                [],
+            ),
+            "newest wins": (
+                [
+                    fake_run(1, started_at=now - 600, metadata=old),
+                    fake_run(2, started_at=now - 60, metadata=new),
+                ],
+                new["solidified"],
+            ),
+        }
+        for label, (runs, expected) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(self._item(runs)["solidified"], expected)
+
+    def test_equal_timestamps_break_by_run_id(self):
+        now = int(time.time())
+        low = {
+            "solidified": [
+                {"type": "script", "path": "scripts/low.sh", "status": "pending"}
+            ]
+        }
+        high = {
+            "solidified": [
+                {"type": "script", "path": "scripts/high.sh", "status": "pending"}
+            ]
+        }
+        item = self._item(
+            [
+                fake_run(1, started_at=now - 60, metadata=low),
+                fake_run(2, started_at=now - 60, metadata=high),
+            ]
+        )
+        self.assertEqual(item["solidified"], high["solidified"])
+
+        # Higher id without a record wins the tie: still no backtracking.
+        item = self._item(
+            [
+                fake_run(1, started_at=now - 60, metadata=low),
+                fake_run(2, started_at=now - 60, metadata={}),
+            ]
+        )
+        self.assertEqual(item["solidified"], [])
+
+
+class SolidifiedGateUpstreamTests(unittest.TestCase):
+    """Accept reads only the newest run, even when an older one is valid."""
+
+    def _server(self, fake: FakeKanban) -> base.WorkbenchServer:
+        self._tmp = tempfile.TemporaryDirectory()
+        server = start_server(Path(self._tmp.name) / "srv", upstream=fake.base)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(server.stop)
+        return server
+
+    def test_accept_rejects_when_newest_run_drops_the_registration(self):
+        now = int(time.time())
+        older = fake_run(
+            1, started_at=now - 600, metadata={"solidified": DEFAULT_SOLIDIFIED}
+        )
+        cases = {
+            "missing": fake_run(2, started_at=now - 60, metadata={}),
+            "invalid": fake_run(
+                2,
+                started_at=now - 60,
+                metadata={
+                    "solidified": [
+                        {"type": "unknown", "path": "x", "status": "pending"}
+                    ]
+                },
+            ),
+        }
+        for label, newest in cases.items():
+            with self.subTest(label):
+                task = fake_task(
+                    "t1", review_events=[(1, now - 100)], runs=[older, newest]
+                )
+                with fake_kanban([task]) as fake:
+                    server = self._server(fake)
+                    code, body = base.http_json(
+                        "POST",
+                        server.base + "/api/workbench/verify/t1",
+                        {"action": "accept"},
+                    )
+                self.assertEqual(code, 400, body)
+                self.assertEqual(body["error"], "missing_solidified")
+                self.assertEqual(fake.task("t1")["status"], "review")
+
+    def test_older_valid_registration_does_not_leak_into_accept(self):
+        now = int(time.time())
+        newer = fake_run(
+            2,
+            started_at=now - 60,
+            metadata={
+                "solidified": [
+                    {"type": "routing", "path": "routing.json", "status": "pending"}
+                ]
+            },
+        )
+        older = fake_run(
+            1, started_at=now - 600, metadata={"solidified": DEFAULT_SOLIDIFIED}
+        )
+        task = fake_task("t1", review_events=[(1, now - 100)], runs=[older, newer])
+        with fake_kanban([task]) as fake:
+            server = self._server(fake)
+            code, body = base.http_json(
+                "GET", server.base + "/api/workbench/inbox"
+            )
+            self.assertEqual(code, 200, body)
+            item = next(entry for entry in body["tasks"] if entry["id"] == "t1")
+            self.assertEqual(
+                item["solidified"],
+                [{"type": "routing", "path": "routing.json", "status": "pending"}],
+            )
+
+
 class VerifyActionTests(VerifyBackendTestCase):
     def test_accept_moves_to_done_and_leaves_inbox(self):
         card = self.seed_review("验收收下")
@@ -914,6 +1254,79 @@ class VerifyActionTests(VerifyBackendTestCase):
         self.assertEqual(detail["task"]["status"], "done")
         self.assertEqual(detail["task"]["latest_summary"], "验收通过")
         self.assertIsNone(self.inbox_item(card))
+
+    def test_accept_requires_a_valid_solidified_entry(self):
+        cases = {
+            "missing": None,
+            "empty": [],
+            "all invalid": [
+                {"type": "unknown", "path": "x", "status": "pending"},
+                {"type": "script", "path": "  ", "status": "pending"},
+            ],
+        }
+        for label, solidified in cases.items():
+            with self.subTest(label):
+                card = self.seed_review("缺固化 " + label, solidified=solidified)
+                code, body = self.verify(card, "accept")
+                self.assertEqual(code, 400, body)
+                self.assertEqual(
+                    body,
+                    {
+                        "ok": False,
+                        "error": "missing_solidified",
+                        "comment_written": False,
+                    },
+                )
+                self.assertEqual(self.server.status(card), "review")
+                self.assertIsNotNone(self.inbox_item(card))
+
+    def test_mixed_solidified_with_one_valid_entry_accepts(self):
+        card = self.seed_review(
+            "混合固化",
+            solidified=[
+                {"type": "unknown", "path": "x", "status": "pending"},
+                DEFAULT_SOLIDIFIED,
+            ],
+        )
+        self.assertEqual(self.inbox_item(card)["solidified"], [DEFAULT_SOLIDIFIED])
+        code, body = self.verify(card, "accept")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "done")
+
+    def test_accept_accepts_upstream_verified_only(self):
+        card = self.seed_review(
+            "上游已验证",
+            solidified={
+                "type": "script",
+                "path": "scripts/verified.sh",
+                "status": "verified",
+            },
+        )
+        self.assertEqual(
+            self.inbox_item(card)["solidified"],
+            [
+                {
+                    "type": "script",
+                    "path": "scripts/verified.sh",
+                    "status": "verified",
+                }
+            ],
+        )
+        code, body = self.verify(card, "accept")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "done")
+
+    def test_reject_and_skip_do_not_require_solidified(self):
+        skipped = self.seed_review("缺固化跳过", solidified=None)
+        code, body = self.verify(skipped, "skip")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "review")
+        self.assertIsNotNone(self.inbox_item(skipped))
+
+        rejected = self.seed_review("缺固化打回", solidified=None)
+        code, body = self.verify(rejected, "reject", "没有登记可复用件")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "triage")
 
     def test_reject_requires_reason_and_caps_length(self):
         card = self.seed_review("验收缺理由")
@@ -1046,6 +1459,191 @@ class VerifyActionTests(VerifyBackendTestCase):
                 self.assertEqual(code, expected, body)
 
 
+class SolidifiedVerifiedTests(VerifyBackendTestCase):
+    """Manual ``pending -> verified`` is a workbench.db overlay keyed by path."""
+
+    def test_manual_verify_writes_overlay_and_stays_idempotent(self):
+        card = self.seed_review("手动已验证")
+        path = DEFAULT_SOLIDIFIED["path"]
+        code, body = self.mark_verified(card, path)
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["path"], path)
+        overlay = body["solidified_verified"]
+        self.assertEqual(len(overlay), 1)
+        self.assertEqual(overlay[0]["path"], path)
+        self.assertIsInstance(overlay[0]["verified_at"], int)
+        self.assertEqual(self.server.metadata_row(card)["solidified_verified"], overlay)
+        self.assertEqual(
+            self.inbox_item(card)["metadata"]["solidified_verified"], overlay
+        )
+
+        # Repeat click: one entry, same timestamp (strict idempotency).
+        code, again = self.mark_verified(card, path)
+        self.assertEqual(code, 200, again)
+        self.assertEqual(again["solidified_verified"], overlay)
+        self.assertEqual(
+            len(self.server.metadata_row(card)["solidified_verified"]), 1
+        )
+
+        # Upstream stays the worker's original registration: still pending.
+        runs = self.detail(card)["runs"]
+        registered = [
+            run.get("metadata", {}).get("solidified")
+            for run in runs
+            if isinstance(run.get("metadata"), dict)
+        ]
+        self.assertIn(DEFAULT_SOLIDIFIED, registered)
+
+    def test_multiple_paths_are_appended_and_verified_independently(self):
+        first = {"type": "routing", "path": "routing.json", "status": "pending"}
+        second = {"type": "script", "path": "scripts/b.sh", "status": "pending"}
+        card = self.seed_review("两条固化", solidified=[first, second])
+        self.assertEqual(self.inbox_item(card)["solidified"], [first, second])
+
+        code, body = self.mark_verified(card, second["path"])
+        self.assertEqual(code, 200, body)
+        code, body = self.mark_verified(card, first["path"])
+        self.assertEqual(code, 200, body)
+        paths = [entry["path"] for entry in body["solidified_verified"]]
+        self.assertEqual(paths, [second["path"], first["path"]])
+
+        code, again = self.mark_verified(card, second["path"])
+        self.assertEqual(code, 200, again)
+        self.assertEqual(len(again["solidified_verified"]), 2)
+
+    def test_unknown_path_is_missing_solidified(self):
+        card = self.seed_review("固化路径不在 run")
+        code, body = self.mark_verified(card, "scripts/not-registered.sh")
+        self.assertEqual(code, 400, body)
+        self.assertEqual(body["error"], "missing_solidified")
+        self.assertNotIn("solidified_verified", self.server.metadata_row(card))
+
+    def test_blank_or_non_string_path_is_invalid_request(self):
+        card = self.seed_review("固化路径为空")
+        for path in ("", "   ", None, 123, [], {}):
+            with self.subTest(path=path):
+                code, body = self.mark_verified(card, path)
+                self.assertEqual(code, 400, body)
+                self.assertEqual(body["error"], "invalid_request")
+        self.assertNotIn("solidified_verified", self.server.metadata_row(card))
+
+    def test_mark_requires_review_status(self):
+        card = self.server.create_task("非 review 标记", triage=True)
+        code, body = self.mark_verified(card, DEFAULT_SOLIDIFIED["path"])
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["error"], "not_in_review")
+        self.assertEqual(body["status"], "triage")
+        self.assertNotIn(
+            "solidified_verified", self.server.metadata_row(card) or {}
+        )
+
+    def test_corrupt_overlay_degrades_and_is_repaired(self):
+        card = self.seed_review("坏 overlay")
+        path = DEFAULT_SOLIDIFIED["path"]
+        self.server.seed_metadata(
+            card,
+            {
+                "bucket": "today",
+                "contract": {"accept": "x"},
+                "solidified_verified": [
+                    {"path": "scripts/nan.sh", "verified_at": float("nan")},
+                    {"path": "scripts/inf.sh", "verified_at": float("inf")},
+                    {"path": "scripts/huge.sh", "verified_at": 10**400},
+                    {"path": "", "verified_at": 1},
+                    {"path": "scripts/no-timestamp.sh"},
+                    "junk",
+                ],
+            },
+        )
+        # A read must not 500 on the corrupt row.
+        code, body = self.inbox()
+        self.assertEqual(code, 200, body)
+        # Marking normalizes the overlay and drops every invalid entry.
+        code, body = self.mark_verified(card, path)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(
+            [entry["path"] for entry in body["solidified_verified"]], [path]
+        )
+        self.assertEqual(
+            self.server.metadata_row(card)["solidified_verified"],
+            body["solidified_verified"],
+        )
+
+    def test_upstream_failure_is_502(self):
+        task = fake_task(
+            "t1",
+            runs=[fake_run(1, metadata={"solidified": DEFAULT_SOLIDIFIED})],
+        )
+        with fake_kanban([task]) as fake:
+            fake.detail_fail_ids = {"t1"}
+            with tempfile.TemporaryDirectory() as tmp:
+                server = start_server(Path(tmp) / "srv", upstream=fake.base)
+                try:
+                    code, body = self.mark_verified(
+                        "t1", DEFAULT_SOLIDIFIED["path"], server=server
+                    )
+                finally:
+                    server.stop()
+        self.assertEqual(code, 502, body)
+        self.assertEqual(body["error"], "upstream_unavailable")
+
+    def test_metadata_unavailable_is_503(self):
+        task = fake_task(
+            "t1",
+            runs=[fake_run(1, metadata={"solidified": DEFAULT_SOLIDIFIED})],
+        )
+        with fake_kanban([task]) as fake:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                broken_db = root / "broken-db"
+                broken_db.mkdir()
+                server = start_server(
+                    root / "srv",
+                    upstream=fake.base,
+                    env_extra={"WORKBENCH_DB": str(broken_db)},
+                )
+                try:
+                    code, body = self.mark_verified(
+                        "t1", DEFAULT_SOLIDIFIED["path"], server=server
+                    )
+                finally:
+                    server.stop()
+        self.assertEqual(code, 503, body)
+        self.assertEqual(body["error"], "metadata_unavailable")
+
+    def test_missing_task_is_404(self):
+        code, body = self.mark_verified("t_missing", "scripts/x.sh")
+        self.assertEqual(code, 404, body)
+        self.assertEqual(body["error"], "not_found")
+
+    def test_verify_endpoint_guards_json_and_origin(self):
+        card = self.seed_review("固化请求守卫")
+        path = (
+            "/api/workbench/solidified/"
+            + urlparse.quote(card, safe="")
+            + "/verify"
+        )
+        code, body = self.raw_request(
+            "POST",
+            path,
+            json.dumps({"path": DEFAULT_SOLIDIFIED["path"]}).encode("utf-8"),
+            {"Content-Type": "text/plain"},
+        )
+        self.assertEqual(code, 415, body)
+        self.assertEqual(body["error"], "unsupported_media_type")
+
+        code, body = self.raw_request(
+            "POST",
+            path,
+            json.dumps({"path": DEFAULT_SOLIDIFIED["path"]}).encode("utf-8"),
+            {"Content-Type": "application/json", "Origin": "http://evil.example"},
+        )
+        self.assertEqual(code, 403, body)
+        self.assertEqual(body["error"], "forbidden_origin")
+        self.assertNotIn("solidified_verified", self.server.metadata_row(card))
+
+
 class FakeUpstreamFailureTests(unittest.TestCase):
     """Verify mapping and reject dedupe against a controllable upstream."""
 
@@ -1056,8 +1654,16 @@ class FakeUpstreamFailureTests(unittest.TestCase):
         self.addCleanup(server.stop)
         return server
 
+    @staticmethod
+    def _accept_task() -> dict:
+        """Review card with a valid solidified record so accept reaches PATCH."""
+        return fake_task(
+            "t1",
+            runs=[fake_run(1, metadata={"solidified": DEFAULT_SOLIDIFIED})],
+        )
+
     def test_patch_409_while_still_review_is_502(self):
-        with fake_kanban([fake_task("t1")]) as fake:
+        with fake_kanban([self._accept_task()]) as fake:
             fake.patch_mode = "409"
             server = self._server(fake)
             code, body = base.http_json(
@@ -1070,7 +1676,7 @@ class FakeUpstreamFailureTests(unittest.TestCase):
         self.assertEqual(fake.task("t1")["status"], "review")
 
     def test_patch_409_after_another_actor_moved_it_is_409(self):
-        with fake_kanban([fake_task("t1")]) as fake:
+        with fake_kanban([self._accept_task()]) as fake:
             fake.patch_mode = "409"
             fake.patch_moves_to = "triage"
             server = self._server(fake)
@@ -1083,7 +1689,7 @@ class FakeUpstreamFailureTests(unittest.TestCase):
         self.assertFalse(body["comment_written"])
 
     def test_patch_200_with_wrong_landed_status_is_502(self):
-        with fake_kanban([fake_task("t1")]) as fake:
+        with fake_kanban([self._accept_task()]) as fake:
             fake.patch_mode = "wrong_status"
             server = self._server(fake)
             code, body = base.http_json(
@@ -1094,7 +1700,7 @@ class FakeUpstreamFailureTests(unittest.TestCase):
         self.assertEqual(body["upstream_status"], 200)
 
     def test_patch_500_is_502(self):
-        with fake_kanban([fake_task("t1")]) as fake:
+        with fake_kanban([self._accept_task()]) as fake:
             fake.patch_mode = "500"
             server = self._server(fake)
             code, body = base.http_json(
@@ -1482,6 +2088,19 @@ class AutoCollectTests(unittest.TestCase):
                 )
             finally:
                 server.stop()
+
+    def test_auto_collect_does_not_require_solidified(self):
+        """48h auto-collect is the queue backstop: no solidified gate."""
+        server = self._server()
+        card = self._seed_review(
+            server, "无固化自动收", age=int(REVIEW_TTL) + 60, summary="完成"
+        )
+        code, body = base.http_json(
+            "POST", server.base + "/api/workbench/reviews/sweep", {}
+        )
+        self.assertEqual(code, 200, body)
+        self.assertIn(card, body["collected_ids"])
+        self.assertEqual(server.status(card), "done")
 
     def test_sweep_ignores_card_under_ttl(self):
         server = self._server()

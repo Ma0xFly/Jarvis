@@ -180,6 +180,11 @@ export default function NotificationCenter({
           setActionError("这张卡已进入新一轮验收，已刷新");
           await refresh(true);
           onChanged?.();
+        } else if (code === "missing_solidified") {
+          // 与验收页一致：卡留在 review，不刷新、不移除通知，让用户改走打回。
+          setActionError(
+            "没有可用的固化记录（未登记或格式不合法），请打回补齐，或等 48h 自动收",
+          );
         } else {
           setActionError("通知动作失败：" + errText(err));
         }

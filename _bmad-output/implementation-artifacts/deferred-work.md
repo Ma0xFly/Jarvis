@@ -105,3 +105,10 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-1-self-report.md`
   summary: 在 Hermes `kanban_request_review` tool schema 的 metadata 描述中加入 self_report 三行契约。
   evidence: 当前 tool schema 只列 changed_files/tests_run/commit/decisions；self_report 只能从 workbench-conventions skill 发现。修改 `~/.hermes/hermes-agent/tools/kanban_tools_schemas.py` 属上游改动，超出 3.1 的“上游零改动”边界；仓库内已补 README 契约说明，待上游愿意改 schema 时再补。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-solidified.md`
+  summary: 固化 verified overlay 目前只按 path 幂等；rework 后同一 path 会沿用旧 verified，且无法撤销或清理旧 path。
+  evidence: `workbench-app/server.py:2052-2072` 的 overlay 无 review_requested_at/run 维度；spec Design Notes 明确 path 幂等，属已选设计的已知边界。后续可按 review 轮次隔离或增加撤销/清理。
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-2-solidified.md`
+  summary: solidified 的 type/status 枚举在 server、UI、README、SKILL、spec 五处重复，缺少跨语言 schema 或 cross-check 测试。
+  evidence: `workbench-app/server.py:141-142`、`workbench-ui/src/api/workbench.ts:490-491`、`workbench-app/README.md`、`~/.hermes/skills/workbench-conventions/SKILL.md`、`spec-3-2-solidified.md`；一侧新增类型不会自动让其他侧失败。

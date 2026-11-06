@@ -716,7 +716,12 @@ class NotificationIntegrationTests(unittest.TestCase):
         )
         code, body = server.dispatch(card)
         self.assertEqual(code, 200, body)
-        code, body = server.patch_status(card, "review", summary="完成")
+        code, body = server.patch_status(
+            card,
+            "review",
+            summary="完成",
+            metadata={"solidified": verifytests.DEFAULT_SOLIDIFIED},
+        )
         self.assertEqual(code, 200, body)
         conn = sqlite3.connect(str(server.kanban_db), timeout=5)
         try:

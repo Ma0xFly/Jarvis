@@ -2,11 +2,14 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { api, KANBAN } from "../platform";
 import {
   getInbox,
+  markSolidifiedVerified,
   MAX_REJECT_REASON_CHARS,
   sweepReviews,
   verifyTask,
   WorkbenchError,
   type InboxTask,
+  type SolidifiedEntry,
+  type SolidifiedVerifiedEntry,
   type VerifyAction,
 } from "../api/workbench";
 
@@ -20,6 +23,12 @@ import {
 const COUNTDOWN_TICK_MS = 30_000;
 const INBOX_POLL_MS = 5000;
 const AUTO_EXIT_MS = 3000;
+
+const SOLIDIFIED_TYPE_LABEL: Record<SolidifiedEntry["type"], string> = {
+  routing: "路由",
+  skill_patch: "技能补丁",
+  script: "脚本",
+};
 
 interface VerifyAttachment {
   id: number;
@@ -123,6 +132,31 @@ function countdownLabel(ageSeconds: number | null | undefined, ttl: number): str
   return `还有 ${Math.max(1, minutes)} 分自动收`;
 }
 
+/** Runtime-safe view of `metadata.solidified_verified` (may be corrupt). */
+function normalizeVerifiedEntries(value: unknown): SolidifiedVerifiedEntry[] {
+  if (!Array.isArray(value)) return [];
+  const byPath = new Map<string, SolidifiedVerifiedEntry>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as { path?: unknown; verified_at?: unknown };
+    if (
+      typeof entry.path !== "string" ||
+      !entry.path.trim() ||
+      typeof entry.verified_at !== "number" ||
+      !Number.isFinite(entry.verified_at)
+    ) {
+      continue;
+    }
+    if (!byPath.has(entry.path)) {
+      byPath.set(entry.path, {
+        path: entry.path,
+        verified_at: entry.verified_at,
+      });
+    }
+  }
+  return Array.from(byPath.values());
+}
+
 function sortQueue(items: QueueItem[]): QueueItem[] {
   // 与后端一致：最早 review 在前；无 review_requested 的卡排最后，
   // 同组内按 created_at / id 稳定排序。
@@ -175,6 +209,7 @@ export default function VerifyPage({
   const [reason, setReason] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [actionError, setActionError] = useState("");
+  const [markingPath, setMarkingPath] = useState<string | null>(null);
   const [stats, setStats] = useState<VerifyStats>({ accepted: 0, rejected: 0, skipped: 0 });
   const [openedEmpty, setOpenedEmpty] = useState(false);
   const openedDetermined = useRef(false);
@@ -186,9 +221,28 @@ export default function VerifyPage({
   const queueRef = useRef<QueueItem[]>([]);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const returnFocusRef = useRef<HTMLElement | null>(null);
+  // 本会话手动标记的 overlay：5s 轮询可能带回过期快照，合并时保留本地的。
+  const markedOverlaysRef = useRef<Record<string, SolidifiedVerifiedEntry[]>>({});
 
   const current = queue.length > 0 ? queue[0] : null;
   const currentId = current?.id ?? null;
+
+  const withMarkedOverlay = useCallback(
+    (task: InboxTask, receivedAt: number): QueueItem => {
+      const marked = normalizeVerifiedEntries(markedOverlaysRef.current[task.id]);
+      if (marked.length === 0) return { ...task, receivedAt };
+      const base = normalizeVerifiedEntries(task.metadata?.solidified_verified);
+      return {
+        ...task,
+        receivedAt,
+        metadata: {
+          ...task.metadata,
+          solidified_verified: normalizeVerifiedEntries([...base, ...marked]),
+        },
+      };
+    },
+    [],
+  );
 
   const loadQueue = useCallback(async () => {
     const seq = ++loadSeq.current;
@@ -212,7 +266,7 @@ export default function VerifyPage({
           ? [...inbox.tasks.slice(startIndex), ...inbox.tasks.slice(0, startIndex)]
           : inbox.tasks;
       const receivedAt = Date.now();
-      setQueue(ordered.map((task) => ({ ...task, receivedAt })));
+      setQueue(ordered.map((task) => withMarkedOverlay(task, receivedAt)));
       if (!openedDetermined.current) {
         openedDetermined.current = true;
         setOpenedEmpty(!initialTaskId && ordered.length === 0);
@@ -225,7 +279,7 @@ export default function VerifyPage({
     } finally {
       if (seq === loadSeq.current) setLoaded(true);
     }
-  }, [initialTaskId]);
+  }, [initialTaskId, withMarkedOverlay]);
 
   useEffect(() => {
     void loadQueue();
@@ -250,7 +304,7 @@ export default function VerifyPage({
       setQueue((prev) => {
         const refreshed = inbox.tasks
           .filter((task) => !handledRef.current.has(task.id))
-          .map((task) => ({ ...task, receivedAt }));
+          .map((task) => withMarkedOverlay(task, receivedAt));
         const preserved = prev.filter(
           (task) =>
             !inboxIds.has(task.id) &&
@@ -262,7 +316,7 @@ export default function VerifyPage({
     } catch {
       // 队列轮询失败保留现有快照；下一次轮询重试。
     }
-  }, []);
+  }, [withMarkedOverlay]);
 
   useEffect(() => {
     if (!loaded) return;
@@ -350,6 +404,7 @@ export default function VerifyPage({
     setReasonOpen(false);
     setReason("");
     setActionError("");
+    setMarkingPath(null);
   }, [currentId]);
 
   const runAction = useCallback(
@@ -383,6 +438,10 @@ export default function VerifyPage({
         } else if (code === "reason_too_long") {
           setReasonOpen(true);
           setActionError(`理由最多 ${MAX_REJECT_REASON_CHARS} 字，请精简后再提交`);
+        } else if (code === "missing_solidified") {
+          setActionError(
+            "没有可用的固化记录（未登记或格式不合法），不能收；可打回补齐，或等 48h 自动收",
+          );
         } else {
           setActionError("验收失败：" + errText(error));
         }
@@ -391,6 +450,39 @@ export default function VerifyPage({
       }
     },
     [current, submitting, onChanged],
+  );
+
+  const markVerified = useCallback(
+    async (path: string) => {
+      if (!current || markingPath) return;
+      setMarkingPath(path);
+      setActionError("");
+      try {
+        const overlay = await markSolidifiedVerified(current.id, path);
+        markedOverlaysRef.current[current.id] = overlay;
+        // 本地合并 overlay：轮询也会带回同一份，按钮无需等下一轮。
+        setQueue((prev) =>
+          prev.map((task) =>
+            task.id === current.id
+              ? {
+                  ...task,
+                  metadata: { ...task.metadata, solidified_verified: overlay },
+                }
+              : task,
+          ),
+        );
+      } catch (error) {
+        const code = error instanceof WorkbenchError ? error.code : "";
+        setActionError(
+          code === "missing_solidified"
+            ? "这条固化记录不在最新一轮 run；可打回补齐，或等 48h 自动收"
+            : "标记已验证失败：" + errText(error),
+        );
+      } finally {
+        setMarkingPath(null);
+      }
+    },
+    [current, markingPath],
   );
 
   const openReject = useCallback(() => {
@@ -493,6 +585,16 @@ export default function VerifyPage({
   const input = current?.metadata?.contract?.input?.trim() || "";
   const reviewAt = current?.review_requested_at ?? null;
   const selfReport = current?.self_report ?? null;
+  const solidified = current?.solidified ?? [];
+  const verifiedPaths = useMemo(
+    () =>
+      new Set(
+        normalizeVerifiedEntries(current?.metadata?.solidified_verified).map(
+          (entry) => entry.path,
+        ),
+      ),
+    [current?.metadata?.solidified_verified],
+  );
 
   const closeButton = (
     <button className="wb-btn wb-verify-close" type="button" onClick={onClose}>
@@ -698,6 +800,58 @@ export default function VerifyPage({
                 </dl>
               ) : (
                 <p className="wb-verify-note warn">自述缺失</p>
+              )}
+            </div>
+
+            <div className="wb-verify-section wb-verify-solidified">
+              <h2>可复用件</h2>
+              {solidified.length > 0 ? (
+                <ul className="wb-verify-solidified-list">
+                  {solidified.map((entry, index) => {
+                    const verified =
+                      entry.status === "verified" || verifiedPaths.has(entry.path);
+                    const marking = markingPath === entry.path;
+                    return (
+                      <li
+                        className="wb-verify-solidified-item"
+                        key={`${entry.type}:${entry.path}:${index}`}
+                      >
+                        <span
+                          className="wb-verify-solidified-type"
+                          data-type={entry.type}
+                          title={entry.type}
+                        >
+                          {SOLIDIFIED_TYPE_LABEL[entry.type]}
+                        </span>
+                        <span className="wb-verify-solidified-path" title={entry.path}>
+                          {entry.path}
+                        </span>
+                        <span
+                          className={
+                            "wb-verify-solidified-status " +
+                            (verified ? "verified" : "pending")
+                          }
+                        >
+                          {verified ? "已验证" : "待验证"}
+                        </span>
+                        {verified ? null : (
+                          <button
+                            className="wb-btn wb-verify-solidified-verify"
+                            type="button"
+                            disabled={markingPath !== null}
+                            onClick={() => void markVerified(entry.path)}
+                          >
+                            {marking ? "标记中…" : "标记已验证"}
+                          </button>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="wb-verify-note warn">
+                  没有可用的固化记录（未登记或格式不合法），不能收；可打回补齐，或等 48h 自动收。
+                </p>
               )}
             </div>
 

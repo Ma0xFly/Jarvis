@@ -422,7 +422,18 @@ print(rows)`,
       const reviewed = await httpJson(
         "PATCH",
         `${base}/api/plugins/kanban/tasks/${encodeURIComponent(card)}`,
-        { status: "review", summary: `完成：${title}` },
+        {
+          status: "review",
+          summary: `完成：${title}`,
+          // 3.2 accept gate: probe cards still need a valid registration.
+          metadata: {
+            solidified: {
+              type: "script",
+              path: "scripts/session-probe.mjs",
+              status: "pending",
+            },
+          },
+        },
       );
       if (reviewed.status !== 200) {
         throw new Error(`转 review 失败 ${title}: ${reviewed.status} ${JSON.stringify(reviewed.data)}`);
