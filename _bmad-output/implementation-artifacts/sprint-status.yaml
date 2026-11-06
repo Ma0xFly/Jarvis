@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-05-2026 13:41
-last_updated: 11-06-2026 13:37
+last_updated: 11-06-2026 14:44
 project: Jarvis
 project_key: NOKEY
 tracking_system: file-system
@@ -48,6 +48,14 @@ development_status:
   2-2-p0-通知与通知操作: done
   2-3-会话追溯入口: done
   epic-2-retrospective: done
+
+  epic-3: backlog
+  3-1-验收页自述三行: backlog
+  3-2-固化登记与验收门禁: backlog
+  3-3-定时唤醒: backlog
+  3-4-执行器契约与-claude_code-适配器: backlog
+  3-5-其余适配器与路由切换: backlog
+  epic-3-retrospective: optional
 action_items:
   - id: "epic-2-retro-item-1-create-parking"
     epic: 2

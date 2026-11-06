@@ -1,20 +1,22 @@
 ---
-status: draft
+status: final
 stepsCompleted: [1, 2, 3]
 p2StepsCompleted: [1, 2, 3]
+p3StepsCompleted: [1, 2, 3, 4]
 inputDocuments:
   - _bmad-output/specs/spec-jarvis-workbench/SPEC.md
   - _bmad-output/specs/spec-jarvis-workbench/ARCHITECTURE-SPINE.md
   - _bmad-output/specs/spec-jarvis-workbench/PLAN.md
   - sketches/006-final/index.html
-scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
+  - sketches/007-dispatch-pipeline/index.html
+scope: P1/P2 已完成；P3 stories 已拆完（3.1–3.5），待 sprint planning
 ---
 
 # Jarvis 人机工作台 - Epic Breakdown
 
 ## Overview
 
-把 `SPEC.md` 的 13 项能力拆成可独立派发的 story。**P1（界面骨架）已完成**（Epic 1，1.0–1.4 全部 done）；本文件正在追加 **P2（闭环）**：全屏验收（CAP-3）、P0 通知（CAP-4）、会话追溯（CAP-12）。P3–P5 的 story 在对应批次开工前追加。
+把 `SPEC.md` 的 13 项能力拆成可独立派发的 story。**P1（界面骨架）与 P2（闭环）已完成**（Epic 1 的 1.0–1.4、Epic 2 的 2.1–2.3 全部 done）；本文件正在追加 **P3（变强）**：自述三行（CAP-6）、完成即固化（CAP-7）、定时唤醒（CAP-8）、执行器契约（CAP-14）。P4–P5 的 story 在对应批次开工前追加。
 
 ## Requirements Inventory
 
@@ -35,6 +37,10 @@ scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 | FR-11 | 验收动作：accept → done；reject 写理由 comment 并回 triage；skip 保留；走 `POST /api/workbench/verify/{task_id}` | CAP-3 |
 | FR-12 | P0 通知：会堵下游的卡 10 秒内系统通知 + 右上角常驻/置顶；非 P0 不打扰；同一事件 30 分钟只升级一次；P1 攒批、P2 日报；通知内可收/不收/10 分钟后再提醒；倒计时代替未读；验收槽容量 3 | CAP-4 |
 | FR-13 | 会话追溯：验收/已完成卡可「打开执行会话」，读 `worker_session_id` / `executor_session_id`，看到该轮完整对话并可用执行器续跑参数接上 | CAP-12 |
+| FR-14 | 验收页在样张之后显示 `run.metadata.self_report` 的交付/依据/没底三行；「没底」为空或缺失时显示明确警示 | CAP-6 |
+| FR-15 | 验收通过前校验最新 run `metadata.solidified` 至少一条 `{type,path,status:pending}`；固化内容仍落 Hermes profile `skills/` / `routing.json`，工作台只做登记展示与 `pending→verified` 审计（verified 写 workbench.db overlay） | CAP-7 |
+| FR-16 | 仓库卡可设 `metadata.wake_at`；到点由工作台后台把卡移入 `ready`（有验收且无未完成 parent）或 `todo`（有 parent）；缺验收则留在仓库并提示 | CAP-8 |
+| FR-17 | 新增 `bin/executor-run` + `executors.json`：stdin 任务书、stdout 末行 JSON、五个退出码；适配器只翻译；回写 `metadata.executor_session_id`；`routing.json` 可指定 executor | CAP-14 |
 
 ### NonFunctional Requirements
 
@@ -48,6 +54,10 @@ scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 | NFR-6 | P0 只走桌面系统通知，手机通道不做（接口预留） |
 | NFR-7 | 验收/通知/会话均 5s 轮询，不引入 WebSocket；首屏 ≤ 1s |
 | NFR-8 | 上游零改动；`state.db` 只读反查，不直接写 `kanban.db`；新端点只加在 `/api/workbench/*` |
+| NFR-9 | 执行器 CLI/适配器不改上游、不读 `kanban.db`、不写业务逻辑；只做参数/输出翻译 |
+| NFR-10 | `self_report` / `solidified` / `executor_session_id` 缺失或畸形时降级展示，不 500 |
+| NFR-11 | 唤醒只处理带 `wake_at` 的卡；仓库卡继续 `scheduled`，无 `not_before` 的原生卡不受影响；唤醒幂等 |
+| NFR-12 | 密钥不进任务书/skill；适配器不记录密钥 |
 
 ### Additional Requirements
 
@@ -56,6 +66,10 @@ scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 - P2 端点：`GET /api/workbench/inbox`（review + P0 blocked 聚合）、`POST /api/workbench/verify/{task_id}`（accept/reject/skip）、会话追溯只读 `state.db` 与任务 metadata。
 - P2 规则：review 超 48h 自动收并记录；验收槽容量 3，兄弟卡成束；桌面通知走系统通知（notify-send/桌面环境），手机通道不做。
 - 会话追溯优先读 `task.metadata.worker_session_id`；执行器卡读 `executor_session_id`，dsh 续跑参数由执行器契约提供。
+- P3 决策（2026-11-06）：CAP-6 读最新 run `metadata.self_report`；CAP-7 读最新 run `metadata.solidified`（`kanban_request_review` 写入 `task_runs.metadata`，不是 `tasks.metadata`），固化内容复用 Hermes profile `skills/` 与 `routing.json`，手动 verified 写 workbench.db 的 `solidified_verified` overlay，**不新建记忆库**；CAP-8 用 workbench `wake_at`，不采用 Hermes 原生 `not_before`，避免与仓库卡占用的 `scheduled` 冲突。
+- `bin/executor-run`、`executors.json`、`routing.json` 放在 `~/Projects/Jarvis`；不改 `~/.hermes/hermes-agent/`。
+- 三个 profile 的 skill 补：自述三行、`solidified` 登记、`executor_session_id` 回写、`kanban_request_review` 而非 `kanban_complete`。
+- P3 适配器范围：`hermes` + `claude_code` 完整实现，`dsh` + `codex` 注册并 smoke；`--stream` 作为后续增强。
 
 ### UX Design Requirements
 
@@ -67,6 +81,10 @@ scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 - UX-DR6：键盘优先（A/R/S/Esc）；拒绝理由为必填输入，不填不能提交。
 - UX-DR7：通知内可直接操作（收/不收/10 分钟后再提醒）；右上角 P0 常驻/置顶；review 卡显示「还有 42h 自动收」倒计时。
 - UX-DR8：验收槽固定容量 3；同一次 decompose 的兄弟卡成束。
+- UX-DR9：验收页顺序固定「样张 → 自述三行」；「没底」单独强调；缺失态可见。
+- UX-DR10：验收页显示固化记录（类型/路径/状态）；缺失时给出阻断原因。
+- UX-DR11：仓库卡显示「将于 HH:MM 唤醒」与「提前唤醒」。
+- UX-DR12：会话抽屉展示 `executor_session_id` 与「续跑」入口（P3 先显示/复制，实际续跑接执行器契约）。
 
 ### FR Coverage Map
 
@@ -80,6 +98,25 @@ scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 | 2.1 全屏验收与验收动作 | FR-10 FR-11 |
 | 2.2 P0 通知与通知操作 | FR-12 |
 | 2.3 会话追溯入口 | FR-13 |
+| 3.1 验收页自述三行 | FR-14 |
+| 3.2 固化登记与验收门禁 | FR-15 |
+| 3.3 定时唤醒 | FR-16 |
+| 3.4 执行器契约与 claude_code 适配器 | FR-17 |
+| 3.5 其余适配器与路由切换 | FR-17 |
+
+### UX-DR Coverage Map
+
+| UX-DR | Story |
+|---|---|
+| UX-DR1–4（三列/凹槽/拖拽反馈/主题 token） | 1.1、1.3 |
+| UX-DR5–6（验收全屏布局/键盘） | 2.1 |
+| UX-DR7–8（通知操作/验收槽） | 2.2 |
+| UX-DR9（自述三行） | 3.1 |
+| UX-DR10（固化展示与阻断） | 3.2 |
+| UX-DR11（唤醒时间/提前唤醒） | 3.3 |
+| UX-DR12（executor session/续跑入口） | 3.5 |
+
+NFR coverage：NFR-9/NFR-12 → 3.4/3.5；NFR-10 → 3.1/3.2；NFR-11 → 3.3；其余 NFR 沿用 Epic 1/2 的约束。
 
 ## Epic List
 
@@ -87,6 +124,7 @@ scope: P1 已完成；P2（全屏验收 / P0 通知 / 会话追溯）拆分中
 |---|---|---|
 | 1 | 派发骨架（P1） | 工作台第一次能真派活，且不再维护一套自建看板 |
 | 2 | 闭环（P2） | 收得掉、叫得应、追得回 |
+| 3 | 变强（P3） | 验收更可判断、完成有沉淀、挂起能自回队、执行器可替换 |
 
 ## Epic 1: 派发骨架（P1）
 
@@ -369,7 +407,7 @@ As a 工作台用户，
 I want 只有会堵下游的卡主动打扰我，且通知里就能处理，
 So that 不被无关提醒淹没，也不漏掉真正卡住的事。
 
-**Acceptance Criteria：** 待 2.2 的 spec 细化（P0 判定、系统通知、30 分钟只升级一次、通知内收/不收/稍后）。
+**Acceptance Criteria：** 见 `_bmad-output/implementation-artifacts/spec-2-2-p0-notifications.md`（已实现；P0 判定、系统通知、30 分钟只升级一次、通知内收/不收/稍后）。
 
 ### Story 2.3: 会话追溯入口
 
@@ -377,14 +415,189 @@ As a 工作台用户，
 I want 从验收/已完成卡直接打开该轮执行会话，
 So that 判断和排障不必去翻日志。
 
-**Acceptance Criteria：** 待 2.3 的 spec 细化（`worker_session_id` 路径优先，`executor_session_id` 属 Epic 3）。
+**Acceptance Criteria：** 见 `_bmad-output/implementation-artifacts/spec-2-3-session-trace.md`（已实现；`worker_session_id` 路径优先，`executor_session_id` 续跑属 Epic 3）。
+
+## Epic 3: 变强（P3）
+
+让验收页能读到可反驳的自述、完成卡能沉淀出可复用件、挂起的卡能到点自己回队，并把任务交给可插拔执行器；四项共享 `server.py`、验收页与 worker skill，因此作为一个 Epic 交付。
+
+**FRs covered:** FR-14, FR-15, FR-16, FR-17
+
+### Story 3.1: 验收页自述三行
+
+As a 工作台用户，
+I want 在验收页先看样张、再看 AI 自述的「交付 / 依据 / 没底」，
+So that 我能用可反驳的自述判断产物，而不是被总结措辞锚定。
+
+**改动文件**：`workbench-app/server.py`（inbox item 读取 latest run `metadata.self_report`）、`workbench-ui/src/api/workbench.ts`（类型）、`workbench-ui/src/verify/VerifyPage.tsx` + `styles/verify.css`（展示）、`workbench-app/tests/test_verify.py`、`workbench-ui/scripts/verify-probe.mjs`；worker skill 契约写入 `workbench-conventions` / 三个 profile 的 review 约定。
+
+**Acceptance Criteria:**
+
+**Given** 一张 review 卡的最新 run 带 `metadata.self_report = {delivered, evidence, uncertain}`
+**When** 打开全屏验收
+**Then** 样张仍在最前，右侧验收标准之后依次显示「交付 / 依据 / 没底」三行
+**And** 「没底」视觉上单独强调
+
+**Given** `uncertain` 为空、缺失或 `self_report` 结构畸形
+**When** 打开该卡
+**Then** 显示「自述缺失 / 没底为空」警示，不抛 500，也不影响 A/R/S 操作
+**And** 旧卡没有 `self_report` 时同样降级显示
+
+**Given** worker 按新契约调用 `kanban_request_review`
+**When** 工作台读取 `GET /tasks/{id}`
+**Then** 最新 run metadata 带有 `self_report`，且 fixture 测试覆盖三种字段
+**And** 缺失时返回 `null` 而不是伪造内容
+
+**不做**：不因自述缺失阻断收卡；不让模型生成自述；不新建表或改上游 schema。
+
+### Story 3.2: 固化登记与验收门禁
+
+As a 工作台用户，
+I want 在验收时看到这张卡沉淀了什么，并在收卡前确认至少一条可复用件，
+So that 完成卡不会只留下结果而没有下次可用的资产。
+
+**改动文件**：`workbench-app/server.py`（读取/校验最新 run `metadata.solidified`、accept 门禁、手动 verified 写 workbench.db overlay）、`workbench-ui/src/api/workbench.ts`、`workbench-ui/src/verify/VerifyPage.tsx` + `styles/verify.css`、`workbench-app/tests/test_verify.py`、`workbench-ui/scripts/verify-probe.mjs`；三个 profile 的 review skill 契约。
+
+**Acceptance Criteria:**
+
+**Given** review 卡的最新 run `metadata.solidified` 至少有一条合法记录
+**When** 打开验收页
+**Then** 显示每条固化的 `type`（`routing` / `skill_patch` / `script`）、`path`、`status`（`pending` / `verified`）
+**And** 合法记录存在时允许 accept
+
+**Given** 最新 run `metadata.solidified` 缺失、为空或没有合法记录
+**When** 用户按 A / 调用 `POST /api/workbench/verify/{id}` 的 accept
+**Then** 返回 400 `missing_solidified`，卡仍留在 review
+**And** reject / skip 不受影响；48h 自动收仍按现有规则执行（作为队列保底，不要求固化）
+
+**Given** 一条 `status=pending` 的固化记录
+**When** 用户点「标记已验证」
+**Then** 工作台在 `workbench.db` 的 `task_metadata.solidified_verified` 记录 `{path, verified_at}`，不 PATCH 上游 run metadata
+**And** UI 把该条显示为 verified；`verified` 不改变 accept 门禁；上游 run 记录保持 pending 作为原始登记
+
+**Given** `solidified` 是单个对象、数组或含畸形字段
+**When** 读取该卡
+**Then** 归一化为列表并忽略非法条目；全部非法时按缺失处理，不 500
+
+**Given** worker 按新契约在 `kanban_request_review` 写入 `solidified`
+**When** 工作台读取详情
+**Then** 能从最新 run `metadata.solidified` 读到该记录；fixture 覆盖 pending / verified / 缺失
+**And** 固化内容仍写 profile `skills/` / `routing.json`，工作台不新建记忆库
+
+**不做**：不做自动引用扫描（P3 只做手动 verified）；不由工作台编辑 profile skill 文件；不阻断 reject/skip；不改上游内核。
+
+### Story 3.3: 定时唤醒
+
+As a 工作台用户，
+I want 给挂起的卡设一个唤醒时间，到点自动回队，也能手动提前，
+So that 不用靠记忆把卡捞回来。
+
+**改动文件**：`workbench-app/server.py`（`wake_at` 校验、due 扫描、dispatch/todo 落地）、`workbench-app/workbench.db` 的 `task_metadata` JSON（无 schema 迁移）、`workbench-ui/src/todo/TodoPage.tsx` + `todo/TaskDetail.tsx`（时间显示/设置/提前唤醒）、`workbench-ui/src/api/workbench.ts`、`workbench-app/tests/test_todo.py`、`workbench-ui/scripts/todo-probe.mjs`。
+
+**Acceptance Criteria:**
+
+**Given** 一张仓库卡
+**When** 设置 `wake_at = now + 5m`
+**Then** 卡片显示「将于 HH:MM 唤醒」，metadata 持久化；清除后显示消失
+
+**Given** `wake_at` 到期，卡有验收且无未完成 parent
+**When** 后台唤醒扫描运行
+**Then** 走现有 dispatch 流程进入 `ready`（写 `contract_defaults`、位次按现队列计算），清空 `wake_at`
+**And** 重复扫描不会二次派发
+
+**Given** `wake_at` 到期且卡有未完成 parent
+**When** 扫描运行
+**Then** 卡进入 `todo`（显式唤醒后的等待态），清空 `wake_at`；不直接进 `ready`
+
+**Given** `wake_at` 到期但验收为空
+**When** 扫描运行
+**Then** 卡留在 `scheduled`，写入可见的 `wake_error=missing_acceptance`，不自动派发
+**And** 用户补验收后可手动唤醒
+
+**Given** 用户点「提前唤醒」
+**When** 验收存在
+**Then** 立即走 dispatch/提前唤醒路径；验收缺失则提示并保留卡
+**And** `wake_at` 只在该卡真正离开仓库后清空
+
+**Given** Hermes 原生 `scheduled` 卡没有 `wake_at`
+**When** 唤醒扫描运行
+**Then** 扫描不读取、不修改该卡
+**And** 仓库卡继续停 `scheduled`，不采用 Hermes `not_before`
+
+**不做**：不做周期任务/重复唤醒；不做时区选择（本地时间显示，存 epoch）；不改上游调度器。
+
+### Story 3.4: 执行器契约与 claude_code 适配器
+
+As a 工作台/worker，
+I want 用一个统一 CLI 把任务交给 claude_code，并拿到统一 JSON 与退出码，
+So that 执行器可以替换而不改业务流程。
+
+**改动文件**：`bin/executor-run`（新建）、`bin/executors/claude_code.py`（新建）、`executors.json`（新建）、`tests/test_executor_run.py`（新建）、`workbench-app/README.md`；`routing.json` 的 `executor` 字段留到 3.5。
+
+**Acceptance Criteria:**
+
+**Given** `executors.json` 注册了 `claude_code`
+**When** `executor-run --executor claude_code --cwd <dir> --mode write --budget-minutes 30 --max-usd 2` 从 stdin 读取任务书
+**Then** 调用 `claude -p --output-format json`（或等价非交互命令），stdout 最后一行是统一 JSON
+**And** JSON 含 `ok`、`executor`、`session_id`、`summary`、`cost`、`log_path`、`exit_code`
+
+**Given** 执行器成功、需要人、超预算、不可用、其它错误
+**When** CLI 退出
+**Then** 分别返回 0 / 2 / 3 / 4 / 1；调用方只依赖这五个码
+**And** 缺二进制/超时映射为 4，预算中断映射为 3
+
+**Given** `--resume <session-id>`
+**When** 适配器执行
+**Then** claude_code 收到 `--resume`，session id 透传
+**And** 无 session id 时 JSON 字段为 `null`，不伪造
+
+**Given** 适配器执行
+**When** 检查依赖
+**Then** 不 import Hermes 内部模块、不读写 `kanban.db`、不把密钥写入日志
+**And** 任务书只从 stdin 读取，参数只做翻译
+
+**不做**：不做 streaming（后续增强）；不接 dsh/codex（3.5）；不做插件；不改 Hermes 内核。
+
+### Story 3.5: 其余适配器与路由切换
+
+As a 工作台用户，
+I want 能用 dsh/codex 等执行器，并让 routing 按任务类型选执行器，
+So that 换执行器不改业务流程，coder 可以切到 claude_code。
+
+**改动文件**：`bin/executors/{dsh,codex,hermes}.py`、`executors.json`、`routing.json`、`tests/test_executor_run.py`、`workbench-app/README.md`、`workbench-conventions`/coder profile 配置；`workbench-ui/src/session/SessionViewer.tsx`（展示 `executor_session_id` / 续跑入口）。
+
+**Acceptance Criteria:**
+
+**Given** `dsh` 适配器
+**When** 以 `--resume <session-id>` 执行
+**Then** 映射为 `dsh --session-id`，从 NDJSON 首行解析 `session-<uuid>`
+**And** `codex` 适配器注册并可 smoke；不可用返回 4
+
+**Given** `hermes` 执行器
+**When** 通过 CLI 调用
+**Then** `executors.json` 标记为 `mode: in-process`；`executor-run --executor hermes` 拒绝并返回 4
+**And** 错误信息说明 hermes 在 worker 进程内运行，不伪装成已执行的外部 CLI
+
+**Given** `routing.json` 的规则带 `executor`
+**When** worker 处理匹配任务
+**Then** 使用该执行器调用 `executor-run`；事件/建卡方不能自行覆盖 executor
+**And** 无 `executor` 字段时保持现有默认
+
+**Given** coder 切到 `claude_code`
+**When** 跑一张 fixture/真实任务
+**Then** `kanban_request_review` 的 metadata 带 `metadata.executor_session_id`
+**And** 会话抽屉显示该 id 与续跑入口（P3 先显示/复制，实际续跑接执行器契约）
+
+**Given** claude_code 不可用
+**When** 切换验证
+**Then** 记录回滚到 dsh 的步骤，不把环境问题伪装成成功
+
+**不做**：不做自动 fallback 链；不做流式模式；不做执行器管理页；不新建执行器插件。
 
 ## 后续 Epic 预告（暂不拆 story）
 
 | Epic | 批次 | 内容 |
 |---|---|---|
-| 2 | P2 | 全屏验收模式（CAP-3）、P0 通知（CAP-4）、会话追溯（CAP-12） |
-| 3 | P3 | 自述三行（CAP-6）、完成即固化（CAP-7）、定时唤醒（CAP-8）、**执行器契约 `bin/executor-run`（CAP-14）** |
 | 4 | P4 | 事件候选区（CAP-9）、四条配方（CAP-10）、熔断与成本（CAP-11） |
 | 5 | P5 | 运行画布（CAP-13）、验收槽与抽样 |
 

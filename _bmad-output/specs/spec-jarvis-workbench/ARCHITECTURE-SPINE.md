@@ -167,16 +167,20 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
 | `bucket` | workbench.db | Story 1.3 建卡入口 | `"today"` \| `"long"` |
 | `contract` | workbench.db | Story 1.3 建卡/编辑 | `{input: string, accept: string, ready: bool, budget?: {...}}` |
 | `contract_defaults` | workbench.db | 派发瞬间（1.2） | `{max_minutes, max_cost, deny_paths[]}` —— 生效值快照 |
-| `solidified` | 尚未落地（deferred） | 后续验收故事 | `{type: "routing"\|"skill"\|"script", path, status: "pending"\|"verified"}` |
+| `solidified` | `task_runs.metadata`（最新 run） | P3 worker（`kanban_request_review`） | `{type: "routing"\|"skill_patch"\|"script", path, status: "pending"\|"verified"}`；workbench 读最新 run |
+| `self_report` | `task_runs.metadata`（最新 run） | P3 worker（`kanban_request_review`） | `{delivered, evidence, uncertain}`；workbench 读最新 run |
+| `solidified_verified` | workbench.db `task_metadata` | P3 workbench 手动标记 | `{path, verified_at}[]` overlay；与上游 pending 合并展示 |
+| `wake_at` | workbench.db `task_metadata` | P3 待办/详情设置 | epoch seconds；只处理带该键的卡，原生 `scheduled` 不受影响 |
 | `cost` | 尚未落地（deferred） | 后续成本故事 | `{minutes, tokens, usd, by_rule}` |
 | `hops` | 尚未落地（deferred） | 后续建子卡故事 | `int`，> 8 拒绝 |
-| `executor` | 尚未落地（deferred） | 后续执行器故事 | `"hermes"\|"claude_code"\|"dsh"\|"codex"` |
-| `executor_session_id` | 尚未落地（deferred） | 后续执行器故事 | 执行器回写的会话 id（dsh 为 `session-<uuid>`，claude 为其 session id） |
+| `executor` | `routing.json` | P3 worker/routing | `"hermes"\|"claude_code"\|"dsh"\|"codex"` |
+| `executor_session_id` | `task_runs.metadata`（最新 run） | P3 executor/worker | 执行器回写的会话 id（dsh 为 `session-<uuid>`，claude 为其 session id） |
 | `classification` | 尚未落地（deferred） | 后续分类故事 | `{by: "human"\|"rule"\|"model", model?, label, confidence, cost?}` |
 
-- 上表后半部分只是目标契约，**当前没有任何存储或读路径**；不要把它们当成上游
-  `task.metadata` 的现状。
-- `bucket` 用 metadata 而不是新状态：**不占用 `todo`**，仓库卡统一 `triage`。
+- 上表是目标契约；`solidified` / `self_report` / `executor_session_id` 落在
+  **`task_runs.metadata`**（`kanban_request_review` 写入），不是 `tasks.metadata`。
+- `bucket` 用 metadata 而不是新状态：**不占用 `todo`**；仓库卡停 `scheduled`，
+  `triage` / `todo` 会被上游 triage specifier / `recompute_ready` 接走。
 - `contract_defaults` 是**派发瞬间**的生效值：全局默认（`workbench-app/defaults.json`）
   + 卡上 `contract.budget` 覆盖；routing 层当前不实现（deferred）。
 - 快照用 SQLite JSON1 `json_set` 按 key 写入、用 `json_remove` 按 key 补偿；
@@ -199,10 +203,12 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
    - `GET /api/workbench/metadata?ids=a,b` —— 读 `workbench.db`，无记录省略，
      `write_token` 不进入响应；单请求最多 200 个 id。
    - `POST /api/workbench/tasks` —— 建待办卡：上游 `POST /tasks`（`triage=true`，
-     可选 `idempotency_key`）→ GET 校验 `status=="triage"` → 写 `bucket` + 空
-     `contract`；metadata 失败返回 503 + `task_id` 供同 key 重试。
+     可选 `idempotency_key`）→ GET 校验 → `triage → todo → scheduled` 停车 → 写
+     `bucket` + 空 `contract`；任何一步失败回退 triage，返回 502 + `task_id` 供同 key
+     重试。`scheduled` 是唯一稳定的仓库状态。
    - `PATCH /api/workbench/metadata/{task_id}` —— 先 GET 上游任务（404 不 upsert），
-     再 JSON1 `json_patch` 合并 `bucket` / `contract`；`contract_defaults` 不可写。
+     再 JSON1 `json_patch` 合并 `bucket` / `contract` / `wake_at`；`contract_defaults`
+     不可写。
    - ready 中间件 —— 覆盖 PATCH ready、非 triage 建卡、bulk ready、reclaim；
      与 dispatch 共用验收检查，空验收 400 不转发。
    - `GET /api/workbench/inbox` —— review 队列（2.1 已落地）：纯读；详情并行拉取，
@@ -214,6 +220,9 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
    - `POST /api/workbench/verify/{task_id}` —— `{action: accept|reject|skip, reason?}`
      （2.1 已落地）：accept → `done`；reject 理由 1–2000 字 → comment + `triage`；
      skip 不改状态；PATCH 后重读，仍 review 返回 502，已离开 review 返回 409。
+     P3 在 accept 前读最新 run `metadata.solidified`，缺失返回 400 `missing_solidified`。
+   - `POST /api/workbench/solidified/{task_id}/verify` —— P3：`{path}` 写
+     workbench.db 的 `solidified_verified` overlay；不 PATCH 上游 run metadata。
    - `GET /api/workbench/cost/{task_id}` —— 读 `metadata.cost`（后续故事，P3）。
    实现方式：与现有 router 平级，**不要改 `plugin_api.py`**；dispatch 路径只经回环公开 REST。
 
