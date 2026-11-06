@@ -457,6 +457,31 @@ class CreateTaskTests(TodoBackendTestCase):
         self.assertEqual(integrity, "ok")
 
 
+class ShellVersionTests(TodoBackendTestCase):
+    def test_version_endpoint_reports_shell_fingerprint(self):
+        code, body = base.http_json(
+            "GET", self.server.base + "/api/workbench/version"
+        )
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("ok"))
+        self.assertIsInstance(body.get("version"), str)
+        self.assertGreater(len(body["version"]), 0)
+
+    def test_shell_assets_are_revalidated(self):
+        opener = urlrequest.build_opener(urlrequest.ProxyHandler({}))
+        for path in ("/", "/static/index.js", "/sw.js"):
+            request = urlrequest.Request(
+                self.server.base + path, headers={"Accept": "text/html"}
+            )
+            with opener.open(request, timeout=10) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(
+                    "no-cache",
+                    (response.headers.get("Cache-Control") or ""),
+                    path,
+                )
+
+
 class UpdateTaskTests(TodoBackendTestCase):
     def test_edit_title_and_contract_persist(self):
         code, created = self.create("原始标题", bucket="today")

@@ -686,12 +686,23 @@ async function main() {
           dispatch: 0,
           create: 0,
           metadata: 0,
+          version: 0,
           lastDispatch: null,
           holdMs: 0,
+          fakeVersion: null,
         };
         const original = window.fetch.bind(window);
         window.fetch = (input, init) => {
           const url = typeof input === "string" ? input : (input && input.url) || "";
+          if (url.includes("/api/workbench/version")) {
+            window.__wbProbe.version += 1;
+            if (window.__wbProbe.fakeVersion) {
+              return Promise.resolve(new Response(
+                JSON.stringify({ ok: true, version: window.__wbProbe.fakeVersion }),
+                { status: 200, headers: { "Content-Type": "application/json" } },
+              ));
+            }
+          }
           if (url.includes("/api/workbench/dispatch/")) {
             window.__wbProbe.dispatch += 1;
             if (window.__wbProbe.hangDispatch) {
@@ -1488,6 +1499,61 @@ async function main() {
       JSON.stringify(reloadState),
     );
     await installProbe();
+
+    // ---- 5e2. shell version banner ----------------------------------
+    const versionEndpoint = await httpJson("GET", `${base}/api/workbench/version`);
+    check(
+      "外壳版本端点可用",
+      versionEndpoint.status === 200 &&
+        versionEndpoint.data?.ok === true &&
+        typeof versionEndpoint.data?.version === "string" &&
+        versionEndpoint.data.version.length > 0,
+      JSON.stringify(versionEndpoint.data),
+    );
+    await waitForEval(
+      "typeof window.__WB_SHELL_BASELINE__ === 'string' && window.__WB_SHELL_BASELINE__.length > 0",
+      5000,
+      "客户端记录版本基线",
+    );
+    check(
+      "客户端基线与服务端版本一致",
+      (await evaluate("window.__WB_SHELL_BASELINE__")) === versionEndpoint.data.version,
+    );
+    await evaluate(
+      "window.__wbProbe.fakeVersion = 'probe-shell-next'; window.dispatchEvent(new Event('focus')); true",
+    );
+    await waitForEval("Boolean(document.querySelector('.wb-update-banner'))", 5000, "新版本提示");
+    const updateBanner = await evaluate(`(() => ({
+      text: document.querySelector('.wb-update-text')?.textContent || '',
+      action: document.querySelector('.wb-update-action')?.textContent || '',
+      dismiss: Boolean(document.querySelector('.wb-update-dismiss')),
+      fixed: getComputedStyle(document.querySelector('.wb-update-banner')).position,
+    }))()`);
+    check(
+      "新版本提示出现且有刷新/稍后按钮",
+      updateBanner.text.includes("已更新") &&
+        updateBanner.action === "刷新" &&
+        updateBanner.dismiss === true &&
+        updateBanner.fixed === "fixed",
+      JSON.stringify(updateBanner),
+    );
+    const bannerContrast = await contrastMatrix({
+      text: ".wb-update-text",
+      action: ".wb-update-action",
+    });
+    check(
+      "版本提示明暗主题对比度 >= 4.5",
+      ["light", "dark"].every((mode) =>
+        Object.values(bannerContrast?.[mode] || {}).every(
+          (value) => typeof value === "number" && value >= 4.5,
+        ),
+      ),
+      JSON.stringify(bannerContrast),
+    );
+    await evaluate("document.querySelector('.wb-update-dismiss').click(); true");
+    await waitForEval("!document.querySelector('.wb-update-banner')", 3000, "稍后提醒");
+    check("新版本提示可稍后", true);
+    await evaluate("window.__wbProbe.fakeVersion = null; true");
 
     // ---- 5f. running: 已在运行, no position --------------------------
     const runningCard = await createUpstream("运行竞态卡");

@@ -265,9 +265,14 @@ export default function TodoPage({
     setCreateError("");
     createKeyRef.current = null;
     createdTaskRef.current = null;
+  }, [createSignal]);
+
+  // 聚焦必须等创建卡真正挂载：侧栏入口可能在 TodoPage 还未 loaded 时就触发。
+  useEffect(() => {
+    if (!createOpen || !active || !loaded) return;
     const frame = window.requestAnimationFrame(() => createTitleRef.current?.focus());
     return () => window.cancelAnimationFrame(frame);
-  }, [createSignal]);
+  }, [createOpen, createBucket, active, loaded]);
 
   const flowLists = FLOW_SEGMENTS.map((segment) => ({
     ...segment,
@@ -483,7 +488,6 @@ export default function TodoPage({
     }
     setCreateBucket(bucket);
     setCreateOpen(true);
-    window.requestAnimationFrame(() => createTitleRef.current?.focus());
   };
 
   const closeCreate = () => {

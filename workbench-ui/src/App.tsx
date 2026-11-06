@@ -7,6 +7,7 @@ import NotificationCenter from "./notify/NotificationCenter";
 import SessionViewer from "./session/SessionViewer";
 import { getInboxCount, sweepReviews } from "./api/workbench";
 import { isPluginHost } from "./platform";
+import { useShellUpdate } from "./update/useShellUpdate";
 import "./styles/board.css";
 import "./styles/todo.css";
 import "./styles/done.css";
@@ -69,6 +70,8 @@ export default function App(): React.ReactElement {
     id: string;
     title?: string;
   } | null>(null);
+  // 插件宿主没有 /api/workbench/*，也不该弹独立版的外壳更新提示。
+  const shellUpdate = useShellUpdate(!isPluginHost);
 
   useEffect(() => {
     if (isPluginHost) return;
@@ -291,6 +294,25 @@ export default function App(): React.ReactElement {
           </div>
         </div>
       </div>
+
+      {/* 新版本提示：只提示，不自动刷新，避免打断正在编辑的卡。 */}
+      {shellUpdate.available ? (
+        <div className="wb-update-banner" role="status" aria-live="polite">
+          <span className="wb-update-text">工作台已更新</span>
+          <button className="wb-update-action" type="button" onClick={shellUpdate.reload}>
+            刷新
+          </button>
+          <button
+            className="wb-update-dismiss"
+            type="button"
+            onClick={shellUpdate.dismiss}
+            aria-label="稍后提醒"
+            title="稍后提醒"
+          >
+            ✕
+          </button>
+        </div>
+      ) : null}
 
       {/* 通知中心只在独立版挂载（插件宿主没有 /api/workbench/*，也不轮询）。 */}
       <NotificationCenter

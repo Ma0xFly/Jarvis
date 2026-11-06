@@ -1,6 +1,6 @@
 /* Jarvis 工作台 PWA service worker：外壳 network-first，API 永不缓存。
    离线时回退到上一次成功的静态外壳；数据仍来自本机 8787 服务。 */
-const CACHE = "jarvis-workbench-shell-v1";
+const CACHE = "jarvis-workbench-shell-v2";
 const SHELL = [
   "/",
   "/static/index.js",
@@ -41,7 +41,9 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   event.respondWith(
-    fetch(event.request)
+    // no-store 让每次导航都绕过浏览器 HTTP 缓存，服务端的 no-cache 头再
+    // 保证 ETag 重新验证；离线时才回退到上一次成功的 shell 副本。
+    fetch(event.request, { cache: "no-store" })
       .then((response) => {
         if (response.ok) {
           const copy = response.clone();

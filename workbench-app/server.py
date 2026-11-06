@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -62,6 +63,23 @@ from notifications import NotificationEngine, NotificationPoller  # noqa: E402
 WEB_DIR = APP_DIR / "web"
 DEFAULT_DB_PATH = APP_DIR / "workbench.db"
 DEFAULT_DEFAULTS_PATH = APP_DIR / "defaults.json"
+
+
+def _shell_version() -> str:
+    """Fingerprint the deployed standalone shell (JS + CSS + SW mtimes/sizes).
+
+    The client uses this to detect a newer build without a page reload. A
+    missing artifact returns "" so an in-progress deploy never produces a
+    version that could flap the update banner.
+    """
+    parts: list[str] = []
+    for name in ("index.js", "style.css", "sw.js"):
+        try:
+            info = (WEB_DIR / name).stat()
+        except OSError:
+            return ""
+        parts.append(f"{name}:{info.st_mtime_ns}:{info.st_size}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 UPSTREAM_CALL_TIMEOUT = 1.0
 DISPATCH_BUDGET_SECONDS = 2.9
@@ -3284,6 +3302,18 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
     )
     app.include_router(load_kanban_router(), prefix="/api/plugins/kanban")
 
+    @app.middleware("http")
+    async def shell_cache_headers(request: Request, call_next):
+        """Force shell revalidation; API responses keep their own policies."""
+        response = await call_next(request)
+        path = request.url.path
+        if (
+            path in ("/", "/workbench", "/sw.js", "/manifest.webmanifest")
+            or path.startswith("/static/")
+        ):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
+        return response
+
     db_path = Path(os.environ.get("WORKBENCH_DB", "").strip() or DEFAULT_DB_PATH)
     defaults_path = Path(os.environ.get("WORKBENCH_DEFAULTS", "").strip() or DEFAULT_DEFAULTS_PATH)
     state_db_path = Path(
@@ -3426,6 +3456,12 @@ def create_app(host: str = "127.0.0.1", port: int = 8787) -> FastAPI:
     @app.get("/sw.js")
     def service_worker() -> FileResponse:
         return FileResponse(WEB_DIR / "sw.js", media_type="application/javascript")
+
+    @app.get("/api/workbench/version")
+    def shell_version() -> JSONResponse:
+        response = JSONResponse({"ok": True, "version": _shell_version()})
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/healthz")
     def healthz() -> JSONResponse:
