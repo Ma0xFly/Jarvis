@@ -2238,10 +2238,14 @@ class WorkbenchService:
             if not isinstance(value, str) or not value.strip():
                 continue
             executor = metadata.get("executor_session_id")
+            executor_name = metadata.get("executor")
             candidates.append(
                 {
                     "session_id": value.strip(),
                     "run": run,
+                    "executor": executor_name.strip()
+                    if isinstance(executor_name, str) and executor_name.strip()
+                    else None,
                     "executor_session_id": executor.strip()
                     if isinstance(executor, str) and executor.strip()
                     else None,
@@ -2253,6 +2257,7 @@ class WorkbenchService:
                 {
                     "session_id": value.strip(),
                     "run": None,
+                    "executor": None,
                     "executor_session_id": None,
                 }
             )
@@ -2645,6 +2650,7 @@ class WorkbenchService:
             "run_id": run_id
             if isinstance(run_id, int) and not isinstance(run_id, bool)
             else None,
+            "executor": candidate["executor"],
             "executor_session_id": candidate["executor_session_id"],
             "messages": messages,
             "returned_count": len(messages),

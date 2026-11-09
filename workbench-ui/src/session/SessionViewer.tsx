@@ -11,7 +11,8 @@ import {
  *
  * 数据来自 GET /api/workbench/session/{task_id}：后端只读 ~/.hermes/state.db，
  * 返回最新 run 的 worker session（或 tasks.session_id 回退）最近 200 条消息。
- * 不跳 9119、不发消息、不续跑；executor_session_id 只展示（续跑属 Epic 3）。
+ * 不跳 9119、不发消息、不续跑；executor_session_id 只展示并复制 `--resume`
+ * 片段，实际续跑由调用方用 bin/executor-run 完成。
  */
 
 interface SessionViewerProps {
@@ -89,6 +90,12 @@ function renderRole(role: string): string {
   return role.replace(/[^a-z0-9_-]/g, "") || "message";
 }
 
+/** Shell-safe token: leave simple values bare, single-quote anything else. */
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_./:@%+=,-]+$/.test(value)) return value;
+  return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
 export default function SessionViewer({
   taskId,
   taskTitle,
@@ -98,6 +105,7 @@ export default function SessionViewer({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<{ code: string; message: string } | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [copyState, setCopyState] = useState<"idle" | "ok" | "error">("idle");
   const drawerRef = useRef<HTMLElement | null>(null);
   const scrimRef = useRef<HTMLDivElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
@@ -149,11 +157,43 @@ export default function SessionViewer({
     if (node) node.scrollTop = node.scrollHeight;
   }, [data]);
 
+  const executorSessionId = data?.executor_session_id ?? null;
+  const executorName = data?.executor ?? null;
+  const resumeCommand = executorSessionId
+    ? [
+        ...(executorName ? ["--executor", shellQuote(executorName)] : []),
+        "--resume",
+        shellQuote(executorSessionId),
+      ].join(" ")
+    : "";
+
+  const copyResume = useCallback(async () => {
+    if (!resumeCommand) return;
+    try {
+      if (!navigator.clipboard || typeof navigator.clipboard.writeText !== "function") {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(resumeCommand);
+      setCopyState("ok");
+    } catch {
+      setCopyState("error");
+    }
+  }, [resumeCommand]);
+
+  // Clear the copy status after a short moment, and on every task change /
+  // drawer reopen (the load effect below also resets it).
+  useEffect(() => {
+    if (copyState === "idle") return;
+    const timer = window.setTimeout(() => setCopyState("idle"), 3000);
+    return () => window.clearTimeout(timer);
+  }, [copyState]);
+
   useEffect(() => {
     let alive = true;
     setLoading(true);
     setData(null);
     setError(null);
+    setCopyState("idle");
     void getSession(taskId)
       .then((transcript) => {
         if (!alive) return;
@@ -330,8 +370,38 @@ export default function SessionViewer({
               </dl>
               {data.executor_session_id ? (
                 <div className="wb-session-executor">
-                  执行器会话 <code>{data.executor_session_id}</code>
-                  <span>续跑属 Epic 3，本页只展示，不启动也不写回。</span>
+                  <div className="wb-session-executor-row">
+                    <span className="wb-session-executor-label">执行器</span>
+                    <code className="wb-session-executor-name">{data.executor || "—"}</code>
+                    <span className="wb-session-executor-label">会话</span>
+                    <code className="wb-session-executor-id">{data.executor_session_id}</code>
+                    <button
+                      className="wb-btn wb-session-copy"
+                      type="button"
+                      onClick={() => void copyResume()}
+                      aria-label={"复制续跑参数 " + resumeCommand}
+                    >
+                      复制续跑参数
+                    </button>
+                    <span
+                      className={
+                        "wb-session-copy-status" + (copyState === "error" ? " error" : "")
+                      }
+                      role="status"
+                    >
+                      {copyState === "ok"
+                        ? "已复制"
+                        : copyState === "error"
+                          ? "复制失败，请手动复制"
+                          : ""}
+                    </span>
+                  </div>
+                  <div className="wb-session-executor-row">
+                    <code className="wb-session-resume">{resumeCommand}</code>
+                    <span className="wb-session-executor-hint">
+                      只复制片段，不启动；实际续跑用 bin/executor-run。
+                    </span>
+                  </div>
                 </div>
               ) : null}
             </section>

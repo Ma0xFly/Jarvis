@@ -38,7 +38,7 @@ CLI = ROOT / "bin" / "executor-run"
 REGISTRY = ROOT / "executors.json"
 
 sys.path.insert(0, str(ROOT / "bin"))
-from executors import claude_code  # noqa: E402
+from executors import claude_code, codex, dsh, hermes  # noqa: E402
 
 TASK_BOOK_MARKER = "TASK_BOOK_MARKER_9f3c2b"
 
@@ -186,6 +186,155 @@ else:
 """
 
 
+FAKE_DSH = """#!__PYTHON__
+import json
+import os
+import sys
+
+prompt = sys.stdin.read()
+capture = os.environ.get("FAKE_DSH_CAPTURE")
+if capture:
+    with open(capture, "w", encoding="utf-8") as handle:
+        json.dump({"argv": sys.argv[1:], "stdin": prompt}, handle, ensure_ascii=False)
+
+mode = os.environ.get("FAKE_DSH_MODE", "ok")
+
+
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+if mode == "ok":
+    emit({"type": "session", "sessionId": "session-abc"})
+    emit({"type": "status", "phase": "step_start"})
+    emit({
+        "type": "status",
+        "phase": "step_end",
+        "usage": {"inputTokens": 10, "outputTokens": 20},
+    })
+    emit({"type": "text", "text": "中间输出"})
+    emit({
+        "type": "status",
+        "phase": "step_end",
+        "usage": {"inputTokens": 1, "outputTokens": 2},
+    })
+    emit({"type": "final", "text": "dsh 改完 3 个文件"})
+    print("diagnostic only", file=sys.stderr)
+    sys.exit(0)
+elif mode == "nosession":
+    emit({
+        "type": "status",
+        "phase": "step_end",
+        "usage": {"inputTokens": 5, "outputTokens": 5},
+    })
+    emit({"type": "final", "text": "ok"})
+elif mode == "nofinal":
+    emit({"type": "session", "sessionId": "session-nofinal"})
+    emit({
+        "type": "status",
+        "phase": "step_end",
+        "usage": {"inputTokens": 1, "outputTokens": 1},
+    })
+elif mode == "unrecognized":
+    emit({"type": "unknown.event", "value": 1})
+elif mode == "badjson":
+    print("this is not json")
+elif mode == "error_event":
+    emit({"type": "error", "message": "dsh 内部错误"})
+    sys.exit(7)
+elif mode == "error_no_message":
+    emit({"type": "error"})
+    emit({"type": "final", "text": "看起来成功"})
+elif mode == "nonzero_with_final":
+    emit({"type": "final", "text": "看起来成功"})
+    print("boom-dsh", file=sys.stderr)
+    sys.exit(7)
+elif mode == "nonzero":
+    print("boom", file=sys.stderr)
+    sys.exit(7)
+else:
+    print("unknown fake dsh mode", file=sys.stderr)
+    sys.exit(9)
+"""
+
+
+FAKE_CODEX = """#!__PYTHON__
+import json
+import os
+import sys
+
+prompt = sys.stdin.read()
+capture = os.environ.get("FAKE_CODEX_CAPTURE")
+if capture:
+    with open(capture, "w", encoding="utf-8") as handle:
+        json.dump({"argv": sys.argv[1:], "stdin": prompt}, handle, ensure_ascii=False)
+
+mode = os.environ.get("FAKE_CODEX_MODE", "ok")
+
+
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+if mode == "ok":
+    emit({"type": "thread.started", "thread_id": "thread-abc"})
+    emit({
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "第一版"},
+    })
+    emit({
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "最终答复"},
+    })
+    emit({
+        "type": "turn.completed",
+        "usage": {"input_tokens": 10, "output_tokens": 20},
+    })
+elif mode == "minimal":
+    emit({"type": "thread.started", "thread_id": "thread-min"})
+    emit({
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "done"},
+    })
+elif mode == "unrecognized":
+    emit({
+        "type": "item.started",
+        "item": {"type": "agent_message", "text": "ignored"},
+    })
+elif mode == "thread_only":
+    emit({"type": "thread.started", "thread_id": "thread-only"})
+elif mode == "turn_only":
+    emit({
+        "type": "turn.completed",
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    })
+elif mode == "error_no_message":
+    emit({"type": "error"})
+elif mode == "badjson":
+    print("this is not json")
+elif mode == "turn_failed":
+    emit({
+        "type": "turn.failed",
+        "error": {"message": "codex 失败"},
+    })
+    sys.exit(7)
+elif mode == "nonzero_with_agent":
+    emit({"type": "thread.started", "thread_id": "thread-nonzero"})
+    emit({
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "看起来完成了"},
+    })
+    print("boom-codex", file=sys.stderr)
+    sys.exit(7)
+elif mode == "nonzero":
+    print("boom", file=sys.stderr)
+    sys.exit(7)
+else:
+    print("unknown fake codex mode", file=sys.stderr)
+    sys.exit(9)
+"""
+
+
 class FakeClaudeHarness(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="executor-run-"))
@@ -193,23 +342,29 @@ class FakeClaudeHarness(unittest.TestCase):
 
         self.fake_bin = self.tmp / "bin"
         self.fake_bin.mkdir()
-        fake = self.fake_bin / "claude"
-        fake.write_text(
-            FAKE_CLAUDE.replace("__PYTHON__", sys.executable),
-            encoding="utf-8",
-        )
-        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        self._install_fake("claude", FAKE_CLAUDE)
+        self._install_fake("dsh", FAKE_DSH)
+        self._install_fake("codex", FAKE_CODEX)
 
         self.cwd = self.tmp / "work"
         self.cwd.mkdir()
         self.capture = self.tmp / "capture.json"
+        self.dsh_capture = self.tmp / "dsh-capture.json"
+        self.codex_capture = self.tmp / "codex-capture.json"
         self.marker = self.tmp / "marker.json"
         self.task = f"# 任务\n\n{TASK_BOOK_MARKER}\n\n只改 x.py。\n"
+
+    def _install_fake(self, name: str, source: str) -> None:
+        fake = self.fake_bin / name
+        fake.write_text(source.replace("__PYTHON__", sys.executable), encoding="utf-8")
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
     def run_cli(
         self,
         *,
         mode: str = "ok",
+        dsh_mode: str = "ok",
+        codex_mode: str = "ok",
         args=None,
         task: str | None = None,
         path: str | None = None,
@@ -221,6 +376,10 @@ class FakeClaudeHarness(unittest.TestCase):
         env["FAKE_CLAUDE_MODE"] = mode
         env["FAKE_CLAUDE_CAPTURE"] = str(self.capture)
         env["FAKE_CLAUDE_MARKER"] = str(self.marker)
+        env["FAKE_DSH_MODE"] = dsh_mode
+        env["FAKE_DSH_CAPTURE"] = str(self.dsh_capture)
+        env["FAKE_CODEX_MODE"] = codex_mode
+        env["FAKE_CODEX_CAPTURE"] = str(self.codex_capture)
         if path is not None:
             env["PATH"] = path
         elif use_fake_path:
@@ -257,6 +416,14 @@ class FakeClaudeHarness(unittest.TestCase):
     def capture_data(self) -> dict:
         self.assertTrue(self.capture.is_file(), "fake claude was not invoked")
         return json.loads(self.capture.read_text(encoding="utf-8"))
+
+    def dsh_capture_data(self) -> dict:
+        self.assertTrue(self.dsh_capture.is_file(), "fake dsh was not invoked")
+        return json.loads(self.dsh_capture.read_text(encoding="utf-8"))
+
+    def codex_capture_data(self) -> dict:
+        self.assertTrue(self.codex_capture.is_file(), "fake codex was not invoked")
+        return json.loads(self.codex_capture.read_text(encoding="utf-8"))
 
     def write_registry(self, data, name: str = "registry.json") -> Path:
         path = self.tmp / name
@@ -910,6 +1077,301 @@ class TerminationTests(FakeClaudeHarness):
         self._wait_pid_gone(info["pid"])
 
 
+class DshContractTests(FakeClaudeHarness):
+    def _args(self, *, mode: str = "write", resume=None) -> list:
+        args = [
+            "--executor",
+            "dsh",
+            "--cwd",
+            str(self.cwd),
+            "--mode",
+            mode,
+            "--budget-minutes",
+            "30",
+        ]
+        if resume is not None:
+            args.extend(["--resume", resume])
+        return args
+
+    def test_success_maps_ndjson_events(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self.payload(proc)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["executor"], "dsh")
+        self.assertEqual(payload["session_id"], "session-abc")
+        self.assertEqual(payload["summary"], "dsh 改完 3 个文件")
+        self.assertEqual(payload["cost"], {"usd": None, "tokens": 33})
+        self.assertEqual(payload["exit_code"], 0)
+
+        captured = self.dsh_capture_data()
+        self.assertEqual(captured["argv"], ["--profile", "headless", "--json"])
+        self.assertEqual(captured["stdin"], self.task)
+        self.assertNotIn(TASK_BOOK_MARKER, " ".join(captured["argv"]))
+        self.assertNotIn(TASK_BOOK_MARKER, proc.stdout)
+        log = (self.cwd / payload["log_path"]).read_text(encoding="utf-8")
+        self.assertNotIn(TASK_BOOK_MARKER, log)
+        self.assertFalse(self.capture.exists())
+        self.assertFalse(self.codex_capture.exists())
+
+    def test_resume_maps_to_session_id(self) -> None:
+        proc = self.run_cli(args=self._args(resume="session-old"), dsh_mode="ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        captured = self.dsh_capture_data()
+        self.assertEqual(
+            captured["argv"],
+            ["--profile", "headless", "--json", "--session-id", "session-old"],
+        )
+        # The resumed id is not fabricated into the result; the event wins.
+        self.assertEqual(self.payload(proc)["session_id"], "session-abc")
+
+    def test_missing_session_event_is_null(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="nosession")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self.payload(proc)
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["session_id"])
+        self.assertEqual(payload["cost"], {"usd": None, "tokens": 10})
+
+    def test_missing_final_event_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="nofinal")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["session_id"], "session-nofinal")
+        self.assertIn("final", payload["summary"])
+
+    def test_unrecognized_events_are_1(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="unrecognized")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("没有可识别的事件", self.payload(proc)["summary"])
+
+    def test_unparsable_output_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="badjson")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIsNone(payload["session_id"])
+        self.assertIn("无法解析", payload["summary"])
+
+    def test_error_event_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="error_event")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("dsh 内部错误", payload["summary"])
+
+    def test_error_without_message_is_not_success(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="error_no_message")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 1)
+        self.assertIn("错误信息", payload["summary"])
+        self.assertIn("看起来成功", payload["summary"])
+
+    def test_nonzero_with_final_prefers_exit_and_stderr(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="nonzero_with_final")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("退出码 7", payload["summary"])
+        self.assertIn("boom-dsh", payload["summary"])
+        self.assertIn("看起来成功", payload["summary"])
+
+    def test_readonly_mode_is_rejected(self) -> None:
+        proc = self.run_cli(args=self._args(mode="readonly"), dsh_mode="ok")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("只读", payload["summary"])
+        self.assertFalse(self.dsh_capture.exists())
+
+    def test_nonzero_exit_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="nonzero")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("boom", self.payload(proc)["summary"])
+
+    def test_missing_binary_is_4_without_starting(self) -> None:
+        empty_bin = self.tmp / "empty-bin"
+        empty_bin.mkdir()
+        proc = self.run_cli(args=self._args(), path=str(empty_bin))
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        payload = self.payload(proc)
+        self.assertEqual(payload["executor"], "dsh")
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("找不到 dsh", payload["summary"])
+        self.assertFalse(self.dsh_capture.exists())
+
+
+class CodexContractTests(FakeClaudeHarness):
+    def _args(self, *, mode: str = "write", resume=None) -> list:
+        args = [
+            "--executor",
+            "codex",
+            "--cwd",
+            str(self.cwd),
+            "--mode",
+            mode,
+            "--budget-minutes",
+            "30",
+        ]
+        if resume is not None:
+            args.extend(["--resume", resume])
+        return args
+
+    def test_success_maps_jsonl_events(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self.payload(proc)
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["executor"], "codex")
+        self.assertEqual(payload["session_id"], "thread-abc")
+        self.assertEqual(payload["summary"], "最终答复")
+        self.assertEqual(payload["cost"], {"usd": None, "tokens": 30})
+        self.assertEqual(payload["exit_code"], 0)
+
+        captured = self.codex_capture_data()
+        self.assertEqual(
+            captured["argv"],
+            ["exec", "--json", "--sandbox", "workspace-write", "-"],
+        )
+        self.assertEqual(captured["stdin"], self.task)
+        self.assertNotIn(TASK_BOOK_MARKER, " ".join(captured["argv"]))
+        self.assertFalse(self.capture.exists())
+        self.assertFalse(self.dsh_capture.exists())
+
+    def test_minimal_thread_and_agent_message_is_ok(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="minimal")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self.payload(proc)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["session_id"], "thread-min")
+        self.assertEqual(payload["summary"], "done")
+        self.assertEqual(payload["cost"], {"usd": None, "tokens": 0})
+
+    def test_readonly_maps_to_read_only_sandbox(self) -> None:
+        proc = self.run_cli(args=self._args(mode="readonly"), codex_mode="minimal")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = self.codex_capture_data()["argv"]
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertNotIn("workspace-write", argv)
+
+    def test_resume_uses_exec_resume(self) -> None:
+        proc = self.run_cli(args=self._args(resume="thread-old"), codex_mode="ok")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        captured = self.codex_capture_data()
+        self.assertEqual(
+            captured["argv"],
+            ["exec", "resume", "--json", "thread-old", "-"],
+        )
+        self.assertEqual(captured["stdin"], self.task)
+        self.assertEqual(self.payload(proc)["session_id"], "thread-abc")
+
+    def test_unrecognized_events_are_1(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="unrecognized")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("没有可识别的事件", self.payload(proc)["summary"])
+
+    def test_unparsable_output_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="badjson")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIsNone(payload["session_id"])
+        self.assertIn("无法解析", payload["summary"])
+
+    def test_turn_failed_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="turn_failed")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("codex 失败", payload["summary"])
+
+    def test_thread_only_is_not_success(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="thread_only")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 1)
+        self.assertIn("agent_message", payload["summary"])
+
+    def test_turn_only_is_not_success(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="turn_only")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("agent_message", payload["summary"])
+
+    def test_error_without_message_is_not_success(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="error_no_message")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("错误信息", payload["summary"])
+
+    def test_nonzero_with_agent_message_prefers_exit_and_stderr(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="nonzero_with_agent")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("退出码 7", payload["summary"])
+        self.assertIn("boom-codex", payload["summary"])
+        self.assertIn("看起来完成了", payload["summary"])
+
+    def test_readonly_resume_is_rejected(self) -> None:
+        args = self._args(mode="readonly", resume="thread-old")
+        proc = self.run_cli(args=args, codex_mode="ok")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertIn("resume", payload["summary"])
+        self.assertFalse(self.codex_capture.exists())
+
+    def test_nonzero_exit_is_1(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="nonzero")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("boom", self.payload(proc)["summary"])
+
+    def test_missing_binary_is_4_without_starting(self) -> None:
+        empty_bin = self.tmp / "empty-bin"
+        empty_bin.mkdir()
+        proc = self.run_cli(args=self._args(), path=str(empty_bin))
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        payload = self.payload(proc)
+        self.assertEqual(payload["executor"], "codex")
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("找不到 codex", payload["summary"])
+        self.assertFalse(self.codex_capture.exists())
+
+
+class HermesInProcessTests(FakeClaudeHarness):
+    def test_cli_returns_4_and_explains_in_process(self) -> None:
+        args = [
+            "--executor",
+            "hermes",
+            "--cwd",
+            str(self.cwd),
+            "--budget-minutes",
+            "30",
+        ]
+        proc = self.run_cli(args=args)
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        payload = self.payload(proc)
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["executor"], "hermes")
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("worker 进程内运行", payload["summary"])
+        self.assertIn("不支持 CLI 调用", payload["summary"])
+        # Refused before import/exec: no fake binary was started.
+        self.assertFalse(self.capture.exists())
+        self.assertFalse(self.dsh_capture.exists())
+        self.assertFalse(self.codex_capture.exists())
+
+
 class RunnerUnitTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -951,6 +1413,22 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(entry["mode"], "cli")
         self.assertEqual(entry["binary"], "claude")
 
+    def test_registry_declares_dsh_codex_and_hermes(self) -> None:
+        data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+        executors = data["executors"]
+
+        self.assertEqual(executors["dsh"]["module"], "executors.dsh")
+        self.assertEqual(executors["dsh"]["mode"], "cli")
+        self.assertEqual(executors["dsh"]["binary"], "dsh")
+
+        self.assertEqual(executors["codex"]["module"], "executors.codex")
+        self.assertEqual(executors["codex"]["mode"], "cli")
+        self.assertEqual(executors["codex"]["binary"], "codex")
+
+        self.assertEqual(executors["hermes"]["module"], "executors.hermes")
+        self.assertEqual(executors["hermes"]["mode"], "in-process")
+        self.assertNotIn("binary", executors["hermes"])
+
     def test_string_entry_form_is_accepted(self) -> None:
         import runpy
 
@@ -976,7 +1454,11 @@ class DependencyBoundaryTests(unittest.TestCase):
 
         for path in (
             ROOT / "bin" / "executor-run",
+            ROOT / "bin" / "route",
             ROOT / "bin" / "executors" / "claude_code.py",
+            ROOT / "bin" / "executors" / "dsh.py",
+            ROOT / "bin" / "executors" / "codex.py",
+            ROOT / "bin" / "executors" / "hermes.py",
         ):
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -1225,6 +1707,282 @@ class ClaudeCodeAdapterTests(unittest.TestCase):
         )
         result = claude_code.translate_result(stdout, "", 0)
         self.assertEqual(result["cost"], {"usd": None, "tokens": 0})
+
+
+class DshAdapterTests(unittest.TestCase):
+    def test_build_command_default(self) -> None:
+        command = dsh.build_command({"binary": "dsh"})
+        self.assertEqual(command, ["dsh", "--profile", "headless", "--json"])
+
+    def test_build_command_resume_maps_to_session_id(self) -> None:
+        command = dsh.build_command({"resume": "session-9"})
+        self.assertEqual(
+            command,
+            ["dsh", "--profile", "headless", "--json", "--session-id", "session-9"],
+        )
+
+    def test_build_command_rejects_readonly(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            dsh.build_command({"mode": "readonly"})
+        self.assertIn("只读", str(caught.exception))
+
+    def test_translate_success_maps_events(self) -> None:
+        stdout = "\n".join(
+            [
+                'diagnostic before json',
+                json.dumps({"type": "session", "sessionId": "session-1"}),
+                json.dumps(
+                    {
+                        "type": "status",
+                        "phase": "step_end",
+                        "usage": {"inputTokens": 10, "outputTokens": 20},
+                    }
+                ),
+                json.dumps({"type": "text", "text": "middle"}),
+                json.dumps(
+                    {
+                        "type": "status",
+                        "phase": "step_end",
+                        "usage": {"input_tokens": 1, "output_tokens": 2},
+                    }
+                ),
+                json.dumps({"type": "final", "text": "done"}),
+                "diagnostic after json",
+            ]
+        )
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["session_id"], "session-1")
+        self.assertEqual(result["summary"], "done")
+        self.assertEqual(result["cost"], {"usd": None, "tokens": 33})
+        self.assertEqual(result["files_changed"], [])
+        self.assertEqual(result["exit_code"], 0)
+
+    def test_translate_missing_session_is_null(self) -> None:
+        stdout = json.dumps({"type": "final", "text": "ok"})
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["session_id"])
+        self.assertEqual(result["cost"], {"usd": None, "tokens": 0})
+
+    def test_translate_missing_final_is_1(self) -> None:
+        stdout = json.dumps({"type": "session", "sessionId": "session-x"})
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["session_id"], "session-x")
+        self.assertIn("final", result["summary"])
+
+    def test_translate_error_event_is_1(self) -> None:
+        stdout = json.dumps({"type": "error", "message": "boom"})
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["summary"], "boom")
+
+    def test_translate_error_without_message_is_1(self) -> None:
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "error"}),
+                json.dumps({"type": "final", "text": "looks fine"}),
+            ]
+        )
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("错误信息", result["summary"])
+        self.assertIn("looks fine", result["summary"])
+
+    def test_translate_nonzero_exit_is_1(self) -> None:
+        stdout = json.dumps({"type": "final", "text": "looks fine"})
+        result = dsh.translate_result(stdout, "oops", 7)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("退出码 7", result["summary"])
+        self.assertIn("oops", result["summary"])
+        self.assertIn("looks fine", result["summary"])
+
+    def test_translate_unparsable_is_1(self) -> None:
+        result = dsh.translate_result("not json\n", "oops", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("无法解析", result["summary"])
+        self.assertIsNone(result["session_id"])
+
+    def test_translate_huge_tokens_fall_back_to_zero(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "status",
+                "phase": "step_end",
+                "usage": {"inputTokens": 10**400, "outputTokens": 10**400},
+            }
+        )
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertEqual(result["cost"], {"usd": None, "tokens": 0})
+
+
+class CodexAdapterTests(unittest.TestCase):
+    def test_build_command_write_and_readonly(self) -> None:
+        write = codex.build_command({"binary": "codex", "mode": "write"})
+        readonly = codex.build_command({"mode": "readonly"})
+        self.assertEqual(
+            write,
+            ["codex", "exec", "--json", "--sandbox", "workspace-write", "-"],
+        )
+        self.assertEqual(
+            readonly,
+            ["codex", "exec", "--json", "--sandbox", "read-only", "-"],
+        )
+
+    def test_build_command_resume(self) -> None:
+        command = codex.build_command({"mode": "write", "resume": "thread-9"})
+        self.assertEqual(
+            command,
+            ["codex", "exec", "resume", "--json", "thread-9", "-"],
+        )
+
+    def test_build_command_rejects_unknown_mode(self) -> None:
+        with self.assertRaises(ValueError):
+            codex.build_command({"mode": "yolo"})
+
+    def test_build_command_rejects_readonly_resume(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            codex.build_command({"mode": "readonly", "resume": "thread-9"})
+        self.assertIn("resume", str(caught.exception))
+
+    def test_translate_success_uses_last_agent_message(self) -> None:
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "first"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "reasoning", "text": "ignored"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": "last"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 10, "output_tokens": 20},
+                    }
+                ),
+            ]
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["session_id"], "thread-1")
+        self.assertEqual(result["summary"], "last")
+        self.assertEqual(result["cost"], {"usd": None, "tokens": 30})
+        self.assertEqual(result["exit_code"], 0)
+
+    def test_translate_without_thread_still_ok_but_null_session(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "done"},
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["session_id"])
+        self.assertEqual(result["summary"], "done")
+
+    def test_translate_unrecognized_events_is_1(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "item.started",
+                "item": {"type": "agent_message", "text": "ignored"},
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("没有可识别的事件", result["summary"])
+
+    def test_translate_turn_failed_is_1(self) -> None:
+        stdout = json.dumps(
+            {"type": "turn.failed", "error": {"message": "codex exploded"}}
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertEqual(result["summary"], "codex exploded")
+
+    def test_translate_thread_only_is_1(self) -> None:
+        stdout = json.dumps({"type": "thread.started", "thread_id": "thread-1"})
+        result = codex.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("agent_message", result["summary"])
+
+    def test_translate_turn_only_is_1(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("agent_message", result["summary"])
+
+    def test_translate_error_without_message_is_1(self) -> None:
+        result = codex.translate_result(json.dumps({"type": "error"}), "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("错误信息", result["summary"])
+
+    def test_translate_nonzero_exit_is_1(self) -> None:
+        stdout = json.dumps({"type": "thread.started", "thread_id": "thread-1"})
+        result = codex.translate_result(stdout, "oops", 7)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("退出码 7", result["summary"])
+        self.assertIn("oops", result["summary"])
+
+    def test_translate_unparsable_is_1(self) -> None:
+        result = codex.translate_result("not json\n", "oops", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("无法解析", result["summary"])
+
+    def test_translate_huge_tokens_fall_back_to_zero(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 10**400,
+                    "output_tokens": 10**400,
+                },
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertEqual(result["cost"], {"usd": None, "tokens": 0})
+
+
+class HermesAdapterTests(unittest.TestCase):
+    def test_build_command_refuses(self) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            hermes.build_command({})
+        self.assertIn("worker 进程内运行", str(caught.exception))
+
+    def test_translate_result_refuses(self) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            hermes.translate_result("{}", "", 0)
+        self.assertIn("worker 进程内运行", str(caught.exception))
 
 
 if __name__ == "__main__":

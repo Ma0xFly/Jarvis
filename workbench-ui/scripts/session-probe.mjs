@@ -11,6 +11,8 @@
  *   - session metadata (ended/duration/running), origin labels
  *   - id-ordered window (regressed timestamps), hidden/rewound/dedupe filtering
  *   - "显示 X / 共 Y" + truncated hint, 参数已折叠, no tool-argument secrets
+ *   - executor name + copyable `--executor … --resume …` snippet,
+ *     clipboard ok/failure, unsafe-id quoting, no block when the id is null
  *   - scroll to newest, body scroll lock + inert background
  *   - Esc close/focus restore, Tab trap, light/dark tokens
  *   - 503 session_unavailable + retry (state.db temporarily renamed)
@@ -448,7 +450,11 @@ print(rows)`,
     const doneCard = await createUpstream(doneTitle);
     addRunMetadata(
       doneCard,
-      { worker_session_id: "sess-done", executor_session_id: "exec-resume-1" },
+      {
+        worker_session_id: "sess-done",
+        executor: "claude_code",
+        executor_session_id: "exec-resume-1",
+      },
       true,
     );
     const longConclusion = "结论：" + "长".repeat(4000);
@@ -489,6 +495,19 @@ print(rows)`,
       },
       { role: "assistant", content: longConclusion, timestamp: 500 },
     ]);
+
+    const unsafeTitle = "不安全执行器 id 卡";
+    const unsafeCard = await createUpstream(unsafeTitle);
+    addRunMetadata(
+      unsafeCard,
+      {
+        worker_session_id: "sess-unsafe",
+        executor: "claude_code",
+        executor_session_id: "exec;touch pwned",
+      },
+      true,
+    );
+    addSession("sess-unsafe", [{ role: "user", content: "unsafe", timestamp: 900 }]);
 
     const taskTitle = "发起会话完成卡";
     const taskCard = await createUpstream(taskTitle);
@@ -635,6 +654,11 @@ print(rows)`,
         toolSummary: document.querySelector('.wb-session-tools summary')?.textContent || '',
         toolRows: [...document.querySelectorAll('.wb-session-tools li')].map((node) => node.textContent),
         executor: document.querySelector('.wb-session-executor')?.textContent || '',
+        executorName: document.querySelector('.wb-session-executor-name')?.textContent || '',
+        executorId: document.querySelector('.wb-session-executor-id')?.textContent || '',
+        executorResume: document.querySelector('.wb-session-resume')?.textContent || '',
+        executorCopy: Boolean(document.querySelector('.wb-session-copy')),
+        executorCount: document.querySelectorAll('.wb-session-executor').length,
         scrollTop: wrap?.scrollTop ?? 0,
         scrollHeight: wrap?.scrollHeight ?? 0,
         clientHeight: wrap?.clientHeight ?? 0,
@@ -682,10 +706,64 @@ print(rows)`,
       JSON.stringify({ summary: drawerState.toolSummary, rows: drawerState.toolRows }),
     );
     check(
-      "executor_session_id 只在已解析 run 上展示",
-      drawerState.executor.includes("exec-resume-1") &&
-        drawerState.executor.includes("续跑属 Epic 3"),
-      drawerState.executor,
+      "执行器名与 executor_session_id 只展示 id 与 --executor/--resume 片段",
+      drawerState.executorCount === 1 &&
+        drawerState.executorName === "claude_code" &&
+        drawerState.executorId === "exec-resume-1" &&
+        drawerState.executorResume ===
+          "--executor claude_code --resume exec-resume-1" &&
+        drawerState.executorCopy === true &&
+        drawerState.executor.includes("只复制片段") &&
+        !drawerState.executor.includes("续跑属 Epic 3"),
+      JSON.stringify({
+        name: drawerState.executorName,
+        id: drawerState.executorId,
+        resume: drawerState.executorResume,
+        copy: drawerState.executorCopy,
+      }),
+    );
+
+    await evaluate(`(() => {
+      window.__wbCopied = null;
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async (text) => { window.__wbCopied = text; } },
+      });
+      return true;
+    })()`);
+    await evaluate("document.querySelector('.wb-session-copy').click(); true");
+    await waitForEval(
+      "document.querySelector('.wb-session-copy-status')?.textContent.includes('已复制')",
+      5000,
+      "复制成功状态",
+    );
+    check(
+      "复制按钮写入 --executor/--resume 片段",
+      (await evaluate("window.__wbCopied")) ===
+        "--executor claude_code --resume exec-resume-1",
+      String(await evaluate("window.__wbCopied")),
+    );
+
+    await evaluate(`(() => {
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText: async () => { throw new Error('denied'); } },
+      });
+      return true;
+    })()`);
+    await evaluate("document.querySelector('.wb-session-copy').click(); true");
+    await waitForEval(
+      "document.querySelector('.wb-session-copy-status')?.textContent.includes('复制失败')",
+      5000,
+      "复制失败状态",
+    );
+    const copyFailureText = await evaluate(
+      "document.querySelector('.wb-session-copy-status')?.textContent || ''",
+    );
+    check(
+      "剪贴板失败显示可见状态",
+      copyFailureText.includes("复制失败"),
+      copyFailureText,
     );
     check(
       "消息列表滚动到最新（底部）",
@@ -739,6 +817,28 @@ print(rows)`,
         (await evaluate("document.querySelector('.wb-root > .wb-shell')?.inert === false")) === true,
     );
 
+    // ---- 1b. unsafe executor id is shell-quoted ----------------------
+    await openSessionFor(unsafeCard);
+    await waitForEval(
+      "document.querySelector('.wb-session-resume')?.textContent.includes('exec;touch pwned')",
+      8000,
+      "不安全 id 会话加载",
+    );
+    const unsafeResume = await evaluate(
+      "document.querySelector('.wb-session-resume')?.textContent || ''",
+    );
+    check(
+      "不安全 executor id 在复制片段里被 shell 引号包住",
+      unsafeResume === "--executor claude_code --resume 'exec;touch pwned'",
+      unsafeResume,
+    );
+    await pressKey("Escape");
+    await waitForEval(
+      "!Boolean(document.querySelector('.wb-session-drawer'))",
+      5000,
+      "不安全 id 抽屉关闭",
+    );
+
     // ---- 2. task.session_id fallback label ----------------------------
     await openSessionFor(taskCard);
     await waitForEval(
@@ -754,6 +854,10 @@ print(rows)`,
       fallbackOrigin.includes("发起会话") && !fallbackOrigin.includes("最新一轮"),
       fallbackOrigin,
     );
+    const noExecutorBlock = await evaluate(
+      "document.querySelector('.wb-session-executor') === null",
+    );
+    check("无 executor_session_id 时不渲染执行器块", noExecutorBlock === true);
     await pressKey("Escape");
     await waitForEval("!Boolean(document.querySelector('.wb-session-drawer'))", 5000, "兜底抽屉关闭");
 

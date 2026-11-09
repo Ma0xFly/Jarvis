@@ -355,6 +355,7 @@ class ResolutionTests(SessionServerTestCase):
             task_id,
             {
                 "worker_session_id": "sess-older",
+                "executor": "dsh",
                 "executor_session_id": "exec-old",
             },
             started_at=int(time.time()) - 600,
@@ -364,6 +365,7 @@ class ResolutionTests(SessionServerTestCase):
             task_id,
             {
                 "worker_session_id": "sess-missing",
+                "executor": "claude_code",
                 "executor_session_id": "exec-new",
             },
             started_at=int(time.time()) - 60,
@@ -375,6 +377,7 @@ class ResolutionTests(SessionServerTestCase):
         self.assertEqual(body["session"]["id"], "sess-older")
         self.assertEqual(body["source"], "run")
         # Executor must come from the run that supplied the session.
+        self.assertEqual(body["executor"], "dsh")
         self.assertEqual(body["executor_session_id"], "exec-old")
         self.assertNotEqual(body["executor_session_id"], "exec-new")
 
@@ -396,6 +399,7 @@ class ResolutionTests(SessionServerTestCase):
         self.assertEqual(body["session"]["id"], "sess-task")
         self.assertEqual(body["source"], "task")
         self.assertIsNone(body["run_id"])
+        self.assertIsNone(body["executor"])
         self.assertIsNone(body["executor_session_id"])
 
     def test_no_session_anywhere_is_404(self):
@@ -426,6 +430,7 @@ class ResolutionTests(SessionServerTestCase):
             task_id,
             {
                 "worker_session_id": "sess-exec",
+                "executor": "claude_code",
                 "executor_session_id": "exec-resume-id",
             },
         )
@@ -434,8 +439,107 @@ class ResolutionTests(SessionServerTestCase):
 
         code, body = self.transcript(task_id)
         self.assertEqual(code, 200, body)
+        self.assertEqual(body["executor"], "claude_code")
         self.assertEqual(body["executor_session_id"], "exec-resume-id")
         self.assertEqual(run_metadata(self.server, run_id), metadata_before)
+
+    def test_malformed_executor_is_null(self):
+        cases = [
+            ("int", 123),
+            ("list", ["dsh"]),
+            ("dict", {"name": "dsh"}),
+            ("bool", True),
+            ("empty", ""),
+            ("blank", "   "),
+        ]
+        for index, (label, executor) in enumerate(cases):
+            with self.subTest(label=label):
+                task_id = self.new_task("畸形执行器名 " + label)
+                session_id = f"sess-bad-executor-{index}"
+                add_run(
+                    self.server,
+                    task_id,
+                    {
+                        "worker_session_id": session_id,
+                        "executor": executor,
+                    },
+                )
+                add_session(
+                    self.state_db,
+                    session_id,
+                    messages=[{"content": "x"}],
+                )
+
+                code, body = self.transcript(task_id)
+                self.assertEqual(code, 200, body)
+                self.assertIsNone(body["executor"])
+
+    def test_executor_is_trimmed(self):
+        task_id = self.new_task("执行器名空白填充")
+        add_run(
+            self.server,
+            task_id,
+            {
+                "worker_session_id": "sess-trim-executor",
+                "executor": "  claude_code  ",
+            },
+        )
+        add_session(
+            self.state_db,
+            "sess-trim-executor",
+            messages=[{"content": "x"}],
+        )
+
+        code, body = self.transcript(task_id)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["executor"], "claude_code")
+
+    def test_malformed_executor_session_id_is_null(self):
+        cases = [
+            ("int", 123),
+            ("list", ["exec"]),
+            ("dict", {"id": "exec"}),
+            ("bool", True),
+            ("empty", ""),
+            ("blank", "   "),
+        ]
+        for index, (label, executor) in enumerate(cases):
+            with self.subTest(label=label):
+                task_id = self.new_task("畸形执行器 id " + label)
+                session_id = f"sess-bad-exec-{index}"
+                add_run(
+                    self.server,
+                    task_id,
+                    {
+                        "worker_session_id": session_id,
+                        "executor_session_id": executor,
+                    },
+                )
+                add_session(
+                    self.state_db,
+                    session_id,
+                    messages=[{"content": "x"}],
+                )
+
+                code, body = self.transcript(task_id)
+                self.assertEqual(code, 200, body)
+                self.assertIsNone(body["executor_session_id"])
+
+    def test_executor_session_id_is_trimmed(self):
+        task_id = self.new_task("执行器 id 空白填充")
+        add_run(
+            self.server,
+            task_id,
+            {
+                "worker_session_id": "sess-trim-exec",
+                "executor_session_id": "  exec-trim  ",
+            },
+        )
+        add_session(self.state_db, "sess-trim-exec", messages=[{"content": "x"}])
+
+        code, body = self.transcript(task_id)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["executor_session_id"], "exec-trim")
 
     def test_transcript_is_read_only_across_both_dbs(self):
         task_id = self.new_task("只读卡")

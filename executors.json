@@ -6,6 +6,23 @@
       "binary": "claude",
       "mode": "cli",
       "description": "Claude Code CLI (claude -p --output-format json)"
+    },
+    "dsh": {
+      "module": "executors.dsh",
+      "binary": "dsh",
+      "mode": "cli",
+      "description": "dsh headless CLI (dsh --profile headless --json); --resume maps to --session-id"
+    },
+    "codex": {
+      "module": "executors.codex",
+      "binary": "codex",
+      "mode": "cli",
+      "description": "Codex CLI (codex exec --json); resume via codex exec resume"
+    },
+    "hermes": {
+      "module": "executors.hermes",
+      "mode": "in-process",
+      "description": "Hermes worker built-in tools (in-process, not a CLI executor)"
     }
   }
 }

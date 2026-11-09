@@ -118,8 +118,9 @@ curl -s -X PATCH http://127.0.0.1:8787/api/workbench/metadata/<task_id> \
   闸门从读验收前就持有 per-task 锁，并保持到转发的状态变更完成；
   `update_metadata` 无法在窗口内清空验收。
 - 预算生效值 = `defaults.json` 全局默认 + 卡上 `metadata.contract.budget`
-  （routing 层 deferred）。派发瞬间把 `max_minutes` / `max_cost` /
-  `deny_paths` 三键快照进 `metadata.contract_defaults`。
+  （`routing.json` 只服务 worker 选执行器，不参与派发快照）。派发瞬间把
+  `max_minutes` / `max_cost` / `deny_paths` 三键快照进
+  `metadata.contract_defaults`。
 - 有未完成 parent → 409 `blocked_by_parent`，卡落 `todo`，不重复入队。
 - `PATCH status=ready` 成功后会用 **GET `/tasks/{id}`** 读真实落点；只有落点
   确实是 `ready` 才读 `/board` 算位次（board 未命中会重读一次，仍不命中返回 502）。
@@ -193,7 +194,7 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/wake/<task_id> \
   `invalid_metadata`）；设置新时间会清掉上一轮的 `wake_error` /
   `wake_next_try_at`。
 
-## 执行器契约（3.4）
+## 执行器契约与路由（3.4 / 3.5）
 
 `bin/executor-run` 是调用执行器的唯一入口：任务书只从 stdin 读，stdout
 **最后一行**是统一 JSON，调用方只依赖五个退出码。适配器只做参数/输出翻译，
@@ -212,14 +213,16 @@ bin/executor-run --executor claude_code --cwd <dir> --mode write \
 - 退出码：`0` 成功、`1` 其它错误（空任务书、非法/空白 cwd、非零退出、末行
   无法解析）、`2` 需要人（权限拒绝/请求）、`3` 超预算（墙钟超时或执行器
   报告预算中断）、`4` 执行器不可用（未知 executor、registry 缺失/非法、
-  二进制不在 PATH）。argparse 用法错误也输出失败 JSON 并走 `1`，不会占用
+  二进制不在 PATH，或 `mode: in-process` 的 hermes）。argparse 用法错误也
+  输出失败 JSON 并走 `1`，不会占用
   `2`；`--help` 是唯一例外（只打印帮助文本，不输出 JSON）。
 - registry 查找顺序：`--registry <path>` > `EXECUTOR_REGISTRY` 环境变量 >
   仓库根 `executors.json`。
-- `--mode write` 映射 `--permission-mode acceptEdits`，`readonly` 映射
-  `plan`；`--max-usd` 映射 `--max-budget-usd`；`--resume` 透传。
-  `--budget-minutes` 只由 runner 做墙钟超时（默认 30 分钟；显式 `0`/负数/
-  非有限值返回 `1`），不传给执行器。
+- `claude_code` 的 `--mode write` 映射 `--permission-mode acceptEdits`，
+  `readonly` 映射 `plan`；`--max-usd` 映射 `--max-budget-usd`；`--resume`
+  透传。`codex` 的 `write` / `readonly` 映射 `--sandbox workspace-write` /
+  `read-only`；`dsh` 只有 `--resume` 语义。`--budget-minutes` 只由 runner
+  做墙钟超时（默认 30 分钟；显式 `0`/负数/非有限值返回 `1`），不传给执行器。
 - `executors.json` 的 `executors` 里按名字注册 `{"module": "executors.<name>",
   "binary": "...", "mode": "cli"}`；条目也可简写为模块字符串。`binary`
   缺省时由适配器自己选默认值（runner 不猜）；带路径的 `binary` 相对
@@ -237,6 +240,27 @@ bin/executor-run --executor claude_code --cwd <dir> --mode write \
   input/output/cache token 求和 → `cost.tokens`，`files_changed` 固定 `[]`。
   适配器另传 `--disallowedTools "Bash(git commit *)" "Bash(git push *)"`，
   只是尽力而为的护栏，**不是沙箱**，不能当作隔离保证。
+- `dsh` 适配器发 `dsh --profile headless --json`；`--resume` 映射为
+  `--session-id`。headless 没有只读沙箱，`--mode` 不映射。解析 NDJSON：首个
+  `session` 事件的 `sessionId` 作 `session_id`（无事件为 `null`），
+  `status.phase=step_end` 的 `usage.inputTokens+outputTokens` 累加作
+  `cost.tokens`，最后一个 `final` 事件的 `text` 作 summary。没有 JSON 事件行
+  或缺 `final`（退出 0）返回 `1`。
+- `codex` 适配器发 `codex exec --json --sandbox read-only|workspace-write -`，
+  续跑用 `codex exec resume --json <id> -`（resume 不支持重设 `--sandbox`）。
+  `thread.started.thread_id` 作
+  `session_id`，最后一条 `item.completed(item.type=agent_message)` 的
+  `text` 作 summary，`turn.completed.usage` 的 input/output token 求和作
+  `cost.tokens`；无识别事件返回 `1`。
+- `hermes` 注册为 `"mode": "in-process"`：它不是外部 CLI，
+  `bin/executor-run --executor hermes` 在导入模块前就返回 `4`，summary 说明
+  「在 worker 进程内运行」；这是“不能当 CLI 调”，**不是**换执行器的信号。
+  `bin/executors/hermes.py` 只作防线，函数一律拒绝。
+- 预算能力不同：`--max-usd` 只对 `claude_code` 生效；`dsh` / `codex` 不支持
+  金额预算，`--budget-minutes` 仍由 runner 做墙钟超时；两家的 `cost.usd`
+  返回 `null`（`cost.tokens` 正常统计）。`dsh` 没有只读沙箱，
+  `codex exec resume` 不能重设 `--sandbox`，因此 `dsh --mode readonly` 与
+  `codex --mode readonly --resume` 都会被明确拒绝（`1`），不会静默降级。
 - 日志默认 `<cwd>/.runs/<UTC 时间>-<executor>-<pid>.log`，记录命令、cwd、
   超时、退出码、stdout/stderr；任务书不写入日志。创建日志失败时不执行子
   进程，返回 `1` 且 `log_path` 为 `null`；其它前置失败也可能没有日志。
@@ -246,8 +270,41 @@ bin/executor-run --executor claude_code --cwd <dir> --mode write \
   尽力脱敏，不是语义脱敏；执行器改写后的敏感文本仍可能漏出。
 - `SIGTERM` 会转成中断、`SIGINT` 会清理子进程组，并在退出前输出失败 JSON。
   `.runs/` 已在 `.gitignore`。
-- 本故事只落契约与 `claude_code`；`routing.json` 接线与其余适配器属 3.5，
-  不实现 `--stream`。
+- `--stream` 仍不实现；3.5 只加适配器、registry 条目、routing 与会话抽屉的
+  复制入口，不启动续跑进程。
+
+### 执行器路由（3.5）
+
+`routing.json` 是 worker 选择执行器的唯一可校验来源；`bin/route` 读它和
+`executors.json`，按 `--profile` / `--source` / `--type` / `--title` 匹配
+文件顺序的首条规则，stdout 末行输出 JSON：
+
+```bash
+bin/route --profile coder --json
+# {"ok":true,"executor":"claude_code","mode":"cli","rule":0,
+#  "budget":{"max_minutes":30,"max_cost":2},
+#  "skills":["workbench-conventions"],"tell":"…"}
+```
+
+- 每条规则有稳定 `name`；输出带 `rule_index` / `rule_name`。规则按文件顺序
+  首条命中；`when` 支持 `profiles` / `sources` / `types` / `keywords`（也接受
+  单数 `source` / `type`），显式空数组表示“什么都不匹配”。
+- `when.profiles` 缺省时用 `to` 匹配 profile，`to` 返回实际命中的 profile。
+  `mode` 与 `adapter_mode` 是适配器可用性（`cli` / `in-process`），不是
+  `executor-run --mode write|readonly`。
+- coder → `claude_code`，researcher / housekeeper / skeptic → `hermes`；
+  `default.executor=hermes`。规则缺 `executor` 时 coder 回落 `dsh`、其它
+  profile 回落 `hermes`。
+- 卡 / 事件 metadata 的 `executor` 一律忽略，`bin/route` 不提供 `--executor`
+  覆盖，也没有自动 fallback 链；in-process hermes 的 `4` 同样不是回滚信号。
+- `budget.max_minutes` / `budget.max_cost` 只透传，由调用方映射
+  `--budget-minutes` / `--max-usd`；route 不解释金额。`dsh` / `codex` 不支持
+  `--max-usd`。
+- 坏 JSON / 非 UTF-8、无法展开的 `~user`、未知 `when` 键、非有限数值、非法
+  registry `mode` 或未知执行器，全部 fail-closed 返回 `1`。
+- coder 从 `claude_code` 回滚 `dsh` 的步骤与 `kanban_request_review` 字段见
+  外部 `workbench-conventions/references/executor-contract.md`；失败不得
+  伪装成功。
 
 ## 验收 inbox / verify / sweep
 
@@ -361,7 +418,8 @@ curl -s http://127.0.0.1:8787/api/workbench/session/<task_id>
 # 200 {"ok":true,"task_id":"t_…","session":{"id":"…","source":"kanban",
 #      "title":"…","model":"…","started_at":…,"ended_at":…,"message_count":N,
 #      "input_tokens":…,"output_tokens":…,"profile_name":"…"},
-#      "source":"run","run_id":48,"executor_session_id":null,
+#      "source":"run","run_id":48,"executor":"claude_code",
+#      "executor_session_id":"…",
 #      "messages":[{"id":123,"role":"user","content":"…","content_chars":42,
 #                   "content_truncated":false,"compressed":false,
 #                   "tool_calls":[],"tool_name":null,"timestamp":…}, …],
@@ -376,7 +434,10 @@ curl -s http://127.0.0.1:8787/api/workbench/session/<task_id>
 - 会话解析按「最新一轮」优先：run 列表按 `started_at`（同值按 run id）倒序，
   第一个带 `metadata.worker_session_id` 的 run 优先；该会话在 `state.db` 中
   不存在时继续尝试更早的 run，最后回退 `tasks.session_id`（标注为「发起会话」）。
-  `executor_session_id` 只从**实际解析出会话的那个 run** 返回（Epic 3 才续跑）。
+  `executor_session_id` 与 `executor` 都只从**实际解析出会话的那个 run**
+  返回（task 兜底时都为 `null`）；3.5 起抽屉展示执行器名，并复制
+  `--executor <name> --resume <id>` 片段（id 会做 shell 引号处理）。实际续跑
+  仍由调用方发起，本页不启动进程。
 - 只读打开 `~/.hermes/state.db`（`mode=ro` + `PRAGMA query_only` + busy timeout），
   按 `messages.id`（不是 timestamp，时钟会回退）倒序取窗口，再正序返回。
   若表里有对应列则遵守 Hermes 的显示规则：`(active = 1 OR compacted = 1)`、
@@ -575,7 +636,8 @@ python3 workbench-app/tests/test_wake.py -v
 python3 workbench-app/tests/test_verify.py -v
 python3 workbench-app/tests/test_notifications.py -v
 python3 workbench-app/tests/test_session.py -v
-python3 tests/test_executor_run.py -v     # 3.4 执行器契约 + fake claude
+python3 tests/test_executor_run.py -v     # 3.4/3.5 执行器契约 + fake claude/dsh/codex
+python3 tests/test_routing.py -v          # 3.5 routing.json + bin/route
 cd workbench-ui && npm run probe:todo    # headless 三列/拖拽/建卡/验收/回执/位次探针
 cd workbench-ui && npm run probe:verify  # headless 全屏验收探针
 cd workbench-ui && npm run probe:notify  # headless 通知中心探针

@@ -1199,7 +1199,9 @@ export interface SessionTranscript {
   /** run = metadata.worker_session_id；task = tasks.session_id 回退 */
   source: "run" | "task";
   run_id: number | null;
-  /** 只展示；续跑属 Epic 3 */
+  /** 执行器名（来自解析出会话的 run metadata.executor；task 兜底为 null） */
+  executor: string | null;
+  /** 只展示/复制 --resume；实际续跑由调用方用 bin/executor-run 发起 */
   executor_session_id: string | null;
   messages: SessionMessage[];
   /** 实际返回条数（已按显示/压缩规则过滤）。 */
@@ -1287,6 +1289,10 @@ export async function getSession(taskId: string): Promise<SessionTranscript> {
       session,
       source: data.source === "task" ? "task" : "run",
       run_id: nullableNumber(data.run_id),
+      executor:
+        typeof data.executor === "string" && data.executor.trim()
+          ? data.executor.trim()
+          : null,
       executor_session_id:
         typeof data.executor_session_id === "string"
           ? data.executor_session_id

@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""route: resolve the worker executor from ``routing.json``.
+
+``routing.json`` is the only verifiable source of executor choice. This CLI
+never accepts ``--executor`` and never looks at card/event metadata; callers
+pass the profile/source/type/title they already know, and the first matching
+rule (file order) wins.
+
+Usage::
+
+    bin/route --profile coder --json
+    # last stdout line: {"ok":true,"executor":"claude_code","mode":"cli",...}
+
+Rules may carry ``when`` (``profiles`` / ``sources`` / ``types`` /
+``keywords``), ``to`` (profile fallback when ``when.profiles`` is absent),
+``executor``, ``skills``, ``budget`` and ``tell``. A matched rule without an
+``executor`` falls back to the profile default (``coder`` -> ``dsh``, every
+other profile -> ``hermes``). No rule match uses ``default.executor``.
+
+Errors are fail-closed: malformed routing/registry JSON, an unknown executor
+or an unreadable file returns exit code 1 with ``{"ok": false, ...}`` as the
+last stdout line. The executor is also required to exist in ``executors.json``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+
+BIN_DIR = Path(__file__).resolve().parent
+ROOT = BIN_DIR.parent
+DEFAULT_ROUTING = ROOT / "routing.json"
+DEFAULT_REGISTRY = ROOT / "executors.json"
+
+#: Fallback when routing.json has no usable executor for a profile.
+DEFAULT_PROFILE_EXECUTORS = {"coder": "dsh"}
+FALLBACK_EXECUTOR = "hermes"
+
+_WHEN_PLURAL_KEYS = ("profiles", "sources", "types", "keywords")
+_WHEN_SINGULAR_KEYS = ("source", "type")
+_ALLOWED_WHEN_KEYS = set(_WHEN_PLURAL_KEYS) | set(_WHEN_SINGULAR_KEYS)
+
+
+class RouteError(Exception):
+    """Routing cannot be resolved (maps to exit code 1)."""
+
+    def __init__(self, kind: str, detail: str):
+        super().__init__(detail)
+        self.kind = kind
+        self.detail = detail
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """Usage errors still end with one JSON line and exit code 1."""
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{self.prog}: error: {message.strip()}\n")
+        _emit({"ok": False, "error": "invalid_args", "detail": message.strip()})
+        raise SystemExit(1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        prog="route",
+        description=(
+            "Resolve the executor for a worker from routing.json. "
+            "The first matching rule wins; the last stdout line is JSON."
+        ),
+    )
+    parser.add_argument("--profile", help="worker profile, e.g. coder")
+    parser.add_argument("--source", help="task source, e.g. kanban")
+    parser.add_argument("--type", dest="task_type", help="task type, e.g. coding")
+    parser.add_argument("--title", default="", help="task title for keyword rules")
+    parser.add_argument(
+        "--routing",
+        default=None,
+        help=f"routing.json path (default: {DEFAULT_ROUTING})",
+    )
+    parser.add_argument(
+        "--registry",
+        default=None,
+        help=f"executors.json path (default: {DEFAULT_REGISTRY})",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="print only the final JSON line (no human summary)",
+    )
+    return parser
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        routing_path = _resolve_path(args.routing, DEFAULT_ROUTING)
+        registry_path = _resolve_path(args.registry, DEFAULT_REGISTRY)
+        decision = resolve(
+            routing_path,
+            registry_path,
+            profile=args.profile,
+            source=args.source,
+            task_type=args.task_type,
+            title=args.title,
+        )
+    except RouteError as exc:
+        if not args.json:
+            print(f"route error: {exc.kind}: {exc.detail}")
+        _emit({"ok": False, "error": exc.kind, "detail": exc.detail})
+        return 1
+    except (UnicodeError, RuntimeError) as exc:
+        if not args.json:
+            print(f"route error: path_invalid: {exc}")
+        _emit({"ok": False, "error": "path_invalid", "detail": str(exc)})
+        return 1
+
+    if not args.json:
+        rule_label = (
+            decision["rule_name"]
+            if decision["rule_name"] is not None
+            else decision["rule"]
+            if decision["rule"] is not None
+            else "default"
+        )
+        print(
+            "executor={executor} mode={mode} profile={profile} rule={rule}".format(
+                executor=decision["executor"],
+                mode=decision["mode"],
+                profile=decision["profile"] or "-",
+                rule=rule_label,
+            )
+        )
+    _emit(decision)
+    return 0
+
+
+def _resolve_path(raw, default) -> Path:
+    try:
+        return Path(raw or default).expanduser()
+    except (RuntimeError, OSError) as exc:
+        raise RouteError("path_invalid", f"{raw or default}（{exc}）") from exc
+
+
+def resolve(
+    routing_path: Path,
+    registry_path: Path,
+    *,
+    profile=None,
+    source=None,
+    task_type=None,
+    title="",
+):
+    """Return the decision payload or raise :class:`RouteError`."""
+    routing = _load_json(routing_path, "routing")
+    registry = _load_json(registry_path, "registry")
+
+    rules = _validate_rules(routing)
+    default = routing.get("default")
+    if default is None:
+        default = {}
+    if not isinstance(default, dict):
+        raise RouteError("routing_invalid", "routing.json 的 default 必须是对象")
+    if "executor" in default:
+        default_executor = default.get("executor")
+        if not isinstance(default_executor, str) or not default_executor.strip():
+            raise RouteError(
+                "routing_invalid",
+                "routing.json 的 default.executor 必须是非空字符串",
+            )
+
+    profile_name = _clean(profile)
+    source_name = _clean(source)
+    type_name = _clean(task_type)
+    title_text = title if isinstance(title, str) else ""
+
+    matched_rule = None
+    matched_index = None
+    for index, rule in enumerate(rules):
+        if _rule_matches(
+            rule,
+            profile=profile_name,
+            source=source_name,
+            task_type=type_name,
+            title=title_text,
+        ):
+            matched_rule = rule
+            matched_index = index
+            break
+
+    if matched_rule is not None:
+        executor = _clean(matched_rule.get("executor"))
+        if executor is None:
+            executor = _profile_default(profile_name)
+        budget = _validate_budget(matched_rule.get("budget"), matched_index)
+        skills = matched_rule.get("skills")
+        if not isinstance(skills, list):
+            skills = []
+        skills = [item for item in skills if isinstance(item, str)]
+        tell = matched_rule.get("tell")
+        if not isinstance(tell, str):
+            tell = ""
+        when = matched_rule.get("when")
+        when = when if isinstance(when, dict) else {}
+        if "profiles" in when or _clean(matched_rule.get("to")) is not None:
+            # Return the profile that actually matched, not a stale rule `to`.
+            matched_to = profile_name
+        else:
+            matched_to = None
+        rule_name = _clean(matched_rule.get("name"))
+    else:
+        executor = _clean(default.get("executor")) or _profile_default(profile_name)
+        budget = {}
+        skills = []
+        tell = ""
+        matched_to = None
+        rule_name = None
+
+    entries = _registry_entries(registry)
+    if executor not in entries:
+        raise RouteError(
+            "unknown_executor",
+            f"执行器 {executor} 不在 {registry_path} 中",
+        )
+    entry = entries[executor]
+    mode = _entry_mode(entry, executor)
+
+    return {
+        "ok": True,
+        "executor": executor,
+        "mode": mode,
+        "adapter_mode": mode,
+        "profile": profile_name,
+        "to": matched_to,
+        "rule": matched_index,
+        "rule_index": matched_index,
+        "rule_name": rule_name,
+        "budget": budget,
+        "skills": skills,
+        "tell": tell,
+    }
+
+
+def _load_json(path: Path, kind: str) -> dict:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise RouteError(f"{kind}_unavailable", f"{path}（{reason}）") from exc
+    except (UnicodeError, RuntimeError) as exc:
+        raise RouteError(
+            f"{kind}_invalid",
+            f"{path} 无法读取为 UTF-8（{exc}）",
+        ) from exc
+    try:
+        data = json.loads(raw, parse_constant=_reject_constant)
+    except (json.JSONDecodeError, ValueError, UnicodeError, RuntimeError) as exc:
+        raise RouteError(f"{kind}_invalid", f"{path} 不是合法 JSON（{exc}）") from exc
+    if not isinstance(data, dict):
+        raise RouteError(f"{kind}_invalid", f"{path} 必须是 JSON 对象")
+    return data
+
+
+def _reject_constant(value):
+    raise ValueError(f"不支持非有限常量：{value}")
+
+
+def _validate_rules(routing: dict) -> list:
+    rules = routing.get("rules", [])
+    if not isinstance(rules, list):
+        raise RouteError("routing_invalid", "routing.json 的 rules 必须是数组")
+    for index, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise RouteError("routing_invalid", f"rules[{index}] 必须是对象")
+        name = rule.get("name")
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise RouteError(
+                "routing_invalid",
+                f"rules[{index}].name 必须是非空字符串",
+            )
+        when = rule.get("when")
+        if when is not None:
+            if not isinstance(when, dict):
+                raise RouteError("routing_invalid", f"rules[{index}].when 必须是对象")
+            unknown = sorted(set(when) - _ALLOWED_WHEN_KEYS)
+            if unknown:
+                raise RouteError(
+                    "routing_invalid",
+                    f"rules[{index}].when 含未知键：{', '.join(unknown)}",
+                )
+            for key in _WHEN_PLURAL_KEYS:
+                if key not in when:
+                    continue
+                value = when[key]
+                if not isinstance(value, list) or not all(
+                    isinstance(item, str) for item in value
+                ):
+                    raise RouteError(
+                        "routing_invalid",
+                        f"rules[{index}].when.{key} 必须是字符串数组",
+                    )
+            for key in _WHEN_SINGULAR_KEYS:
+                if key not in when:
+                    continue
+                value = when[key]
+                if not isinstance(value, str) or not value.strip():
+                    raise RouteError(
+                        "routing_invalid",
+                        f"rules[{index}].when.{key} 必须是非空字符串",
+                    )
+        executor = rule.get("executor")
+        if executor is not None and not isinstance(executor, str):
+            raise RouteError(
+                "routing_invalid",
+                f"rules[{index}].executor 必须是字符串",
+            )
+        to = rule.get("to")
+        if to is not None and not isinstance(to, str):
+            raise RouteError("routing_invalid", f"rules[{index}].to 必须是字符串")
+        budget = rule.get("budget")
+        if isinstance(budget, dict):
+            _check_finite(budget, f"rules[{index}].budget")
+    return rules
+
+
+def _rule_matches(rule, *, profile, source, task_type, title) -> bool:
+    when = rule.get("when")
+    when = when if isinstance(when, dict) else {}
+
+    # An explicitly empty allowlist matches nothing; only an absent key means
+    # "no constraint".
+    if "profiles" in when:
+        if profile is None or profile not in when["profiles"]:
+            return False
+    else:
+        target = _clean(rule.get("to"))
+        if target is not None and profile != target:
+            return False
+
+    if "sources" in when:
+        if source is None or source not in when["sources"]:
+            return False
+    elif "source" in when:
+        if source != when["source"]:
+            return False
+
+    if "types" in when:
+        if task_type is None or task_type not in when["types"]:
+            return False
+    elif "type" in when:
+        if task_type != when["type"]:
+            return False
+
+    if "keywords" in when:
+        keywords = when["keywords"]
+        haystack = title.casefold()
+        if not any(
+            keyword.casefold() in haystack for keyword in keywords if keyword
+        ):
+            return False
+
+    return True
+
+
+def _entry_mode(entry, executor: str) -> str:
+    if isinstance(entry, str):
+        return "cli"
+    if not isinstance(entry, dict):
+        raise RouteError("registry_invalid", f"执行器 {executor} 的注册项格式错误")
+    if "mode" not in entry:
+        return "cli"
+    mode = entry["mode"]
+    if not isinstance(mode, str) or mode not in ("cli", "in-process"):
+        raise RouteError(
+            "registry_invalid",
+            f"执行器 {executor} 的 mode 必须是 cli 或 in-process（实际 {mode!r}）",
+        )
+    return mode
+
+
+def _validate_budget(budget, index):
+    if not isinstance(budget, dict):
+        return {}
+    _check_finite(budget, f"rules[{index}].budget")
+    return budget
+
+
+def _check_finite(value, label: str) -> None:
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, (int, float)):
+        if isinstance(value, float):
+            try:
+                finite = math.isfinite(value)
+            except (OverflowError, TypeError):
+                finite = False
+            if not finite:
+                raise RouteError("routing_invalid", f"{label} 含非有限数值")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _check_finite(item, label)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise RouteError("routing_invalid", f"{label} 含非字符串键")
+            _check_finite(item, label)
+        return
+    raise RouteError("routing_invalid", f"{label} 含不可序列化的值")
+
+
+def _registry_entries(registry: dict) -> dict:
+    entries = registry.get("executors", registry)
+    if not isinstance(entries, dict):
+        raise RouteError("registry_invalid", "executors.json 的 executors 必须是对象")
+    if "executors" not in registry:
+        entries = {
+            key: value
+            for key, value in entries.items()
+            if key not in {"version", "$schema", "description"}
+        }
+    return entries
+
+
+def _profile_default(profile) -> str:
+    name = _clean(profile)
+    if name is not None and name.casefold() == "coder":
+        return DEFAULT_PROFILE_EXECUTORS["coder"]
+    return FALLBACK_EXECUTOR
+
+
+def _clean(value):
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _emit(payload: dict) -> None:
+    line = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    raw = (line + "\n").encode("utf-8")
+    # Flush any human-readable line first: writing to sys.stdout.buffer bypasses
+    # the text layer's buffer and would otherwise put the JSON above it.
+    try:
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+    try:
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(raw)
+            buffer.flush()
+        else:  # in-process embedding (tests) may replace sys.stdout
+            sys.stdout.write(raw.decode("utf-8"))
+            sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

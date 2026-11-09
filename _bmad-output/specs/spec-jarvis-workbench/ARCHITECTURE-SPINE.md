@@ -23,7 +23,8 @@ spec: SPEC.md
 │         ▼                                    ▲                                │
 │   researcher / housekeeper / coder           │ HTTP (same origin, no CORS)    │
 │         │                                    │                                │
-│         └─ coder → dsh headless              browser / Chrome --app           │
+│         └─ coder → executor-run              browser / Chrome --app           │
+│                    (claude_code / dsh / codex; routing.json)                   │
 │                                                                               │
 │   Hermes dashboard 127.0.0.1:9119 ── native board (reference only)            │
 │   magpie gateway 127.0.0.1:3425 ── model routing (worker source)              │
@@ -43,6 +44,8 @@ spec: SPEC.md
 | `workbench-app/defaults.json` | 全局预算 + `queue.minutes_per_task`（唯一默认源） | 可改 |
 | `workbench-app/workbench.db` | 工作台自有 `task_metadata`（运行期生成，gitignore） | 可改（只经 `server.py`） |
 | `workbench-app/tests/test_dispatch.py` | 派发/闸门/metadata 集成测试（临时库） | 可改 |
+| `bin/executor-run`、`bin/executors/*.py` | 统一执行器 CLI + 适配器（只做翻译，不 import Hermes、不读 `kanban.db`） | 可改 |
+| `bin/route`、`executors.json`、`routing.json` | 执行器注册与路由；`bin/route` 是 worker 唯一可校验的 executor 来源 | 可改 |
 | `workbench-ui/src/` | **前端唯一源码**（React + TS） | **只改这里** |
 | `workbench-ui/src/api/workbench.ts` | `/api/workbench/*` 客户端 + 错误码映射 | 可改 |
 | `workbench-app/web/index.js`、`style.css` | 独立版构建产物 | 产物，禁止手改 |
@@ -185,7 +188,8 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
 - `bucket` 用 metadata 而不是新状态：**不占用 `todo`**；仓库卡停 `scheduled`，
   `triage` / `todo` 会被上游 triage specifier / `recompute_ready` 接走。
 - `contract_defaults` 是**派发瞬间**的生效值：全局默认（`workbench-app/defaults.json`）
-  + 卡上 `contract.budget` 覆盖；routing 层当前不实现（deferred）。
+  + 卡上 `contract.budget` 覆盖；`routing.json`（3.5）只服务 worker 选执行器，
+  不参与派发快照。
 - 快照用 SQLite JSON1 `json_set` 按 key 写入、用 `json_remove` 按 key 补偿；
   **非 ready/running 状态派发会重拍 `contract_defaults`**（新 `write_token`），ready
   重派保留。`write_token` 记录本次写入归属，补偿只在 token 仍匹配时删除，避免误删
@@ -242,8 +246,12 @@ dispatch 自身的 PATCH 因为卡上已有验收文本，走同一检查后放�
    插件宿主没有 `/api/workbench/*`，只渲染看板 tab（就绪列客户端只读）；待办三区与
    全屏验收仅在独立版 8787 提供。
 
-3. **规则与固化物**落 `~/Projects/Jarvis/routing.json`（1.2 不读取，deferred）。
-4. **执行器适配器**：`bin/executor-run` + `executors.json`。适配器只做翻译（统一参数 → 各家 CLI，各家输出 → 统一 JSON），不放业务逻辑、不读 `kanban.db`（见 PLAN §6.3）。
+3. **规则与固化物**落 `~/Projects/Jarvis/routing.json`（3.5 起由 `bin/route`
+   读取；`default.executor=hermes`，coder → `claude_code`，其它 profile → `hermes`）。
+4. **执行器适配器**：`bin/executor-run` + `executors.json`。适配器只做翻译
+   （统一参数 → 各家 CLI，各家输出 → 统一 JSON），不放业务逻辑、不读
+   `kanban.db`（见 PLAN §6.3）。已注册 `claude_code` / `dsh` / `codex`（CLI）
+   与 `hermes`（`mode: in-process`，CLI 调用返回 4）。
 
 ## 7. 三条不改的边界
 
@@ -335,5 +343,7 @@ cd workbench-ui && npm run verify   # build + headless 三区探针 + 验收探�
 | Hermes | v0.22.7（`~/.hermes/hermes-agent`） |
 | magpie | `127.0.0.1:3425`，组 `group/group`（杂活）、`group/main`（长编码） |
 | dsh | 0.2.1-rc.5，`dsh --profile headless --json` |
+| codex | `codex-cli 0.166.0`，`codex exec --json` |
+| claude_code | `claude -p --output-format json` |
 | Python | 3.14（Hermes 运行时） |
 | OS | Ubuntu 26.04.1 LTS，GNOME 50.1 Wayland |

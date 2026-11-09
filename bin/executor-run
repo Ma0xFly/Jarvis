@@ -20,7 +20,8 @@ Exit codes (callers only rely on these five)
     1  other error (bad input, unparsable output, non-zero executor exit)
     2  needs human (permission denial or explicit permission request)
     3  over budget (wall-clock timeout or executor budget interruption)
-    4  executor unavailable (unknown executor, missing registry, missing binary)
+    4  executor unavailable (unknown executor, missing registry, missing binary,
+       or an in-process executor such as hermes)
 
 Adapters live in ``bin/executors/<name>.py`` and implement
 ``build_command(ctx)`` and ``translate_result(stdout, stderr, raw_exit)``.
@@ -420,6 +421,10 @@ def resolve_entry(entries: dict, name: str) -> dict:
     if not entry.get("module"):
         raise RegistryError(f"执行器 {name} 的注册项缺少 module")
     mode = entry.get("mode", "cli")
+    if mode == "in-process":
+        raise RegistryError(
+            f"执行器 {name} 在 worker 进程内运行，不支持 CLI 调用（mode=in-process）"
+        )
     if mode != "cli":
         raise RegistryError(f"执行器 {name} 不支持 CLI 调用（mode={mode}）")
     return entry

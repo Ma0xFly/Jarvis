@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "description": "Worker executor routing. Rules are evaluated in file order; the first match wins. Card/event metadata.executor is ignored. bin/route is the only reader. `to` is the profile fallback when `when.profiles` is absent; explicit empty allowlists match nothing.",
+  "default": {
+    "executor": "hermes"
+  },
+  "rules": [
+    {
+      "name": "coder-claude-code",
+      "executor": "claude_code",
+      "when": {
+        "profiles": ["coder"]
+      },
+      "skills": ["workbench-conventions"],
+      "budget": {
+        "max_minutes": 30,
+        "max_cost": 2
+      },
+      "tell": "编码/重构/测试默认 claude_code；claude 不可用（exit 4）时按 executor-contract 回滚 dsh，失败如实写进 review，不伪装成功。"
+    },
+    {
+      "name": "researcher-hermes",
+      "executor": "hermes",
+      "when": {
+        "profiles": ["researcher"]
+      },
+      "skills": ["workbench-conventions"],
+      "budget": {
+        "max_minutes": 15
+      },
+      "tell": "调研默认在 worker 进程内用 hermes，不起外部 CLI；hermes 的 exit 4 不是可回滚信号。"
+    },
+    {
+      "name": "housekeeper-hermes",
+      "executor": "hermes",
+      "when": {
+        "profiles": ["housekeeper"]
+      },
+      "skills": ["workbench-conventions"],
+      "budget": {
+        "max_minutes": 15
+      },
+      "tell": "杂务/整理默认在 worker 进程内用 hermes，不起外部 CLI；hermes 的 exit 4 不是可回滚信号。"
+    },
+    {
+      "name": "skeptic-hermes",
+      "executor": "hermes",
+      "when": {
+        "profiles": ["skeptic"]
+      },
+      "skills": ["workbench-conventions"],
+      "budget": {
+        "max_minutes": 15
+      },
+      "tell": "交叉复核默认在 worker 进程内用 hermes，不起外部 CLI；hermes 的 exit 4 不是可回滚信号。"
+    }
+  ]
+}
