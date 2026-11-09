@@ -193,6 +193,62 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/wake/<task_id> \
   `invalid_metadata`）；设置新时间会清掉上一轮的 `wake_error` /
   `wake_next_try_at`。
 
+## 执行器契约（3.4）
+
+`bin/executor-run` 是调用执行器的唯一入口：任务书只从 stdin 读，stdout
+**最后一行**是统一 JSON，调用方只依赖五个退出码。适配器只做参数/输出翻译，
+不 import Hermes、不读写 `kanban.db`、不写业务逻辑。
+
+```bash
+cd ~/Projects/Jarvis
+bin/executor-run --executor claude_code --cwd <dir> --mode write \
+  --budget-minutes 30 --max-usd 2 [--resume <session-id>] < task.md
+# stdout 末行：
+# {"ok":true,"executor":"claude_code","session_id":"…","summary":"…",
+#  "files_changed":[],"cost":{"usd":0.42,"tokens":18234},
+#  "log_path":".runs/2026-11-09T08-15-30Z-claude_code-123.log","exit_code":0}
+```
+
+- 退出码：`0` 成功、`1` 其它错误（空任务书、非法/空白 cwd、非零退出、末行
+  无法解析）、`2` 需要人（权限拒绝/请求）、`3` 超预算（墙钟超时或执行器
+  报告预算中断）、`4` 执行器不可用（未知 executor、registry 缺失/非法、
+  二进制不在 PATH）。argparse 用法错误也输出失败 JSON 并走 `1`，不会占用
+  `2`；`--help` 是唯一例外（只打印帮助文本，不输出 JSON）。
+- registry 查找顺序：`--registry <path>` > `EXECUTOR_REGISTRY` 环境变量 >
+  仓库根 `executors.json`。
+- `--mode write` 映射 `--permission-mode acceptEdits`，`readonly` 映射
+  `plan`；`--max-usd` 映射 `--max-budget-usd`；`--resume` 透传。
+  `--budget-minutes` 只由 runner 做墙钟超时（默认 30 分钟；显式 `0`/负数/
+  非有限值返回 `1`），不传给执行器。
+- `executors.json` 的 `executors` 里按名字注册 `{"module": "executors.<name>",
+  "binary": "...", "mode": "cli"}`；条目也可简写为模块字符串。`binary`
+  缺省时由适配器自己选默认值（runner 不猜）；带路径的 `binary` 相对
+  `--cwd` 解析，裸名字走 PATH。`mode` 不是 `cli`（例如 3.5 的
+  `hermes: in-process`）时 CLI 返回 `4`。扁平 registry 会忽略 `version` /
+  `$schema` / `description` 元数据键。新增执行器只需加适配器模块 + registry
+  条目，`bin/executor-run` 不动。
+- 适配器接口固定为 `build_command(ctx)` 与
+  `translate_result(stdout, stderr, raw_exit)`；`ctx` 含 `executor` / `cwd` /
+  `mode` / `resume` / `max_usd` / `budget_minutes` / `binary`。任务书由 runner
+  经 stdin 交给子进程，不进入命令行。
+- `claude_code` 只接受末行 JSON 里 `type: "result"` 的消息；`system/init` 等
+  其它消息按其它错误返回 `1`。`result` → `summary`，`session_id` 原样透传
+  （缺失为 `null`），`total_cost_usd` → `cost.usd`，`usage` 的
+  input/output/cache token 求和 → `cost.tokens`，`files_changed` 固定 `[]`。
+  适配器另传 `--disallowedTools "Bash(git commit *)" "Bash(git push *)"`，
+  只是尽力而为的护栏，**不是沙箱**，不能当作隔离保证。
+- 日志默认 `<cwd>/.runs/<UTC 时间>-<executor>-<pid>.log`，记录命令、cwd、
+  超时、退出码、stdout/stderr；任务书不写入日志。创建日志失败时不执行子
+  进程，返回 `1` 且 `log_path` 为 `null`；其它前置失败也可能没有日志。
+  脱敏边界：完整任务书（无论长短）及其 JSON 转义形式、长度 ≥4 的任务书行
+  及其 JSON 转义形式、以及名字匹配 `KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL`
+  且长度 ≥8 的环境变量值，都会在日志和 summary 中被替换。它是精确匹配的
+  尽力脱敏，不是语义脱敏；执行器改写后的敏感文本仍可能漏出。
+- `SIGTERM` 会转成中断、`SIGINT` 会清理子进程组，并在退出前输出失败 JSON。
+  `.runs/` 已在 `.gitignore`。
+- 本故事只落契约与 `claude_code`；`routing.json` 接线与其余适配器属 3.5，
+  不实现 `--stream`。
+
 ## 验收 inbox / verify / sweep
 
 验收队列只含上游 `review` 卡。所有端点只读写上游公开 REST，不碰 `kanban.db`。
@@ -519,6 +575,7 @@ python3 workbench-app/tests/test_wake.py -v
 python3 workbench-app/tests/test_verify.py -v
 python3 workbench-app/tests/test_notifications.py -v
 python3 workbench-app/tests/test_session.py -v
+python3 tests/test_executor_run.py -v     # 3.4 执行器契约 + fake claude
 cd workbench-ui && npm run probe:todo    # headless 三列/拖拽/建卡/验收/回执/位次探针
 cd workbench-ui && npm run probe:verify  # headless 全屏验收探针
 cd workbench-ui && npm run probe:notify  # headless 通知中心探针

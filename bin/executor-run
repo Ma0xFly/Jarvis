@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""executor-run: one CLI contract for pluggable executors.
+
+Input
+    The task book is read **only** from stdin (Markdown: input / acceptance /
+    forbidden areas). It is never echoed to stdout and never written to the
+    runner log.
+
+Output
+    The last line of stdout is one JSON object::
+
+        {"ok": true, "executor": "claude_code", "session_id": "...",
+         "summary": "...", "files_changed": [],
+         "cost": {"usd": 0.42, "tokens": 18234},
+         "log_path": ".runs/2026-11-09T08-15-30Z-claude_code-123.log",
+         "exit_code": 0}
+
+Exit codes (callers only rely on these five)
+    0  success
+    1  other error (bad input, unparsable output, non-zero executor exit)
+    2  needs human (permission denial or explicit permission request)
+    3  over budget (wall-clock timeout or executor budget interruption)
+    4  executor unavailable (unknown executor, missing registry, missing binary)
+
+Adapters live in ``bin/executors/<name>.py`` and implement
+``build_command(ctx)`` and ``translate_result(stdout, stderr, raw_exit)``.
+The runner owns subprocess execution, the wall-clock timeout, logging and the
+final JSON envelope, so adding an executor never changes this file.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_NEEDS_HUMAN = 2
+EXIT_BUDGET = 3
+EXIT_UNAVAILABLE = 4
+ALLOWED_EXIT_CODES = {EXIT_OK, EXIT_ERROR, EXIT_NEEDS_HUMAN, EXIT_BUDGET, EXIT_UNAVAILABLE}
+
+BIN_DIR = Path(__file__).resolve().parent
+REPO_ROOT = BIN_DIR.parent
+DEFAULT_REGISTRY = REPO_ROOT / "executors.json"
+ENV_REGISTRY = "EXECUTOR_REGISTRY"
+
+#: Minimum length for per-line task-book redaction (the full task book is
+#: always redacted, regardless of length).
+_REDACT_LINE_MIN_CHARS = 4
+#: Minimum length for environment secret values to be scrubbed from output.
+_REDACT_SECRET_MIN_CHARS = 8
+_SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
+
+
+class RegistryError(Exception):
+    """Registry or adapter cannot be used (maps to exit code 4)."""
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """argparse reports usage errors as exit code 1, not argparse's default 2.
+
+    Exit code 2 means "needs human" in this contract; reserving it for that
+    keeps callers from misreading a typo as a permission request.
+    """
+
+    def error(self, message: str) -> None:
+        self.print_usage(sys.stderr)
+        _emit(
+            _failure_payload(
+                "-",
+                EXIT_ERROR,
+                f"参数错误：{message.strip()}",
+            )
+        )
+        self.exit(EXIT_ERROR)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        prog="executor-run",
+        description=(
+            "Run a task book through a registered CLI executor. "
+            "The task book is read from stdin; the last stdout line is JSON."
+        ),
+        epilog=(
+            "exit codes: 0 success, 1 other error, 2 needs human, "
+            "3 over budget/timeout, 4 executor unavailable"
+        ),
+    )
+    parser.add_argument("--executor", required=True, help="registry key, e.g. claude_code")
+    parser.add_argument("--cwd", required=True, help="working directory for the executor")
+    parser.add_argument(
+        "--mode",
+        choices=("write", "readonly"),
+        default="write",
+        help="write -> acceptEdits; readonly -> plan (default: write)",
+    )
+    parser.add_argument(
+        "--budget-minutes",
+        type=float,
+        default=30.0,
+        help="wall-clock timeout in minutes (runner-enforced; default: 30)",
+    )
+    parser.add_argument(
+        "--max-usd",
+        type=float,
+        default=None,
+        help="maximum USD spend forwarded to the executor",
+    )
+    parser.add_argument("--resume", default=None, help="resume an existing executor session id")
+    parser.add_argument(
+        "--registry",
+        default=None,
+        help=f"executors.json path (default: {DEFAULT_REGISTRY})",
+    )
+    return parser
+
+
+def main(argv=None) -> int:
+    _install_signal_handlers()
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _run(args)
+    except KeyboardInterrupt:
+        payload = _failure_payload(
+            args.executor,
+            EXIT_ERROR,
+            "执行被中断（SIGINT/SIGTERM）",
+            task_book=getattr(args, "_task_book", ""),
+        )
+        _emit(payload)
+        return EXIT_ERROR
+    except Exception as exc:  # noqa: BLE001 - contract: never leak a traceback to stdout
+        payload = _failure_payload(
+            args.executor,
+            EXIT_ERROR,
+            f"内部错误：{type(exc).__name__}: {exc}",
+            task_book=getattr(args, "_task_book", ""),
+        )
+        _emit(payload)
+        return EXIT_ERROR
+
+
+def _install_signal_handlers() -> None:
+    """Turn SIGTERM into KeyboardInterrupt so cleanup still emits JSON."""
+
+    def _interrupt(_signum, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _interrupt)
+    except (ValueError, OSError):
+        # Not the main thread, or the platform does not support it.
+        pass
+
+
+def _run(args) -> int:
+    executor = args.executor
+
+    try:
+        budget_minutes = _positive_number(args.budget_minutes, "--budget-minutes")
+        max_usd = _positive_number(args.max_usd, "--max-usd")
+    except ValueError as exc:
+        return _finish(_failure_payload(executor, EXIT_ERROR, str(exc)), EXIT_ERROR)
+
+    registry_path = Path(
+        args.registry or os.environ.get(ENV_REGISTRY) or str(DEFAULT_REGISTRY)
+    ).expanduser()
+
+    try:
+        entries = load_registry(registry_path)
+        entry = resolve_entry(entries, executor)
+        adapter = load_adapter(entry)
+    except RegistryError as exc:
+        return _finish(_failure_payload(executor, EXIT_UNAVAILABLE, str(exc)), EXIT_UNAVAILABLE)
+
+    if not args.cwd.strip():
+        return _finish(_failure_payload(executor, EXIT_ERROR, "cwd 不能为空"), EXIT_ERROR)
+
+    cwd = _resolve_cwd(args.cwd)
+    if cwd is None:
+        return _finish(
+            _failure_payload(executor, EXIT_ERROR, f"cwd 不可用：{args.cwd}（不存在或不是目录）"),
+            EXIT_ERROR,
+        )
+
+    try:
+        prompt = sys.stdin.read()
+    except (OSError, UnicodeError) as exc:
+        return _finish(
+            _failure_payload(executor, EXIT_ERROR, f"无法读取任务书：{exc}"),
+            EXIT_ERROR,
+        )
+    if not prompt.strip():
+        return _finish(_failure_payload(executor, EXIT_ERROR, "任务书为空：stdin 没有内容"), EXIT_ERROR)
+    args._task_book = prompt
+
+    ctx = {
+        "executor": executor,
+        "cwd": str(cwd),
+        "mode": args.mode,
+        "resume": args.resume or None,
+        "max_usd": max_usd,
+        "budget_minutes": budget_minutes,
+        # Each adapter owns its default binary; the runner must not guess one.
+        "binary": entry.get("binary"),
+    }
+
+    try:
+        command = adapter.build_command(ctx)
+    except Exception as exc:  # noqa: BLE001 - adapter is third-party code
+        return _finish(
+            _failure_payload(
+                executor,
+                EXIT_ERROR,
+                f"适配器构建命令失败：{exc}",
+                task_book=prompt,
+            ),
+            EXIT_ERROR,
+        )
+    if (
+        not isinstance(command, (list, tuple))
+        or not command
+        or not all(isinstance(part, str) for part in command)
+    ):
+        return _finish(
+            _failure_payload(
+                executor,
+                EXIT_ERROR,
+                "适配器返回了非法命令",
+                task_book=prompt,
+            ),
+            EXIT_ERROR,
+        )
+    command = list(command)
+    command[0] = _resolve_binary(command[0], cwd)
+
+    if shutil.which(command[0]) is None:
+        return _finish(
+            _failure_payload(
+                executor,
+                EXIT_UNAVAILABLE,
+                f"执行器不可用：找不到 {command[0]}",
+                task_book=prompt,
+            ),
+            EXIT_UNAVAILABLE,
+        )
+
+    log_path = _new_log_path(cwd, executor)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = log_path.open("w", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return _finish(
+            _failure_payload(
+                executor,
+                EXIT_ERROR,
+                f"无法创建运行日志：{exc}",
+                task_book=prompt,
+            ),
+            EXIT_ERROR,
+        )
+
+    relative_log = os.path.relpath(log_path, cwd)
+    timeout_seconds = budget_minutes * 60 if budget_minutes is not None else None
+    payload = None
+    process = None
+
+    try:
+        _write_log_header(log, command, cwd, timeout_seconds)
+
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(cwd),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=(os.name != "nt"),
+            )
+        except FileNotFoundError:
+            _write_log_tail(log, None, "", "", timed_out=False, task_book=prompt)
+            payload = _failure_payload(
+                executor,
+                EXIT_UNAVAILABLE,
+                f"执行器不可用：找不到 {command[0]}",
+                log_path=relative_log,
+                task_book=prompt,
+            )
+        except OSError as exc:
+            _write_log_tail(log, None, "", str(exc), timed_out=False, task_book=prompt)
+            payload = _failure_payload(
+                executor,
+                EXIT_UNAVAILABLE,
+                f"无法启动执行器：{exc}",
+                log_path=relative_log,
+                task_book=prompt,
+            )
+        else:
+            timed_out = False
+            try:
+                stdout, stderr = process.communicate(prompt, timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", ""
+            raw_exit = process.returncode
+
+            _write_log_tail(
+                log,
+                raw_exit,
+                stdout or "",
+                stderr or "",
+                timed_out=timed_out,
+                task_book=prompt,
+            )
+
+            if timed_out:
+                minutes = f"{budget_minutes:g}" if budget_minutes is not None else "?"
+                payload = _failure_payload(
+                    executor,
+                    EXIT_BUDGET,
+                    f"执行器超时（预算 {minutes} 分钟），运行已中断",
+                    log_path=relative_log,
+                    task_book=prompt,
+                )
+            else:
+                try:
+                    translated = adapter.translate_result(stdout or "", stderr or "", raw_exit)
+                except Exception as exc:  # noqa: BLE001 - adapter is third-party code
+                    translated = {
+                        "ok": False,
+                        "session_id": None,
+                        "summary": f"适配器解析结果失败：{exc}",
+                        "files_changed": [],
+                        "cost": {"usd": None, "tokens": 0},
+                        "exit_code": EXIT_ERROR,
+                    }
+                payload = _normalise_payload(executor, translated, relative_log, prompt)
+    finally:
+        # On SIGINT/SIGTERM (or any unexpected exception) the detached child
+        # must not keep running after the runner exits.
+        if process is not None and process.poll() is None:
+            _terminate(process)
+        try:
+            log.close()
+        except OSError:
+            pass
+
+    if payload is None:  # defensive: every branch above should set it
+        payload = _failure_payload(
+            executor,
+            EXIT_ERROR,
+            "执行器未返回结果",
+            log_path=relative_log,
+            task_book=prompt,
+        )
+
+    return _finish(payload, payload["exit_code"])
+
+
+def load_registry(path: Path) -> dict:
+    """Load ``executors.json`` and return the name -> entry mapping."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        reason = exc.strerror or str(exc)
+        raise RegistryError(f"执行器注册表不可用：{path}（{reason}）") from exc
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise RegistryError(f"执行器注册表不是合法 JSON：{path}（{exc}）") from exc
+
+    if not isinstance(data, dict):
+        raise RegistryError(f"执行器注册表格式错误：{path}")
+
+    entries = data.get("executors", data)
+    if not isinstance(entries, dict):
+        raise RegistryError(f"执行器注册表格式错误：{path}")
+
+    if "executors" not in data:
+        entries = {
+            key: value
+            for key, value in entries.items()
+            if key not in {"version", "$schema", "description"}
+        }
+    return entries
+
+
+def resolve_entry(entries: dict, name: str) -> dict:
+    """Resolve one registry entry, accepting string or object forms."""
+    if name not in entries:
+        raise RegistryError(f"未知执行器：{name}")
+
+    entry = entries[name]
+    if isinstance(entry, str):
+        entry = {"module": entry, "mode": "cli"}
+    if not isinstance(entry, dict):
+        raise RegistryError(f"执行器 {name} 的注册项格式错误")
+    if not entry.get("module"):
+        raise RegistryError(f"执行器 {name} 的注册项缺少 module")
+    mode = entry.get("mode", "cli")
+    if mode != "cli":
+        raise RegistryError(f"执行器 {name} 不支持 CLI 调用（mode={mode}）")
+    return entry
+
+
+def load_adapter(entry: dict):
+    """Import the adapter module and verify its fixed interface."""
+    module_name = str(entry["module"])
+    if str(BIN_DIR) not in sys.path:
+        sys.path.insert(0, str(BIN_DIR))
+    try:
+        module = importlib.import_module(module_name)
+    except Exception as exc:  # noqa: BLE001 - any import failure means unavailable
+        raise RegistryError(f"执行器模块加载失败：{module_name}（{exc}）") from exc
+
+    for attribute in ("build_command", "translate_result"):
+        if not callable(getattr(module, attribute, None)):
+            raise RegistryError(f"执行器模块 {module_name} 缺少 {attribute}()")
+    return module
+
+
+def _resolve_cwd(raw: str):
+    try:
+        path = Path(raw).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return path if path.is_dir() else None
+
+
+def _resolve_binary(binary: str, cwd: Path) -> str:
+    """Resolve relative binary paths against ``--cwd``.
+
+    Bare names (``claude``) stay untouched so ``shutil.which`` can search
+    ``PATH``; explicit paths (``./bin/tool``) are anchored at the run cwd.
+    """
+    expanded = os.path.expanduser(str(binary))
+    if os.path.isabs(expanded):
+        return expanded
+    has_separator = os.sep in expanded or (
+        os.altsep is not None and os.altsep in expanded
+    )
+    if has_separator:
+        return str((cwd / expanded).resolve())
+    return expanded
+
+
+def _positive_number(value, flag: str):
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{flag} 必须是数字") from exc
+    try:
+        finite = math.isfinite(number)
+    except (OverflowError, TypeError) as exc:
+        raise ValueError(f"{flag} 必须是有限正数") from exc
+    if not finite or number <= 0:
+        raise ValueError(f"{flag} 必须是有限正数")
+    return number
+
+
+def _finite_float(value):
+    """Return a finite float, or ``None`` for bool/overflow/garbage."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    try:
+        return number if math.isfinite(number) else None
+    except (OverflowError, TypeError):
+        return None
+
+
+def _new_log_path(cwd: Path, executor: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%SZ")
+    safe_executor = re.sub(r"[^A-Za-z0-9_.-]+", "_", executor) or "executor"
+    return cwd / ".runs" / f"{stamp}-{safe_executor}-{os.getpid()}.log"
+
+
+def _write_log_header(log, command, cwd: Path, timeout_seconds) -> None:
+    log.write(f"command: {shlex.join(command)}\n")
+    log.write(f"cwd: {cwd}\n")
+    log.write(f"timeout_seconds: {timeout_seconds if timeout_seconds is not None else 'none'}\n")
+    log.write(f"started_at: {_utc_stamp()}\n")
+    log.flush()
+
+
+def _write_log_tail(
+    log,
+    raw_exit,
+    stdout: str,
+    stderr: str,
+    *,
+    timed_out: bool,
+    task_book: str,
+) -> None:
+    log.write(f"timed_out: {'true' if timed_out else 'false'}\n")
+    log.write(f"exit_code: {raw_exit if raw_exit is not None else 'none'}\n")
+    log.write("--- stdout ---\n")
+    log.write(_redact(stdout, task_book))
+    if stdout and not stdout.endswith("\n"):
+        log.write("\n")
+    log.write("--- stderr ---\n")
+    log.write(_redact(stderr, task_book))
+    if stderr and not stderr.endswith("\n"):
+        log.write("\n")
+    log.write(f"finished_at: {_utc_stamp()}\n")
+    log.flush()
+
+
+def _redact(text: str, task_book: str) -> str:
+    """Scrub task-book and secret echoes from logs / summaries.
+
+    The runner never writes stdin itself; this is defense against executors
+    that echo it back. The full task book is always redacted (regardless of
+    length), plus its raw and JSON-escaped forms, and per-line forms of at
+    least four characters. Values of environment variables whose names look
+    like credentials are also redacted. This is exact-match scrubbing, not
+    semantic redaction.
+    """
+    if not text:
+        return text
+    text = _replace_needles(
+        text,
+        _task_book_needles(task_book),
+        "[task book redacted]",
+    )
+    text = _replace_needles(text, _secret_needles(), "[redacted]")
+    return text
+
+
+def _replace_needles(text: str, needles, marker: str) -> str:
+    # Longest first so a full-task replacement wins over a line fragment.
+    for needle in sorted(set(needles), key=len, reverse=True):
+        if needle:
+            text = text.replace(needle, marker)
+    return text
+
+
+def _json_escaped_forms(value: str):
+    forms = []
+    for ensure_ascii in (False, True):
+        try:
+            escaped = json.dumps(value, ensure_ascii=ensure_ascii)[1:-1]
+        except (TypeError, ValueError):
+            continue
+        if escaped and escaped != value:
+            forms.append(escaped)
+    return forms
+
+
+def _task_book_needles(task_book: str):
+    if not task_book:
+        return []
+    needles = []
+    for candidate in {task_book, task_book.strip()}:
+        if not candidate:
+            continue
+        needles.append(candidate)
+        needles.extend(_json_escaped_forms(candidate))
+    for line in task_book.splitlines():
+        line = line.strip()
+        if len(line) < _REDACT_LINE_MIN_CHARS:
+            continue
+        needles.append(line)
+        needles.extend(_json_escaped_forms(line))
+    return needles
+
+
+def _secret_needles():
+    needles = []
+    for name, value in os.environ.items():
+        if not _SECRET_ENV_RE.search(name):
+            continue
+        if not isinstance(value, str) or len(value) < _REDACT_SECRET_MIN_CHARS:
+            continue
+        needles.append(value)
+        needles.extend(_json_escaped_forms(value))
+    return needles
+
+
+def _normalise_payload(executor: str, translated, relative_log: str, task_book: str) -> dict:
+    if not isinstance(translated, dict):
+        return _failure_payload(
+            executor,
+            EXIT_ERROR,
+            "适配器返回了非对象结果",
+            log_path=relative_log,
+            task_book=task_book,
+        )
+
+    exit_code = translated.get("exit_code", EXIT_ERROR)
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = EXIT_ERROR
+    if exit_code not in ALLOWED_EXIT_CODES:
+        exit_code = EXIT_ERROR
+
+    ok = translated.get("ok") is True and exit_code == EXIT_OK
+    if not ok and exit_code == EXIT_OK:
+        exit_code = EXIT_ERROR
+
+    session_id = translated.get("session_id")
+    if session_id is not None and not isinstance(session_id, str):
+        session_id = str(session_id)
+    if not session_id:
+        session_id = None
+
+    summary = translated.get("summary")
+    summary = "" if summary is None else str(summary)
+    if not summary:
+        summary = {
+            EXIT_OK: "执行完成",
+            EXIT_NEEDS_HUMAN: "需要人工处理",
+            EXIT_BUDGET: "执行器预算中断",
+            EXIT_UNAVAILABLE: "执行器不可用",
+        }.get(exit_code, "执行失败")
+    summary = _redact(summary, task_book)
+
+    files_changed = translated.get("files_changed")
+    if not isinstance(files_changed, list):
+        files_changed = []
+    files_changed = [item for item in files_changed if isinstance(item, str)]
+
+    cost = translated.get("cost")
+    if not isinstance(cost, dict):
+        cost = {"usd": None, "tokens": 0}
+    else:
+        usd = _finite_float(cost.get("usd"))
+
+        tokens = cost.get("tokens")
+        if isinstance(tokens, bool) or not isinstance(tokens, int):
+            try:
+                tokens = int(tokens)  # type: ignore[arg-type]
+            except (TypeError, ValueError, OverflowError):
+                tokens = 0
+        try:
+            tokens_ok = math.isfinite(tokens)
+        except (OverflowError, TypeError):
+            tokens_ok = False
+        if not tokens_ok or tokens < 0:
+            tokens = 0
+        cost = {"usd": usd, "tokens": tokens}
+
+    return {
+        "ok": ok,
+        "executor": executor,
+        "session_id": session_id,
+        "summary": summary,
+        "files_changed": files_changed,
+        "cost": cost,
+        "log_path": relative_log,
+        "exit_code": exit_code,
+    }
+
+
+def _failure_payload(
+    executor: str,
+    exit_code: int,
+    summary: str,
+    *,
+    log_path=None,
+    session_id=None,
+    task_book: str = "",
+) -> dict:
+    if exit_code not in ALLOWED_EXIT_CODES:
+        exit_code = EXIT_ERROR
+    return {
+        "ok": False,
+        "executor": executor,
+        "session_id": session_id,
+        "summary": _redact(str(summary), task_book),
+        "files_changed": [],
+        "cost": {"usd": None, "tokens": 0},
+        "log_path": log_path,
+        "exit_code": exit_code,
+    }
+
+
+def _finish(payload: dict, exit_code: int) -> int:
+    _emit(payload)
+    return exit_code
+
+
+def _emit(payload: dict) -> None:
+    line = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    raw = (line + "\n").encode("utf-8")
+    try:
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(raw)
+            buffer.flush()
+        else:  # in-process embedding (tests) may replace sys.stdout
+            sys.stdout.write(raw.decode("utf-8"))
+            sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
+def _terminate(process) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name != "nt":
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        else:  # pragma: no cover - the workbench runs on Linux
+            process.kill()
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

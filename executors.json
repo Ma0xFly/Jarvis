@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "executors": {
+    "claude_code": {
+      "module": "executors.claude_code",
+      "binary": "claude",
+      "mode": "cli",
+      "description": "Claude Code CLI (claude -p --output-format json)"
+    }
+  }
+}

@@ -122,3 +122,10 @@
 - source_spec: `_bmad-output/implementation-artifacts/spec-3-3-wake.md`
   summary: 外部写入的 malformed `wake_at` 被 due query 静默跳过，无日志/清理。
   evidence: `due_wake_tasks` 只选 integer；`_has_wake_at` 只用于清理；3.3 review R22。
+
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-4-executor-contract.md`
+  summary: `claude_code` 的 summary 未限长，可能把多 KB 的最终 result 塞进单行 JSON。
+  evidence: `translate_result` 原样使用 `result`；3.4 review R17，当前无长度契约，留到 3.5 或后续统一截断策略。
+- source_spec: `_bmad-output/implementation-artifacts/spec-3-4-executor-contract.md`
+  summary: executor-run 的 stdout/stderr 与日志无大小上限，且 `.runs/` 默认落在目标仓库，可能产生未跟踪日志。
+  evidence: `communicate` 全量缓冲并整段写日志；`.gitignore` 只覆盖 Jarvis 仓库，目标仓库需自行忽略；3.4 review R19。
