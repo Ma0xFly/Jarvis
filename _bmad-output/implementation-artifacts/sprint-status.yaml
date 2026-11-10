@@ -29,7 +29,7 @@
 # - Dev moves story to 'review', then runs code-review (fresh context, different LLM recommended)
 # - Retrospective appends its action items to action_items; the status view surfaces open ones
 generated: 11-05-2026 13:41
-last_updated: 11-09-2026 23:44
+last_updated: 11-10-2026 22:55
 project: Jarvis
 project_key: NOKEY
 tracking_system: file-system
@@ -55,7 +55,7 @@ development_status:
   3-3-定时唤醒: review
   3-4-执行器契约与-claude_code-适配器: review
   3-5-其余适配器与路由切换: review
-  epic-3-retrospective: optional
+  epic-3-retrospective: done
 action_items:
   - id: "epic-2-retro-item-1-create-parking"
     epic: 2
@@ -154,3 +154,88 @@ action_items:
     owner: "PM + architect"
     status: open
     ref: "_bmad-output/implementation-artifacts/epic-2-retro-2026-11-06.md"
+  - id: "epic-3-retro-item-16-worker-契约全覆盖-researcher-housekeeper-skep"
+    epic: 3
+    action: "worker 契约全覆盖：researcher/housekeeper/skeptic 改用 kanban_request_review
+      + self_report/solidified/executor_session_id，安装/对齐 profile skill，刷新快照，契约测试覆盖所有
+      profile 且缺失时 fail。"
+    owner: "dev + PM"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-17-执行器回滚与能力-dsh-安装-启动失败映射-4-dsh-codex-2-3-与"
+    epic: 3
+    action: "执行器回滚与能力：dsh 安装/启动失败映射 4，dsh/codex 2/3 与 commit guard，max_usd 能力，registry
+      错误与信号清理，真实只读 smoke。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-18-review-证据完整性-expected_review_at-worker-v"
+    epic: 3
+    action: "review 证据完整性：expected_review_at、worker verified 与 overlay 区分、self_report
+      封顶、metadata NaN 清洗、无 solidified 禁用收、真实 request_review wrapper 测试。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-19-route-fail-open-规则级未知键-空白-executor-to-bu"
+    epic: 3
+    action: "route fail-open：规则级未知键、空白 executor/to、budget 类型、registry module 校验与测试。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-20-唤醒回归与超时-patch-tasks-清-wake-失败键-_wake_to_"
+    epic: 3
+    action: "唤醒回归与超时：PATCH tasks 清 wake 失败键、_wake_to_todo 错落点、due_wake_tasks 坏 JSON、wake
+      端点守卫、UI 超时、wake_error 枚举。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-21-verify-标记已验证探针-跨-in-flight-5s-轮询验证-withm"
+    epic: 3
+    action: "verify 标记已验证探针：跨 in-flight 5s 轮询验证 withMarkedOverlay。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-22-预算权威对账-dispatch-快照-vs-routing-budget-记录"
+    epic: 3
+    action: "预算权威对账：dispatch 快照 vs routing budget，记录 routed budget，补分歧测试。"
+    owner: "dev + PM"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-23-会话执行器展示-executor-为-null-的续跑占位-known-set"
+    epic: 3
+    action: "会话执行器展示：executor 为 null 的续跑占位、known set 校验、ARCHITECTURE 来源修正。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-24-固化条目验收后可见-done-详情或只读索引"
+    epic: 3
+    action: "固化条目验收后可见：Done 详情或只读索引。"
+    owner: "PM + dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-25-结构债-拆分-server-py-抽-adapter-registry-help"
+    epic: 3
+    action: "结构债：拆分 server.py、抽 adapter/registry helper、summary/日志封顶、关闭 Epic 2 遗留
+      UI 项、清理 tracked .bak。"
+    owner: "dev"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-26-文档对账-epics-md-plan-architecture-spine-的"
+    epic: 3
+    action: "文档对账：epics.md/PLAN/ARCHITECTURE-SPINE 的 scope、smoke、routing 入口、成本、executor
+      来源。"
+    owner: "PM"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-27-3-1-3-5-人工验收-walkthrough-后改-done-或明确接受-r"
+    epic: 3
+    action: "3.1–3.5 人工验收：walkthrough 后改 done 或明确接受 review；机器裁决 rejected。"
+    owner: "user + PM"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
+  - id: "epic-3-retro-item-28-epic-2-action-状态-确认后把-1-2-3-4-6-12-标-don"
+    epic: 3
+    action: "Epic 2 action 状态：确认后把 1/2/3/4/6/12 标 done，其余保持 open/in-progress。"
+    owner: "PM"
+    status: open
+    ref: "/home/myx/Projects/Jarvis/_bmad-output/implementation-artifacts/epic-3-retro-2026-11-10.md"
