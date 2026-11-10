@@ -214,6 +214,9 @@ export default function VerifyPage({
   const [openedEmpty, setOpenedEmpty] = useState(false);
   const openedDetermined = useRef(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  // Bumped when a stale-review 409 forces a refresh of the current card's
+  // upstream detail (queue-only refresh would leave old run data on screen).
+  const [detailNonce, setDetailNonce] = useState(0);
   const reasonRef = useRef<HTMLTextAreaElement | null>(null);
   const loadSeq = useRef(0);
   // 本会话已动作过的卡：跳过仍在上游 review，轮询不能把它重新加回队列。
@@ -226,6 +229,10 @@ export default function VerifyPage({
 
   const current = queue.length > 0 ? queue[0] : null;
   const currentId = current?.id ?? null;
+  const solidified = current?.solidified ?? [];
+  // The server rejects accept without a valid registration; mirror that so
+  // "收"/A never fires a request that is guaranteed to 400.
+  const canAccept = solidified.length > 0;
 
   const withMarkedOverlay = useCallback(
     (task: InboxTask, receivedAt: number): QueueItem => {
@@ -393,7 +400,7 @@ export default function VerifyPage({
     return () => {
       alive = false;
     };
-  }, [currentId]);
+  }, [currentId, detailNonce]);
 
   useEffect(() => {
     if (reasonOpen) reasonRef.current?.focus();
@@ -410,10 +417,23 @@ export default function VerifyPage({
   const runAction = useCallback(
     async (action: VerifyAction, reasonText?: string) => {
       if (!current || submitting) return;
+      if (action === "accept" && !canAccept) {
+        setActionError(
+          "没有可用的固化记录（未登记或格式不合法），不能收；可打回补齐，或等 48h 自动收",
+        );
+        return;
+      }
       setSubmitting(true);
       setActionError("");
       try {
-        await verifyTask(current.id, action, reasonText);
+        // Let the server pin this action to the round whose evidence is on
+        // screen; a newer round then 409s as ``stale_review``.
+        await verifyTask(
+          current.id,
+          action,
+          reasonText,
+          current.review_requested_at,
+        );
         setStats((prev) => ({
           accepted: prev.accepted + (action === "accept" ? 1 : 0),
           rejected: prev.rejected + (action === "reject" ? 1 : 0),
@@ -432,6 +452,15 @@ export default function VerifyPage({
           setActionError("这张卡已不在验收队列，已移除");
           setQueue((prev) => prev.filter((task) => task.id !== current.id));
           onChanged?.();
+        } else if (code === "stale_review") {
+          // A new review round landed between polls. Never act on the old
+          // round's self-report/solidified: refresh queue + detail and let the
+          // human re-review the new evidence.
+          await syncQueue();
+          setDetailNonce((value) => value + 1);
+          setNotice(
+            "这张卡已进入新一轮验收，队列已刷新；请重新核对自述与固化记录",
+          );
         } else if (code === "reason_required") {
           setReasonOpen(true);
           setActionError("不收必须写理由");
@@ -449,7 +478,7 @@ export default function VerifyPage({
         setSubmitting(false);
       }
     },
-    [current, submitting, onChanged],
+    [current, submitting, canAccept, syncQueue, onChanged],
   );
 
   const markVerified = useCallback(
@@ -585,7 +614,6 @@ export default function VerifyPage({
   const input = current?.metadata?.contract?.input?.trim() || "";
   const reviewAt = current?.review_requested_at ?? null;
   const selfReport = current?.self_report ?? null;
-  const solidified = current?.solidified ?? [];
   const verifiedPaths = useMemo(
     () =>
       new Set(
@@ -801,53 +829,87 @@ export default function VerifyPage({
               ) : (
                 <p className="wb-verify-note warn">自述缺失</p>
               )}
+              {current.self_report_truncated ? (
+                <p className="wb-verify-note">
+                  自述过长，服务端已截断显示（字段末尾有截断标记）。
+                </p>
+              ) : null}
             </div>
 
             <div className="wb-verify-section wb-verify-solidified">
               <h2>可复用件</h2>
               {solidified.length > 0 ? (
-                <ul className="wb-verify-solidified-list">
-                  {solidified.map((entry, index) => {
-                    const verified =
-                      entry.status === "verified" || verifiedPaths.has(entry.path);
-                    const marking = markingPath === entry.path;
-                    return (
-                      <li
-                        className="wb-verify-solidified-item"
-                        key={`${entry.type}:${entry.path}:${index}`}
-                      >
-                        <span
-                          className="wb-verify-solidified-type"
-                          data-type={entry.type}
-                          title={entry.type}
+                <>
+                  <ul className="wb-verify-solidified-list">
+                    {solidified.map((entry, index) => {
+                      // Provenance matters: worker-declared ``verified`` is
+                      // self-certification, not a human/workbench judgement.
+                      const overlayVerified = verifiedPaths.has(entry.path);
+                      const workerVerified = entry.status === "verified";
+                      const provenance = overlayVerified
+                        ? "workbench"
+                        : workerVerified
+                          ? "worker"
+                          : "none";
+                      const marking = markingPath === entry.path;
+                      return (
+                        <li
+                          className="wb-verify-solidified-item"
+                          key={`${entry.type}:${entry.path}:${index}`}
                         >
-                          {SOLIDIFIED_TYPE_LABEL[entry.type]}
-                        </span>
-                        <span className="wb-verify-solidified-path" title={entry.path}>
-                          {entry.path}
-                        </span>
-                        <span
-                          className={
-                            "wb-verify-solidified-status " +
-                            (verified ? "verified" : "pending")
-                          }
-                        >
-                          {verified ? "已验证" : "待验证"}
-                        </span>
-                        {verified ? null : (
-                          <button
-                            className="wb-btn wb-verify-solidified-verify"
-                            type="button"
-                            disabled={markingPath !== null}
-                            onClick={() => void markVerified(entry.path)}
+                          <span
+                            className="wb-verify-solidified-type"
+                            data-type={entry.type}
+                            title={entry.type}
                           >
-                            {marking ? "标记中…" : "标记已验证"}
-                          </button>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
+                            {SOLIDIFIED_TYPE_LABEL[entry.type]}
+                          </span>
+                          <span className="wb-verify-solidified-path" title={entry.path}>
+                            {entry.path}
+                          </span>
+                          <span
+                            className={
+                              "wb-verify-solidified-status " +
+                              (overlayVerified ? "verified" : "pending")
+                            }
+                            data-provenance={provenance}
+                            title={
+                              overlayVerified
+                                ? "工作台验收人手动标记（workbench overlay），不是 worker 自报"
+                                : workerVerified
+                                  ? "worker 在最新 run metadata 中自报，未经工作台人工验证"
+                                  : "尚未验证"
+                            }
+                          >
+                            {overlayVerified
+                              ? "工作台已验证"
+                              : workerVerified
+                                ? "worker 自报已验证"
+                                : "待验证"}
+                          </span>
+                          {overlayVerified || workerVerified ? null : (
+                            <button
+                              className="wb-btn wb-verify-solidified-verify"
+                              type="button"
+                              disabled={markingPath !== null}
+                              onClick={() => void markVerified(entry.path)}
+                            >
+                              {marking ? "标记中…" : "标记已验证"}
+                            </button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  {solidified.some(
+                    (entry) =>
+                      entry.status === "verified" && !verifiedPaths.has(entry.path),
+                  ) ? (
+                    <p className="wb-verify-note">
+                      「worker 自报已验证」来自 worker 的 run metadata，不等于工作台人工验证。
+                    </p>
+                  ) : null}
+                </>
               ) : (
                 <p className="wb-verify-note warn">
                   没有可用的固化记录（未登记或格式不合法），不能收；可打回补齐，或等 48h 自动收。
@@ -973,7 +1035,10 @@ export default function VerifyPage({
               <button
                 className="wb-verify-key accept"
                 type="button"
-                disabled={submitting}
+                disabled={submitting || !canAccept}
+                title={
+                  canAccept ? undefined : "没有可用的固化记录，不能收"
+                }
                 onClick={() => void runAction("accept")}
               >
                 <kbd>A</kbd> 收

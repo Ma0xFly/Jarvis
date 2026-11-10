@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -252,6 +253,18 @@ elif mode == "nonzero_with_final":
 elif mode == "nonzero":
     print("boom", file=sys.stderr)
     sys.exit(7)
+elif mode == "startup_failure":
+    print(
+        "Error: Cannot find module '@deepseek-ai/dsh/lib/bin.js'",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+elif mode == "budget":
+    print("Exceeded USD budget (2)", file=sys.stderr)
+    sys.exit(1)
+elif mode == "permission":
+    print("permission denied: Bash", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unknown fake dsh mode", file=sys.stderr)
     sys.exit(9)
@@ -329,6 +342,18 @@ elif mode == "nonzero_with_agent":
 elif mode == "nonzero":
     print("boom", file=sys.stderr)
     sys.exit(7)
+elif mode == "startup_failure":
+    print(
+        "Error: Cannot find module '@openai/codex/bin/codex.js'",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+elif mode == "budget":
+    print("Exceeded USD budget (2)", file=sys.stderr)
+    sys.exit(1)
+elif mode == "permission":
+    print("permission denied: shell", file=sys.stderr)
+    sys.exit(1)
 else:
     print("unknown fake codex mode", file=sys.stderr)
     sys.exit(9)
@@ -911,6 +936,39 @@ class RegistryBehaviorTests(FakeClaudeHarness):
         self.assertEqual(proc.returncode, 4, proc.stderr)
         self.assertIn("格式错误", self.payload(proc)["summary"])
 
+    def test_unexpandable_registry_path_is_4(self) -> None:
+        args = [
+            "--executor",
+            "claude_code",
+            "--cwd",
+            str(self.cwd),
+            "--budget-minutes",
+            "30",
+        ]
+        proc = self.run_cli(
+            args=args,
+            registry=Path("~nonexistent-user-e2-xyz/registry.json"),
+        )
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("注册表路径不可用", payload["summary"])
+
+    def test_non_utf8_registry_is_4(self) -> None:
+        registry = self.tmp / "bad-utf8.json"
+        registry.write_bytes(
+            b'{"executors": {"claude_code": {"module": "\xff"}}}'
+        )
+        proc = self.run_cli(registry=registry)
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("UTF-8", payload["summary"])
+
     def test_in_process_mode_is_4_end_to_end(self) -> None:
         registry = self.write_registry(
             {
@@ -1038,7 +1096,7 @@ class TerminationTests(FakeClaudeHarness):
             time.sleep(0.05)
         self.fail(f"executor child {pid} is still alive")
 
-    def test_sigterm_kills_child_and_emits_json(self) -> None:
+    def _start_marker_child(self):
         env = os.environ.copy()
         env["PATH"] = str(self.fake_bin)
         env["FAKE_CLAUDE_MODE"] = "marker"
@@ -1055,8 +1113,14 @@ class TerminationTests(FakeClaudeHarness):
         try:
             proc.stdin.write(self.task)
             proc.stdin.close()
-            info = self._wait_marker()
-            proc.terminate()
+        except BrokenPipeError:
+            pass
+        return proc, self._wait_marker()
+
+    def _assert_signal_interrupt(self, signum: int) -> None:
+        proc, info = self._start_marker_child()
+        try:
+            os.kill(proc.pid, signum)
             stdout, stderr = proc.communicate(timeout=10)
         finally:
             if proc.poll() is None:
@@ -1064,11 +1128,28 @@ class TerminationTests(FakeClaudeHarness):
                 proc.wait(timeout=10)
 
         self.assertEqual(proc.returncode, 1, stderr)
-        payload = json.loads([line for line in stdout.splitlines() if line.strip()][-1])
+        payload = json.loads(
+            [line for line in stdout.splitlines() if line.strip()][-1]
+        )
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["exit_code"], 1)
         self.assertIn("中断", payload["summary"])
         self._wait_pid_gone(info["pid"])
+
+    def test_sigterm_kills_child_and_emits_json(self) -> None:
+        self._assert_signal_interrupt(signal.SIGTERM)
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGHUP"), "platform has no SIGHUP"
+    )
+    def test_sighup_kills_child_and_emits_json(self) -> None:
+        self._assert_signal_interrupt(signal.SIGHUP)
+
+    @unittest.skipUnless(
+        hasattr(signal, "SIGQUIT"), "platform has no SIGQUIT"
+    )
+    def test_sigquit_kills_child_and_emits_json(self) -> None:
+        self._assert_signal_interrupt(signal.SIGQUIT)
 
     def test_timeout_kills_child_process_group(self) -> None:
         proc = self.run_cli(mode="marker", args=self._args("0.05"))
@@ -1192,6 +1273,29 @@ class DshContractTests(FakeClaudeHarness):
         proc = self.run_cli(args=self._args(), dsh_mode="nonzero")
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("boom", self.payload(proc)["summary"])
+
+    def test_startup_failure_is_4(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="startup_failure")
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("启动失败", payload["summary"])
+        self.assertIn("Cannot find module", payload["summary"])
+
+    def test_budget_text_is_3(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="budget")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 3)
+
+    def test_permission_text_is_2(self) -> None:
+        proc = self.run_cli(args=self._args(), dsh_mode="permission")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 2)
 
     def test_missing_binary_is_4_without_starting(self) -> None:
         empty_bin = self.tmp / "empty-bin"
@@ -1335,6 +1439,29 @@ class CodexContractTests(FakeClaudeHarness):
         self.assertEqual(proc.returncode, 1, proc.stderr)
         self.assertIn("boom", self.payload(proc)["summary"])
 
+    def test_startup_failure_is_4(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="startup_failure")
+        self.assertEqual(proc.returncode, 4, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 4)
+        self.assertIn("启动失败", payload["summary"])
+        self.assertIn("Cannot find module", payload["summary"])
+
+    def test_budget_text_is_3(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="budget")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 3)
+
+    def test_permission_text_is_2(self) -> None:
+        proc = self.run_cli(args=self._args(), codex_mode="permission")
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        payload = self.payload(proc)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["exit_code"], 2)
+
     def test_missing_binary_is_4_without_starting(self) -> None:
         empty_bin = self.tmp / "empty-bin"
         empty_bin.mkdir()
@@ -1402,6 +1529,28 @@ class RunnerUnitTests(unittest.TestCase):
             "",
         )
         self.assertEqual(payload["cost"], {"usd": None, "tokens": 0})
+
+    def test_huge_summary_is_capped(self) -> None:
+        payload = self.runner["_normalise_payload"](
+            "claude_code",
+            {"ok": True, "exit_code": 0, "summary": "x" * 10000},
+            ".runs/test.log",
+            "",
+        )
+        self.assertTrue(payload["summary"].startswith("x" * 100))
+        self.assertLessEqual(
+            len(payload["summary"]), self.runner["_SUMMARY_MAX_CHARS"] + 40
+        )
+        self.assertIn("已截断", payload["summary"])
+
+    def test_failure_summary_is_capped(self) -> None:
+        payload = self.runner["_failure_payload"](
+            "claude_code", 1, "y" * 10000
+        )
+        self.assertLessEqual(
+            len(payload["summary"]), self.runner["_SUMMARY_MAX_CHARS"] + 40
+        )
+        self.assertIn("已截断", payload["summary"])
 
 
 class RegistryTests(unittest.TestCase):
@@ -1809,6 +1958,50 @@ class DshAdapterTests(unittest.TestCase):
         self.assertIn("无法解析", result["summary"])
         self.assertIsNone(result["session_id"])
 
+    def test_translate_startup_failure_is_4(self) -> None:
+        for stub, text in (
+            ("", "Error: Cannot find module '@deepseek-ai/dsh/lib/bin.js'"),
+            ("Error: Cannot find module '@deepseek-ai/dsh/lib/bin.js'", ""),
+        ):
+            with self.subTest(stub=stub, text=text):
+                result = dsh.translate_result(stub, text, 1)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["exit_code"], 4)
+                self.assertIn("启动失败", result["summary"])
+                self.assertIsNone(result["session_id"])
+
+    def test_translate_budget_text_is_3(self) -> None:
+        result = dsh.translate_result("", "Exceeded USD budget (2)", 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 3)
+        self.assertIn("预算", result["summary"])
+
+    def test_translate_permission_text_is_2(self) -> None:
+        result = dsh.translate_result("", "permission denied: Bash", 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("人工授权", result["summary"])
+
+    def test_translate_error_event_permission_is_2(self) -> None:
+        stdout = json.dumps({"type": "error", "message": "permission denied: Bash"})
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 2)
+
+    def test_translate_error_event_budget_is_3(self) -> None:
+        stdout = json.dumps(
+            {"type": "error", "message": "Exceeded USD budget (2)"}
+        )
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 3)
+
+    def test_translate_success_budget_text_stays_0(self) -> None:
+        stdout = json.dumps({"type": "final", "text": "Added a budget limit"})
+        result = dsh.translate_result(stdout, "", 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["exit_code"], 0)
+
     def test_translate_huge_tokens_fall_back_to_zero(self) -> None:
         stdout = json.dumps(
             {
@@ -1958,6 +2151,63 @@ class CodexAdapterTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["exit_code"], 1)
         self.assertIn("无法解析", result["summary"])
+
+    def test_translate_startup_failure_is_4(self) -> None:
+        for stub, text in (
+            ("", "Error: Cannot find module '@openai/codex/bin/codex.js'"),
+            ("Error: Cannot find module '@openai/codex/bin/codex.js'", ""),
+        ):
+            with self.subTest(stub=stub, text=text):
+                result = codex.translate_result(stub, text, 1)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["exit_code"], 4)
+                self.assertIn("启动失败", result["summary"])
+                self.assertIsNone(result["session_id"])
+
+    def test_translate_budget_text_is_3(self) -> None:
+        result = codex.translate_result("", "Exceeded USD budget (2)", 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 3)
+        self.assertIn("预算", result["summary"])
+
+    def test_translate_permission_text_is_2(self) -> None:
+        result = codex.translate_result("", "permission denied: shell", 1)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("人工授权", result["summary"])
+
+    def test_translate_turn_failed_permission_is_2(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": "permission denied: shell"},
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 2)
+
+    def test_translate_turn_failed_budget_is_3(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "turn.failed",
+                "error": {"message": "Exceeded USD budget (2)"},
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["exit_code"], 3)
+
+    def test_translate_success_budget_text_stays_0(self) -> None:
+        stdout = json.dumps(
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Added a budget limit"},
+            }
+        )
+        result = codex.translate_result(stdout, "", 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["exit_code"], 0)
 
     def test_translate_huge_tokens_fall_back_to_zero(self) -> None:
         stdout = json.dumps(

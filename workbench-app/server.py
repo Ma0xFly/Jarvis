@@ -138,6 +138,10 @@ ACCEPT_SUMMARY = "验收通过"
 AUTO_COLLECT_COMMENT = "48h 自动收"
 AUTO_COLLECT_AUDIT_SUMMARY = "48h 自动收（worker 自述保留在 review_requested 事件/run）"
 MAX_REJECT_REASON_CHARS = 2000
+# Worker self-report (Story 3.1): each of the three lines is capped so one
+# oversized handoff cannot inflate every 5s inbox poll. The marker stays inside
+# the cap and ``self_report_truncated`` makes the loss visible.
+MAX_SELF_REPORT_CHARS = 2000
 VERIFY_AUTHOR = "workbench"
 # Scheduled wake (Story 3.3): repository cards may carry a top-level ``wake_at``
 # in workbench metadata. The background scheduler only scans that key, so a
@@ -219,6 +223,37 @@ class SessionUnavailable(RuntimeError):
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def normalize_solidified_verified(value: Any) -> list[dict[str, Any]]:
+    """Read the workbench-owned ``solidified_verified`` overlay defensively.
+
+    Stored as ``{path, verified_at}[]``; a corrupt row degrades to [] so a
+    broken overlay cannot fail the verify page or an endpoint. Applied in
+    :meth:`MetadataStore.get_many` so JSON responses (notably the bulk
+    ``/api/workbench/metadata`` read) never carry ``NaN``/``Infinity``.
+    """
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for candidate in value:
+        if not isinstance(candidate, dict):
+            continue
+        path = candidate.get("path")
+        verified_at = candidate.get("verified_at")
+        if not isinstance(path, str) or not path.strip():
+            continue
+        # NaN/Infinity survive Python's permissive JSON decoder but cannot
+        # be int()'d; an int too large for float also overflows inside
+        # math.isfinite. A corrupt overlay must degrade, not 500.
+        try:
+            valid_timestamp = _is_number(verified_at)
+        except OverflowError:
+            valid_timestamp = False
+        if not valid_timestamp:
+            continue
+        entries.append({"path": path.strip(), "verified_at": int(verified_at)})
+    return entries
 
 
 def _valid_deny_paths(value: Any) -> bool:
@@ -532,6 +567,12 @@ class MetadataStore:
         for task_id, raw in rows:
             decoded = self._decode(raw)
             if decoded is not None:
+                # A corrupt workbench overlay must not make an entire JSON
+                # batch unserializable (``JSONResponse`` uses allow_nan=False).
+                if "solidified_verified" in decoded:
+                    decoded["solidified_verified"] = normalize_solidified_verified(
+                        decoded["solidified_verified"]
+                    )
                 out[task_id] = decoded
         return out
 
@@ -1280,6 +1321,8 @@ class WorkbenchService:
         return 400, {"ok": False, "error": "missing_acceptance"}
 
     def metadata_for(self, task_ids: list[str]) -> tuple[int, dict[str, Any]]:
+        # ``get_many`` normalizes the workbench ``solidified_verified`` overlay,
+        # so one corrupt row (NaN/Infinity) cannot 500 the whole batch.
         try:
             return 200, self.store.get_many(task_ids)
         except MetadataUnavailable:
@@ -1374,36 +1417,52 @@ class WorkbenchService:
 
     SELF_REPORT_FIELDS = ("delivered", "evidence", "uncertain")
 
+    @staticmethod
+    def _cap_self_report_field(text: str) -> tuple[str, bool]:
+        if len(text) <= MAX_SELF_REPORT_CHARS:
+            return text, False
+        marker = f"…[已截断：原 {len(text)} 字符]"
+        keep = max(0, MAX_SELF_REPORT_CHARS - len(marker))
+        return text[:keep] + marker, True
+
     @classmethod
-    def _latest_self_report(cls, detail: dict[str, Any]) -> Optional[dict[str, str]]:
-        """The newest run's ``metadata.self_report``, normalized, or None.
+    def _latest_self_report(
+        cls, detail: dict[str, Any]
+    ) -> tuple[Optional[dict[str, str]], bool]:
+        """Newest run's ``metadata.self_report``, normalized + capped, or None.
 
         Workers write the three-line handoff through
         ``kanban_request_review(metadata={"self_report": ...})`` and Hermes
         stores it on the run row. Only the latest run counts — no cross-round
-        stitching. Missing or malformed values degrade to None so the verify
-        page can show a warning without blocking A/R/S.
+        stitching. Missing or malformed values degrade to ``None`` so the
+        verify page can show a warning without blocking A/R/S. Each field is
+        capped at ``MAX_SELF_REPORT_CHARS``; the second return value reports
+        whether any field was truncated (the text also carries a marker).
         """
         runs = cls._ordered_runs(detail)
         if not runs:
-            return None
+            return None, False
         metadata = runs[0].get("metadata")
         if not isinstance(metadata, dict):
-            return None
+            return None, False
         report = metadata.get("self_report")
         if not isinstance(report, dict):
-            return None
+            return None, False
         fields: dict[str, str] = {}
         for key in cls.SELF_REPORT_FIELDS:
             value = report.get(key)
             if not isinstance(value, str):
-                return None
+                return None, False
             fields[key] = value.strip()
         # 交付/依据 blank is malformed, not a valid handoff. 没底 blank is
         # meaningful: the UI renders it as "未填写" and keeps A/R/S enabled.
         if not fields["delivered"] or not fields["evidence"]:
-            return None
-        return fields
+            return None, False
+        truncated = False
+        for key in cls.SELF_REPORT_FIELDS:
+            fields[key], capped = cls._cap_self_report_field(fields[key])
+            truncated = truncated or capped
+        return fields, truncated
 
     @staticmethod
     def _normalize_solidified(value: Any) -> list[dict[str, str]]:
@@ -1461,50 +1520,21 @@ class WorkbenchService:
             return []
         return cls._normalize_solidified(metadata.get("solidified"))
 
-    @staticmethod
-    def _normalize_solidified_verified(value: Any) -> list[dict[str, Any]]:
-        """Read the workbench-owned ``solidified_verified`` overlay defensively.
-
-        Stored as ``{path, verified_at}[]``; a corrupt row degrades to [] so a
-        broken overlay cannot fail the verify page or the endpoint.
-        """
-        if not isinstance(value, list):
-            return []
-        entries: list[dict[str, Any]] = []
-        for candidate in value:
-            if not isinstance(candidate, dict):
-                continue
-            path = candidate.get("path")
-            verified_at = candidate.get("verified_at")
-            if not isinstance(path, str) or not path.strip():
-                continue
-            # NaN/Infinity survive Python's permissive JSON decoder but cannot
-            # be int()'d; an int too large for float also overflows inside
-            # math.isfinite. A corrupt overlay must degrade, not 500.
-            try:
-                valid_timestamp = _is_number(verified_at)
-            except OverflowError:
-                valid_timestamp = False
-            if not valid_timestamp:
-                continue
-            entries.append({"path": path.strip(), "verified_at": int(verified_at)})
-        return entries
-
     def _inbox_item(
         self, task_id: str, detail: dict[str, Any], metadata: dict[str, Any]
     ) -> dict[str, Any]:
         task = self._detail_task(detail)
         review_at = self._latest_review_requested_at(detail)
         age = self._review_age_seconds(review_at, time.time())
-        # The overlay is workbench-owned, but a corrupt row (NaN/Infinity,
-        # junk entries) must not make the inbox unserializable.
+        # The overlay is workbench-owned and already normalized by
+        # ``MetadataStore.get_many``; normalize again so a direct caller cannot
+        # put a corrupt row into this response.
         safe_metadata = dict(metadata)
         if "solidified_verified" in safe_metadata:
-            safe_metadata["solidified_verified"] = (
-                self._normalize_solidified_verified(
-                    safe_metadata["solidified_verified"]
-                )
+            safe_metadata["solidified_verified"] = normalize_solidified_verified(
+                safe_metadata["solidified_verified"]
             )
+        self_report, self_report_truncated = self._latest_self_report(detail)
         return {
             "id": task_id,
             "title": task.get("title") if isinstance(task.get("title"), str) else "",
@@ -1515,7 +1545,8 @@ class WorkbenchService:
             "completed_at": task.get("completed_at"),
             "result": task.get("result"),
             "latest_summary": task.get("latest_summary"),
-            "self_report": self._latest_self_report(detail),
+            "self_report": self_report,
+            "self_report_truncated": self_report_truncated,
             "solidified": self._latest_solidified(detail),
             "metadata": safe_metadata,
             "review_requested_at": review_at,
@@ -2171,7 +2202,7 @@ class WorkbenchService:
                 metadata = self.store.get(normalized_id) or {}
             except MetadataUnavailable:
                 return self._fail(503, "metadata_unavailable")
-            overlay = self._normalize_solidified_verified(
+            overlay = normalize_solidified_verified(
                 metadata.get("solidified_verified")
             )
             if not any(entry["path"] == normalized_path for entry in overlay):

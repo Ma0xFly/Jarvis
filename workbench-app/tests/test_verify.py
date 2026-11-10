@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import threading
@@ -37,6 +39,8 @@ import test_dispatch as base  # noqa: E402
 
 REVIEW_TTL = 48 * 60 * 60
 AUTO_PREFIX = "48h 自动收"
+# Mirrors server.py; each self-report line is capped with a visible marker.
+MAX_SELF_REPORT_CHARS = 2000
 DEFAULT_SOLIDIFIED = {
     "type": "script",
     "path": "workbench-app/tests/test_verify.py",
@@ -458,10 +462,14 @@ class VerifyBackendTestCase(unittest.TestCase):
                 return item
         return None
 
-    def verify(self, task_id: str, action, reason=None, server=None):
+    def verify(
+        self, task_id: str, action, reason=None, server=None, expected_review_at=None
+    ):
         payload = {"action": action}
         if reason is not None:
             payload["reason"] = reason
+        if expected_review_at is not None:
+            payload["expected_review_at"] = expected_review_at
         target = server or self.server
         return base.http_json(
             "POST",
@@ -784,6 +792,32 @@ class InboxSelfReportTests(unittest.TestCase):
                 "uncertain": "没跑真机",
             },
         )
+        self.assertFalse(item["self_report_truncated"])
+
+    def test_oversized_field_is_capped_with_a_visible_marker(self):
+        oversized = "x" * 50_000
+        item = self._item(
+            [
+                fake_run(
+                    1,
+                    metadata={
+                        "self_report": {
+                            "delivered": oversized,
+                            "evidence": "依据",
+                            "uncertain": "",
+                        }
+                    },
+                )
+            ]
+        )
+        self.assertTrue(item["self_report_truncated"])
+        delivered = item["self_report"]["delivered"]
+        self.assertEqual(len(delivered), MAX_SELF_REPORT_CHARS)
+        self.assertIn(f"原 {len(oversized)} 字符", delivered)
+        self.assertTrue(delivered.endswith("]"))
+        # Other fields are untouched by the cap.
+        self.assertEqual(item["self_report"]["evidence"], "依据")
+        self.assertEqual(item["self_report"]["uncertain"], "")
 
     def test_blank_uncertain_stays_an_empty_string(self):
         item = self._item(
@@ -1235,6 +1269,95 @@ class SolidifiedGateUpstreamTests(unittest.TestCase):
             )
 
 
+def hermes_venv_python() -> Path | None:
+    """Hermes's own venv can import ``tools.kanban_tools`` (ruamel etc.)."""
+    candidate = Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "python"
+    return candidate if candidate.is_file() else None
+
+
+class ReviewHandoffWrapperTests(VerifyBackendTestCase):
+    """Exercise the real ``kanban_request_review`` wrapper, not PATCH review.
+
+    The wrapper adds ``_redact_metadata`` and ``_stamp_worker_session_metadata``
+    on top of ``kanban_db.request_review``; the dashboard PATCH tests cannot see
+    those. It runs in a subprocess with the throwaway kanban home, so nothing
+    under ``~/.hermes/hermes-agent`` is modified.
+    """
+
+    def test_wrapper_lands_self_report_solidified_and_session_stamp(self):
+        python = hermes_venv_python()
+        if python is None:
+            self.skipTest(
+                "Hermes venv python unavailable; real kanban_request_review "
+                "wrapper remains an untested gap"
+            )
+
+        card = self.server.create_task("真实 review wrapper", triage=True)
+        self.server.seed_metadata(card, {"contract": {"accept": "ok"}})
+        run_id = self.server.start_run(card)
+        report = {
+            "delivered": "改了真实 wrapper 链路",
+            "evidence": "test_verify wrapper 用例",
+            "uncertain": "没跑真机",
+        }
+        solidified = [
+            {"type": "script", "path": "scripts/wrapper-probe.sh", "status": "pending"}
+        ]
+        script = (
+            "import json, os, sys\n"
+            "sys.path.insert(0, os.path.expanduser('~/.hermes/hermes-agent'))\n"
+            "from tools import kanban_tools\n"
+            "print(kanban_tools._handle_request_review("
+            "json.loads(os.environ['WRAPPER_ARGS'])))\n"
+        )
+        env = os.environ.copy()
+        # Never let a developer/CI pin redirect the wrapper at a real board.
+        env.pop("HERMES_KANBAN_BOARD", None)
+        env.update(
+            {
+                "HERMES_KANBAN_HOME": str(self.server.kanban_home),
+                "HERMES_KANBAN_DB": str(self.server.kanban_db),
+                "HERMES_KANBAN_TASK": card,
+                "HERMES_KANBAN_RUN_ID": str(run_id),
+                "HERMES_SESSION_ID": "sess-wrapper-review",
+                "WRAPPER_ARGS": json.dumps(
+                    {
+                        "summary": "实现完成，转验收",
+                        "metadata": {
+                            "self_report": report,
+                            "solidified": solidified,
+                        },
+                    }
+                ),
+            }
+        )
+        proc = subprocess.run(
+            [str(python), "-I", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("status"), "review")
+        self.assertEqual(result.get("task_id"), card)
+
+        item = self.inbox_item(card)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["self_report"], report)
+        self.assertFalse(item["self_report_truncated"])
+        self.assertEqual(item["solidified"], solidified)
+
+        runs = self.detail(card)["runs"]
+        metadata = next(run["metadata"] for run in runs if run["id"] == run_id)
+        self.assertEqual(metadata["self_report"], report)
+        self.assertEqual(metadata["solidified"], solidified)
+        # Only the wrapper stamps this trusted identity; the PATCH path cannot.
+        self.assertEqual(metadata["worker_session_id"], "sess-wrapper-review")
+
+
 class VerifyActionTests(VerifyBackendTestCase):
     def test_accept_moves_to_done_and_leaves_inbox(self):
         card = self.seed_review("验收收下")
@@ -1396,6 +1519,32 @@ class VerifyActionTests(VerifyBackendTestCase):
         self.assertEqual(self.server.status(card), "review")
         self.assertEqual(len(self.comments(card)), before)
         self.assertIsNotNone(self.inbox_item(card))
+
+    def test_expected_review_at_guards_the_rendered_round(self):
+        card = self.seed_review("跨轮守卫")
+        item = self.inbox_item(card)
+        self.assertIsNotNone(item)
+        first_at = item["review_requested_at"]
+        self.assertIsNotNone(first_at)
+
+        # Matching round: the action is allowed.
+        code, body = self.verify(card, "skip", expected_review_at=first_at)
+        self.assertEqual(code, 200, body)
+
+        # A newer round landed: the old round's evidence must not accept it.
+        second_at = int(time.time()) + 5
+        self.add_review_event(card, int(time.time() * 1000), second_at)
+        code, body = self.verify(card, "accept", expected_review_at=first_at)
+        self.assertEqual(code, 409, body)
+        self.assertEqual(body["error"], "stale_review")
+        self.assertEqual(body["review_requested_at"], second_at)
+        self.assertFalse(body["comment_written"])
+        self.assertEqual(self.server.status(card), "review")
+
+        # Re-reviewing the new round is allowed once the UI refreshes.
+        code, body = self.verify(card, "accept", expected_review_at=second_at)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["status"], "done")
 
     def test_verify_non_review_card_is_409(self):
         triage = self.server.create_task("不是 review", triage=True)
@@ -1568,6 +1717,41 @@ class SolidifiedVerifiedTests(VerifyBackendTestCase):
         self.assertEqual(
             self.server.metadata_row(card)["solidified_verified"],
             body["solidified_verified"],
+        )
+
+    def test_metadata_batch_sanitizes_corrupt_overlay(self):
+        """One NaN/corrupt row must not 500 the whole metadata batch."""
+        bad = self.server.create_task("坏 metadata 批次", triage=True)
+        good = self.server.create_task("好 metadata 批次", triage=True)
+        self.server.seed_metadata(
+            bad,
+            {
+                "solidified_verified": [
+                    {"path": "scripts/nan.sh", "verified_at": float("nan")},
+                    {"path": "scripts/inf.sh", "verified_at": float("inf")},
+                    {"path": "scripts/huge.sh", "verified_at": 10**400},
+                    {"path": "scripts/ok.sh", "verified_at": 123},
+                ]
+            },
+        )
+        self.server.seed_metadata(
+            good,
+            {
+                "solidified_verified": [
+                    {"path": "scripts/good.sh", "verified_at": 456}
+                ]
+            },
+        )
+
+        code, rows = self.server.get_metadata([bad, good])
+        self.assertEqual(code, 200, rows)
+        self.assertEqual(
+            rows[bad]["solidified_verified"],
+            [{"path": "scripts/ok.sh", "verified_at": 123}],
+        )
+        self.assertEqual(
+            rows[good]["solidified_verified"],
+            [{"path": "scripts/good.sh", "verified_at": 456}],
         )
 
     def test_upstream_failure_is_502(self):

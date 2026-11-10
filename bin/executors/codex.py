@@ -26,15 +26,38 @@ Contract
     * ``turn.completed.usage`` adds ``input_tokens + output_tokens`` to
       ``cost.tokens``.
 
-    Output without recognized events maps to exit code 1. Non-zero exits map
-    to 1 as well; the runner owns codes 3 (timeout) and 4 (missing binary /
-    unknown executor).
+    Output without recognized events maps to exit code 1. A process that dies
+    before any parsable event with a loader/startup signature
+    (``MODULE_NOT_FOUND``, a missing shared library, a bad interpreter, ...)
+    maps to exit code 4 instead. On a failed run, budget/permission text maps
+    to 3/2 as a heuristic; structured failure events are preferred when
+    present. The runner owns the wall-clock timeout (3) and the missing-binary
+    check (4).
+
+Capabilities and limits
+-----------------------
+* **No per-command commit/push guard.** Codex is invoked with
+  ``--sandbox workspace-write`` (``readonly`` -> ``read-only``) but has no
+  denylist flag here, so ``git commit`` / ``git push`` are not blocked in
+  write mode. The sandbox is the only containment; callers must not treat
+  this adapter as a commit/push guard.
+* **No USD budget.** Codex exposes no ``--max-usd`` equivalent here, so the
+  runner's ``--max-usd`` is not forwarded and ``cost.usd`` stays ``null``.
+  The runner still enforces ``--budget-minutes`` as a wall-clock timeout.
+* **Tokens only.** Usage is summed from ``turn.completed`` events.
 """
 
 from __future__ import annotations
 
 import json
 import math
+
+from executors.text_signals import (
+    EXIT_BUDGET,
+    classify_failure,
+    looks_like_startup_failure,
+    startup_failure_line,
+)
 
 #: Unified mode -> Codex sandbox mode.
 SANDBOX_MODES = {
@@ -72,6 +95,23 @@ def translate_result(stdout, stderr="", raw_exit=0):
     """Translate codex JSONL events into the unified result dict."""
     events = _parse_events(stdout)
     if not events:
+        if looks_like_startup_failure(_combined_output(stdout, stderr)):
+            return _result(
+                ok=False,
+                session_id=None,
+                summary=_startup_summary(stderr, stdout),
+                cost=_empty_cost(),
+                exit_code=4,
+            )
+        signal = classify_failure(stderr, stdout)
+        if signal is not None:
+            return _result(
+                ok=False,
+                session_id=None,
+                summary=_signal_summary(signal, stderr, stdout),
+                cost=_empty_cost(),
+                exit_code=signal,
+            )
         return _result(
             ok=False,
             session_id=None,
@@ -130,6 +170,15 @@ def translate_result(stdout, stderr="", raw_exit=0):
         )
 
     if raw_exit != 0:
+        signal = classify_failure(stderr, error_text, last_message)
+        if signal is not None:
+            return _result(
+                ok=False,
+                session_id=session_id,
+                summary=_signal_summary(signal, stderr, error_text or last_message),
+                cost=cost,
+                exit_code=signal,
+            )
         return _result(
             ok=False,
             session_id=session_id,
@@ -140,6 +189,17 @@ def translate_result(stdout, stderr="", raw_exit=0):
 
     # A failure event is authoritative even when the process exits 0.
     if failure_event:
+        signal = classify_failure(error_text, last_message, stderr)
+        if signal is not None:
+            return _result(
+                ok=False,
+                session_id=session_id,
+                summary=_signal_summary(
+                    signal, error_text, last_message or stderr
+                ),
+                cost=cost,
+                exit_code=signal,
+            )
         summary = error_text or "执行器报告失败（turn.failed/error），但没有错误信息"
         if last_message:
             summary += f"（agent 输出：{last_message[:300]}）"
@@ -225,6 +285,36 @@ def _nonzero_summary(raw_exit, stderr, error_text, last_message):
         details.append(f"agent 输出：{last_message[:300]}")
     if details:
         summary += "：" + "；".join(details)
+    return summary
+
+
+def _combined_output(stdout, stderr):
+    parts = [
+        part for part in (stdout, stderr) if isinstance(part, str) and part
+    ]
+    return "\n".join(parts)
+
+
+def _startup_summary(stderr, stdout):
+    summary = "执行器不可用：启动失败"
+    detail = (
+        startup_failure_line(stderr, stdout)
+        or _first_line(stderr)
+        or _first_line(stdout)
+    )
+    if detail:
+        summary += f"：{detail[:300]}"
+    return summary
+
+
+def _signal_summary(exit_code, primary, fallback=""):
+    if exit_code == EXIT_BUDGET:
+        summary = "执行器预算中断"
+    else:
+        summary = "执行器需要人工授权"
+    detail = _first_line(primary) or _first_line(fallback)
+    if detail:
+        summary += f"：{detail[:300]}"
     return summary
 
 

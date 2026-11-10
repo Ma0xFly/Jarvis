@@ -23,14 +23,36 @@ Contract
     * the last ``final`` event supplies ``text`` -> ``summary``.
 
     Output without any parsable JSON event, or without a ``final`` event on a
-    zero exit, maps to exit code 1. Non-zero exits map to 1 as well; the
-    runner owns codes 3 (timeout) and 4 (missing binary / unknown executor).
+    zero exit, maps to exit code 1. A process that dies before any parsable
+    event with a loader/startup signature (``MODULE_NOT_FOUND``, a missing
+    shared library, a bad interpreter, ...) maps to exit code 4 instead. On a
+    failed run, budget/permission text maps to 3/2 as a heuristic; structured
+    error events are preferred when present. The runner owns the wall-clock
+    timeout (3) and the missing-binary check (4).
+
+Capabilities and limits
+-----------------------
+* **No commit/push guard.** dsh has no per-command deny flag, so this adapter
+  does not block ``git commit`` / ``git push``. Callers must not treat it as
+  containment.
+* **No USD budget.** dsh has no ``--max-usd`` equivalent; the runner's
+  ``--max-usd`` is not forwarded and ``cost.usd`` stays ``null``. The runner
+  still enforces ``--budget-minutes`` as a wall-clock timeout.
+* **Tokens only.** Usage is summed from ``status`` events with
+  ``phase == "step_end"``.
 """
 
 from __future__ import annotations
 
 import json
 import math
+
+from executors.text_signals import (
+    EXIT_BUDGET,
+    classify_failure,
+    looks_like_startup_failure,
+    startup_failure_line,
+)
 
 #: Usage keys accepted on ``status.usage`` (camelCase is the dsh spelling).
 _USAGE_TOKEN_KEYS = (
@@ -65,6 +87,23 @@ def translate_result(stdout, stderr="", raw_exit=0):
     """Translate dsh NDJSON events into the unified result dict."""
     events = _parse_events(stdout)
     if not events:
+        if looks_like_startup_failure(_combined_output(stdout, stderr)):
+            return _result(
+                ok=False,
+                session_id=None,
+                summary=_startup_summary(stderr, stdout),
+                cost=_empty_cost(),
+                exit_code=4,
+            )
+        signal = classify_failure(stderr, stdout)
+        if signal is not None:
+            return _result(
+                ok=False,
+                session_id=None,
+                summary=_signal_summary(signal, stderr, stdout),
+                cost=_empty_cost(),
+                exit_code=signal,
+            )
         return _result(
             ok=False,
             session_id=None,
@@ -120,6 +159,15 @@ def translate_result(stdout, stderr="", raw_exit=0):
         )
 
     if raw_exit != 0:
+        signal = classify_failure(stderr, error_text, final_text)
+        if signal is not None:
+            return _result(
+                ok=False,
+                session_id=session_id,
+                summary=_signal_summary(signal, stderr, error_text or final_text),
+                cost=cost,
+                exit_code=signal,
+            )
         return _result(
             ok=False,
             session_id=session_id,
@@ -130,6 +178,17 @@ def translate_result(stdout, stderr="", raw_exit=0):
 
     # An error/fatal event is authoritative even when the process exits 0.
     if failure_event:
+        signal = classify_failure(error_text, final_text, stderr)
+        if signal is not None:
+            return _result(
+                ok=False,
+                session_id=session_id,
+                summary=_signal_summary(
+                    signal, error_text, final_text or stderr
+                ),
+                cost=cost,
+                exit_code=signal,
+            )
         summary = error_text or "执行器报告失败（error/fatal），但没有错误信息"
         if final_text:
             summary += f"（final 输出：{final_text[:300]}）"
@@ -214,6 +273,36 @@ def _nonzero_summary(raw_exit, stderr, error_text, final_text):
         details.append(f"final 输出：{final_text[:300]}")
     if details:
         summary += "：" + "；".join(details)
+    return summary
+
+
+def _combined_output(stdout, stderr):
+    parts = [
+        part for part in (stdout, stderr) if isinstance(part, str) and part
+    ]
+    return "\n".join(parts)
+
+
+def _startup_summary(stderr, stdout):
+    summary = "执行器不可用：启动失败"
+    detail = (
+        startup_failure_line(stderr, stdout)
+        or _first_line(stderr)
+        or _first_line(stdout)
+    )
+    if detail:
+        summary += f"：{detail[:300]}"
+    return summary
+
+
+def _signal_summary(exit_code, primary, fallback=""):
+    if exit_code == EXIT_BUDGET:
+        summary = "执行器预算中断"
+    else:
+        summary = "执行器需要人工授权"
+    detail = _first_line(primary) or _first_line(fallback)
+    if detail:
+        summary += f"：{detail[:300]}"
     return summary
 
 

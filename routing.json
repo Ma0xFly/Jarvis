@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "description": "Worker executor routing. Rules are evaluated in file order; the first match wins. Card/event metadata.executor is ignored. bin/route is the only reader. `to` is the profile fallback when `when.profiles` is absent; explicit empty allowlists match nothing.",
+  "description": "Worker executor routing. Rules are evaluated in file order; the first match wins. Card/event metadata.executor is ignored. bin/route is the only reader. `to` is the profile fallback when `when.profiles` is absent; explicit empty allowlists match nothing. Every `skills` entry must resolve under the target profile's `skills/` directory.",
   "default": {
     "executor": "hermes"
   },
@@ -11,7 +11,7 @@
       "when": {
         "profiles": ["coder"]
       },
-      "skills": ["workbench-conventions"],
+      "skills": ["workbench-conventions", "dsh-delegation"],
       "budget": {
         "max_minutes": 30,
         "max_cost": 2

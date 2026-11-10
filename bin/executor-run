@@ -20,8 +20,10 @@ Exit codes (callers only rely on these five)
     1  other error (bad input, unparsable output, non-zero executor exit)
     2  needs human (permission denial or explicit permission request)
     3  over budget (wall-clock timeout or executor budget interruption)
-    4  executor unavailable (unknown executor, missing registry, missing binary,
-       or an in-process executor such as hermes)
+    4  executor unavailable (unknown executor, missing/unreadable/non-UTF-8
+       registry, unexpandable registry path, missing binary, a loader/startup
+       failure before any parsable event, or an in-process executor such as
+       hermes)
 
 Adapters live in ``bin/executors/<name>.py`` and implement
 ``build_command(ctx)`` and ``translate_result(stdout, stderr, raw_exit)``.
@@ -62,6 +64,9 @@ ENV_REGISTRY = "EXECUTOR_REGISTRY"
 _REDACT_LINE_MIN_CHARS = 4
 #: Minimum length for environment secret values to be scrubbed from output.
 _REDACT_SECRET_MIN_CHARS = 8
+#: Cap on the summary forwarded to callers (A21/R17). The task book is
+#: redacted first, so truncation cannot expose a partially redacted secret.
+_SUMMARY_MAX_CHARS = 4000
 _SECRET_ENV_RE = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)", re.IGNORECASE)
 
 
@@ -139,7 +144,7 @@ def main(argv=None) -> int:
         payload = _failure_payload(
             args.executor,
             EXIT_ERROR,
-            "执行被中断（SIGINT/SIGTERM）",
+            "执行被中断（SIGINT/SIGTERM/SIGHUP/SIGQUIT）",
             task_book=getattr(args, "_task_book", ""),
         )
         _emit(payload)
@@ -156,16 +161,25 @@ def main(argv=None) -> int:
 
 
 def _install_signal_handlers() -> None:
-    """Turn SIGTERM into KeyboardInterrupt so cleanup still emits JSON."""
+    """Turn termination signals into KeyboardInterrupt so cleanup emits JSON.
+
+    SIGTERM, SIGHUP and SIGQUIT all take the same path: the ``_run`` finally
+    block kills the detached child process group, logs are closed and one
+    failure JSON line is written before exiting.
+    """
 
     def _interrupt(_signum, _frame):
         raise KeyboardInterrupt
 
-    try:
-        signal.signal(signal.SIGTERM, _interrupt)
-    except (ValueError, OSError):
-        # Not the main thread, or the platform does not support it.
-        pass
+    for name in ("SIGTERM", "SIGHUP", "SIGQUIT"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        try:
+            signal.signal(signum, _interrupt)
+        except (ValueError, OSError):
+            # Not the main thread, or the platform does not support it.
+            pass
 
 
 def _run(args) -> int:
@@ -177,9 +191,20 @@ def _run(args) -> int:
     except ValueError as exc:
         return _finish(_failure_payload(executor, EXIT_ERROR, str(exc)), EXIT_ERROR)
 
-    registry_path = Path(
+    registry_raw = (
         args.registry or os.environ.get(ENV_REGISTRY) or str(DEFAULT_REGISTRY)
-    ).expanduser()
+    )
+    try:
+        registry_path = Path(registry_raw).expanduser()
+    except (RuntimeError, OSError, ValueError) as exc:
+        return _finish(
+            _failure_payload(
+                executor,
+                EXIT_UNAVAILABLE,
+                f"执行器注册表路径不可用：{registry_raw}（{exc}）",
+            ),
+            EXIT_UNAVAILABLE,
+        )
 
     try:
         entries = load_registry(registry_path)
@@ -386,10 +411,14 @@ def load_registry(path: Path) -> dict:
     except OSError as exc:
         reason = exc.strerror or str(exc)
         raise RegistryError(f"执行器注册表不可用：{path}（{reason}）") from exc
+    except (UnicodeError, RuntimeError, ValueError) as exc:
+        raise RegistryError(
+            f"执行器注册表无法读取为 UTF-8：{path}（{exc}）"
+        ) from exc
 
     try:
         data = json.loads(raw)
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise RegistryError(f"执行器注册表不是合法 JSON：{path}（{exc}）") from exc
 
     if not isinstance(data, dict):
@@ -651,7 +680,7 @@ def _normalise_payload(executor: str, translated, relative_log: str, task_book: 
             EXIT_BUDGET: "执行器预算中断",
             EXIT_UNAVAILABLE: "执行器不可用",
         }.get(exit_code, "执行失败")
-    summary = _redact(summary, task_book)
+    summary = _cap_summary(_redact(summary, task_book))
 
     files_changed = translated.get("files_changed")
     if not isinstance(files_changed, list):
@@ -705,12 +734,19 @@ def _failure_payload(
         "ok": False,
         "executor": executor,
         "session_id": session_id,
-        "summary": _redact(str(summary), task_book),
+        "summary": _cap_summary(_redact(str(summary), task_book)),
         "files_changed": [],
         "cost": {"usd": None, "tokens": 0},
         "log_path": log_path,
         "exit_code": exit_code,
     }
+
+
+def _cap_summary(text: str) -> str:
+    """Keep one summary from turning the JSON envelope/log into a payload dump."""
+    if len(text) <= _SUMMARY_MAX_CHARS:
+        return text
+    return text[:_SUMMARY_MAX_CHARS] + f"…（已截断，原长 {len(text)} 字符）"
 
 
 def _finish(payload: dict, exit_code: int) -> int:

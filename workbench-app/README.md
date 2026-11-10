@@ -212,8 +212,9 @@ bin/executor-run --executor claude_code --cwd <dir> --mode write \
 
 - 退出码：`0` 成功、`1` 其它错误（空任务书、非法/空白 cwd、非零退出、末行
   无法解析）、`2` 需要人（权限拒绝/请求）、`3` 超预算（墙钟超时或执行器
-  报告预算中断）、`4` 执行器不可用（未知 executor、registry 缺失/非法、
-  二进制不在 PATH，或 `mode: in-process` 的 hermes）。argparse 用法错误也
+  报告预算中断）、`4` 执行器不可用（未知 executor、registry 缺失/非法/
+  无法读取/非 UTF-8/路径无法展开、进程启动失败、二进制不在 PATH，或
+  `mode: in-process` 的 hermes）。argparse 用法错误也
   输出失败 JSON 并走 `1`，不会占用
   `2`；`--help` 是唯一例外（只打印帮助文本，不输出 JSON）。
 - registry 查找顺序：`--registry <path>` > `EXECUTOR_REGISTRY` 环境变量 >
@@ -300,8 +301,9 @@ bin/route --profile coder --json
 - `budget.max_minutes` / `budget.max_cost` 只透传，由调用方映射
   `--budget-minutes` / `--max-usd`；route 不解释金额。`dsh` / `codex` 不支持
   `--max-usd`。
-- 坏 JSON / 非 UTF-8、无法展开的 `~user`、未知 `when` 键、非有限数值、非法
-  registry `mode` 或未知执行器，全部 fail-closed 返回 `1`。
+- 坏 JSON / 非 UTF-8、无法展开的 `~user`、规则级或 `when` 未知键、空白
+  `executor`/`to`、非对象/非有限正数 budget、缺非空 `module` 的 registry
+  条目、非法 registry `mode` 或未知执行器，全部 fail-closed 返回 `1`。
 - coder 从 `claude_code` 回滚 `dsh` 的步骤与 `kanban_request_review` 字段见
   外部 `workbench-conventions/references/executor-contract.md`；失败不得
   伪装成功。
@@ -382,6 +384,10 @@ curl -s -X POST http://127.0.0.1:8787/api/workbench/solidified/<task_id>/verify 
   窗口内 sweeper 不再重试，inbox item 暴露 `auto_collect_due` 与
   `auto_collect_error:{message,attempts,retry_in_seconds}`。
 - 队列顺序：最早进入 review 的在前；无 `review_requested` 的卡排在最后。
+- 验收动作可带 `expected_review_at`（当前展示轮次的 `review_requested_at`）；
+  轮次在 5s 轮询之间变化时返回 409 `stale_review`，前端刷新队列而不是用旧证据
+  收下新一轮。固化条目区分 `worker 自报已验证` 与 `工作台已验证` overlay；没有
+  合法 `solidified` 时 UI 禁用「收」/A，R/S 仍可用。
 - **worker 自述契约**：worker 调 `kanban_request_review` 时在
   `metadata.self_report` 写 `{"delivered": "...", "evidence": "...", "uncertain": "..."}`
   三个字符串（交付 / 依据 / 没底）。inbox 只读**最新 run** 的该字段，不跨轮拼接：
@@ -638,6 +644,7 @@ python3 workbench-app/tests/test_notifications.py -v
 python3 workbench-app/tests/test_session.py -v
 python3 tests/test_executor_run.py -v     # 3.4/3.5 执行器契约 + fake claude/dsh/codex
 python3 tests/test_routing.py -v          # 3.5 routing.json + bin/route
+python3 tests/test_worker_contract.py -v  # worker 契约：四个 profile + 共享 skill
 cd workbench-ui && npm run probe:todo    # headless 三列/拖拽/建卡/验收/回执/位次探针
 cd workbench-ui && npm run probe:verify  # headless 全屏验收探针
 cd workbench-ui && npm run probe:notify  # headless 通知中心探针

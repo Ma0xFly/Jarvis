@@ -471,6 +471,112 @@ class HardeningTests(RoutingHarness):
         self.assertEqual(payload["error"], "routing_invalid")
         self.assertIn("mystery", payload["detail"])
 
+    def test_unknown_rule_level_keys_are_1(self) -> None:
+        for key in ("exectuor", "budjet", "skils"):
+            with self.subTest(key=key):
+                rule = {"name": "typo", "to": "coder", "executor": "dsh"}
+                rule[key] = "claude_code"
+                proc = self.route_with(
+                    {"rules": [rule]}, "--profile", "coder", "--json"
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                payload = self.payload(proc)
+                self.assertEqual(payload["error"], "routing_invalid")
+                self.assertIn(key, payload["detail"])
+
+    def test_blank_executor_and_to_are_1(self) -> None:
+        cases = [
+            {"name": "blank-executor", "to": "coder", "executor": ""},
+            {"name": "blank-executor", "to": "coder", "executor": "   "},
+            {"name": "blank-to", "to": "", "executor": "dsh"},
+            {"name": "blank-to", "to": "   ", "executor": "dsh"},
+        ]
+        for rule in cases:
+            with self.subTest(rule=rule):
+                proc = self.route_with(
+                    {"rules": [rule]}, "--profile", "coder", "--json"
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertEqual(
+                    self.payload(proc)["error"], "routing_invalid"
+                )
+
+    def test_non_object_budget_is_1(self) -> None:
+        for budget in ("30", True, False, 0, [], ["max_minutes"], None):
+            with self.subTest(budget=budget):
+                routing = {
+                    "rules": [
+                        {
+                            "name": "bad-budget",
+                            "to": "coder",
+                            "executor": "dsh",
+                            "budget": budget,
+                        }
+                    ]
+                }
+                proc = self.route_with(routing, "--profile", "coder", "--json")
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertEqual(
+                    self.payload(proc)["error"], "routing_invalid"
+                )
+
+    def test_budget_values_must_be_finite_positive_numbers(self) -> None:
+        cases = [
+            {"max_minutes": "30"},
+            {"max_cost": "2"},
+            {"max_minutes": True},
+            {"max_cost": False},
+            {"max_minutes": 0},
+            {"max_cost": -1},
+            {"max_minutes": None},
+            {"max_cost": [2]},
+            {"max_minutes": {"value": 30}},
+            {"max_tokens": 100},
+        ]
+        for budget in cases:
+            with self.subTest(budget=budget):
+                routing = {
+                    "rules": [
+                        {
+                            "name": "bad-budget",
+                            "to": "coder",
+                            "executor": "dsh",
+                            "budget": budget,
+                        }
+                    ]
+                }
+                proc = self.route_with(routing, "--profile", "coder", "--json")
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertEqual(
+                    self.payload(proc)["error"], "routing_invalid"
+                )
+
+    def test_registry_entry_requires_non_empty_module(self) -> None:
+        cases = [
+            {"binary": "dsh"},
+            {"module": ""},
+            {"module": "   "},
+            {"module": 42},
+            {},
+            "",
+        ]
+        for entry in cases:
+            with self.subTest(entry=entry):
+                registry = self.write_json(
+                    "bad-module.json", {"executors": {"dsh": entry}}
+                )
+                proc = self.route_with(
+                    {"rules": [{"name": "r", "to": "coder", "executor": "dsh"}]},
+                    "--profile",
+                    "coder",
+                    "--json",
+                    registry=registry,
+                )
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                payload = self.payload(proc)
+                self.assertEqual(payload["error"], "registry_invalid")
+                self.assertIn("module", payload["detail"])
+
     def test_singular_source_and_type_aliases_match(self) -> None:
         routing = {
             "default": {"executor": "hermes"},

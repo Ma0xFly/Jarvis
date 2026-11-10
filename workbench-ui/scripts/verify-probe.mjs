@@ -697,19 +697,22 @@ async function main() {
     );
     check("点击标记已验证", clickedVerify === true);
     await waitForEval(
-      "document.querySelector('.wb-verify-solidified-status')?.textContent === '已验证'",
+      "document.querySelector('.wb-verify-solidified-status')?.textContent === '工作台已验证'",
       8000,
-      "固化变为已验证",
+      "固化变为工作台已验证",
     );
     const markedState = await evaluate(`(() => ({
       status: document.querySelector('.wb-verify-solidified-status')?.textContent || '',
+      provenance:
+        document.querySelector('.wb-verify-solidified-status')?.getAttribute('data-provenance') || '',
       button: Boolean(document.querySelector('.wb-verify-solidified-verify')),
     }))()`);
     const inboxAfterMark = await httpJson("GET", `${base}/api/workbench/inbox`);
     const itemAfterMark = inboxAfterMark.data.tasks.find((task) => task.id === cardA);
     check(
-      "手动 verified 写 workbench overlay，按钮消失",
-      markedState.status === "已验证" &&
+      "手动 verified 写 workbench overlay，按钮消失，provenance=workbench",
+      markedState.status === "工作台已验证" &&
+        markedState.provenance === "workbench" &&
         markedState.button === false &&
         itemAfterMark?.metadata?.solidified_verified?.length === 1 &&
         itemAfterMark.metadata.solidified_verified[0].path === SOLID_A.path,
@@ -838,20 +841,31 @@ async function main() {
         statuses: items.map(
           (item) => item.querySelector('.wb-verify-solidified-status')?.textContent,
         ),
+        provenances: items.map((item) =>
+          item.querySelector('.wb-verify-solidified-status')?.getAttribute('data-provenance'),
+        ),
         buttons: items.map((item) =>
           Boolean(item.querySelector('.wb-verify-solidified-verify')),
+        ),
+        provenanceNote: Boolean(
+          [...document.querySelectorAll('.wb-verify-solidified .wb-verify-note')].find(
+            (node) => node.textContent.includes("不等于工作台人工验证"),
+          ),
         ),
       };
     })()`);
     check(
-      "数组固化逐条展示，上游 verified 不显示标记按钮",
+      "数组固化逐条展示；worker 自报 verified 与待验证分开标注，不显示标记按钮",
       solidifiedB.count === 2 &&
         JSON.stringify(solidifiedB.types) ===
           JSON.stringify(SOLID_B.map((entry) => entry.type)) &&
         JSON.stringify(solidifiedB.paths) ===
           JSON.stringify(SOLID_B.map((entry) => entry.path)) &&
         JSON.stringify(solidifiedB.statuses) ===
-          JSON.stringify(["已验证", "待验证"]) &&
+          JSON.stringify(["worker 自报已验证", "待验证"]) &&
+        JSON.stringify(solidifiedB.provenances) ===
+          JSON.stringify(["worker", "none"]) &&
+        solidifiedB.provenanceNote === true &&
         JSON.stringify(solidifiedB.buttons) === JSON.stringify([false, true]),
       JSON.stringify(solidifiedB),
     );
@@ -944,6 +958,51 @@ async function main() {
       (await taskStatus(cardC)) === "review",
     );
 
+    // ---- 4b. stale review 409 must refresh, not accept a new round ----
+    // Synthetic one-shot 409: deterministic stand-in for a new review round
+    // landing between the 5s polls.
+    await evaluate(`(() => {
+      const original = window.fetch;
+      let used = false;
+      window.fetch = (input, init) => {
+        const url = typeof input === "string" ? input : (input && input.url) || '';
+        if (!used && url.includes('/api/workbench/verify/')) {
+          used = true;
+          window.fetch = original;
+          return Promise.resolve(new Response(JSON.stringify({
+            ok: false,
+            error: 'stale_review',
+            status: 'review',
+            review_requested_at: Math.floor(Date.now() / 1000),
+          }), { status: 409, headers: { 'Content-Type': 'application/json' } }));
+        }
+        return original(input, init);
+      };
+      return true;
+    })()`);
+    await pressKey("a");
+    await waitForEval(
+      `Boolean([...document.querySelectorAll('.wb-verify-notice')].find(
+        (node) => node.textContent.includes('新一轮验收'),
+      ))`,
+      8000,
+      "stale_review 刷新提示",
+    );
+    const staleState = await evaluate(`(() => ({
+      title: document.querySelector('.wb-verify-title')?.textContent || '',
+      count: document.querySelector('.wb-verify-count')?.textContent || '',
+      notice: [...document.querySelectorAll('.wb-verify-notice')]
+        .map((node) => node.textContent).join(' '),
+    }))()`);
+    check(
+      "stale_review 409 刷新队列、不吞卡、也不静默收下新一轮",
+      staleState.title === titleD &&
+        staleState.count === "3/3" &&
+        staleState.notice.includes("新一轮验收") &&
+        (await taskStatus(cardD)) === "review",
+      JSON.stringify({ ...staleState, status: await taskStatus(cardD) }),
+    );
+
     // ---- 5. last card accepted → stats + auto-exit -------------------
     await pressKey("a");
     await waitForEval("Boolean(document.querySelector('.wb-verify-finish-title'))", 8000, "本批统计");
@@ -1024,16 +1083,28 @@ async function main() {
     );
 
     const countBeforeBlocked = await verifyCount();
+    const blockedKeys = await evaluate(`(() => ({
+      accept: document.querySelector('.wb-verify-key.accept')?.disabled,
+      reject: document.querySelector('.wb-verify-key.reject')?.disabled,
+      skip: document.querySelector('.wb-verify-key.skip')?.disabled,
+    }))()`);
+    check(
+      "缺固化时「收」禁用，R/S 仍可用",
+      blockedKeys.accept === true &&
+        blockedKeys.reject === false &&
+        blockedKeys.skip === false,
+      JSON.stringify(blockedKeys),
+    );
     await pressKey("a");
     await waitForEval(
       `Boolean([...document.querySelectorAll('.wb-verify-error')].find(
         (node) => node.textContent.includes('没有可用的固化记录'),
       ))`,
       5000,
-      "缺固化按 A 被阻断提示",
+      "缺固化按 A 被本地阻断",
     );
     check(
-      "缺固化按 A 返回 missing_solidified，卡留在 review",
+      "缺固化按 A 不发请求，卡留在 review",
       (await verifyTitle()) === titleC &&
         (await verifyCount()) === countBeforeBlocked &&
         (await taskStatus(cardC)) === "review",
@@ -1142,8 +1213,9 @@ async function main() {
     );
 
     // External status change while the card is on screen: verify must 409,
-    // remove it locally, and surface the next card. Pause page intervals so
-    // the 5s sync cannot remove the card before the A keydown is handled.
+    // remove it locally, and surface the next card. Use S because this card
+    // has no solidified entry (A is intentionally disabled). Pause page
+    // intervals so the 5s sync cannot remove the card before the keydown.
     await evaluate("for (let i = 1; i < 20000; i += 1) { clearInterval(i); } true");
     const triageState = await evaluate(`(async () => {
       const response = await fetch(${JSON.stringify(
@@ -1158,7 +1230,7 @@ async function main() {
         return { dispatched: false, titleNow, status: response.status };
       }
       window.dispatchEvent(new KeyboardEvent('keydown', {
-        key: 'a', bubbles: true, cancelable: true,
+        key: 's', bubbles: true, cancelable: true,
       }));
       return { dispatched: true, titleNow, status: response.status };
     })()`);
@@ -1168,7 +1240,7 @@ async function main() {
       "外部状态变化后前进到下一张",
     );
     check(
-      "外部改状态后 A 收 409 并移到下一张",
+      "外部改状态后 S 跳过 409 并移到下一张",
       triageState.dispatched === true && (await taskStatus(cardC)) === "triage",
       JSON.stringify(triageState),
     );
@@ -1179,12 +1251,17 @@ async function main() {
       );
       return {
         status: item?.querySelector('.wb-verify-solidified-status')?.textContent || '',
+        provenance:
+          item?.querySelector('.wb-verify-solidified-status')?.getAttribute('data-provenance') ||
+          '',
         button: Boolean(item?.querySelector('.wb-verify-solidified-verify')),
       };
     })()`);
     check(
-      "上游 verified 记录无需手动标记（accept 不被阻断）",
-      solidifiedE.status === "已验证" && solidifiedE.button === false,
+      "上游 verified 显示为 worker 自报（accept 不被阻断）",
+      solidifiedE.status === "worker 自报已验证" &&
+        solidifiedE.provenance === "worker" &&
+        solidifiedE.button === false,
       JSON.stringify(solidifiedE),
     );
 

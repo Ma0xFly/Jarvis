@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import json
 import math
-import re
+
+from executors.text_signals import looks_like_budget, looks_like_permission_text
 
 #: Unified mode -> Claude Code permission mode.
 PERMISSION_MODES = {
@@ -38,25 +39,6 @@ _USAGE_TOKEN_KEYS = (
     "output_tokens",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
-)
-
-_BUDGET_TEXT_RE = re.compile(
-    r"budget[^.\n]{0,80}(exceed|exhaust|limit|reache|interrupt|stop|spent)"
-    r"|(exceed|exhaust|hit|reache)[^.\n]{0,80}budget",
-    re.IGNORECASE,
-)
-
-_PERMISSION_TEXT_RE = re.compile(
-    r"permission[^.\n]{0,80}(denied|denial|not granted|haven'?t granted"
-    r"|has not been granted|required|requested|needs? (approval|grant))"
-    r"|(not|no)[^.\n]{0,20}(allowed|permitted)"
-    r"|tool[^.\n]{0,20}use[^.\n]{0,20}denied",
-    re.IGNORECASE,
-)
-
-_PERMISSION_TEXT_ZH_RE = re.compile(
-    r"(权限|授权)[^。\n]{0,30}(拒绝|不足|需要|申请)"
-    r"|需要[^。\n]{0,30}(权限|授权)"
 )
 
 
@@ -152,7 +134,7 @@ def translate_result(stdout, stderr="", raw_exit=0):
 
     # Free-text heuristics only apply to failed runs. A successful result that
     # merely mentions "budget" or "permission" must not change the exit code.
-    if failed and _looks_like_budget(subtype, result_text):
+    if failed and looks_like_budget(subtype, result_text):
         return _result(
             ok=False,
             session_id=session_id,
@@ -171,7 +153,7 @@ def translate_result(stdout, stderr="", raw_exit=0):
             exit_code=2,
         )
 
-    if failed and _looks_like_permission_text(result_text):
+    if failed and looks_like_permission_text(result_text):
         return _result(
             ok=False,
             session_id=session_id,
@@ -214,7 +196,7 @@ def translate_result(stdout, stderr="", raw_exit=0):
 def _translate_malformed(stderr, raw_exit):
     """Classify an unparseable stdout line, including stderr signals."""
     first_line = _first_line(stderr)
-    if _looks_like_budget("", stderr):
+    if looks_like_budget("", stderr):
         summary = "执行器输出无法解析，stderr 显示预算中断"
         if first_line:
             summary += f"：{first_line[:300]}"
@@ -225,7 +207,7 @@ def _translate_malformed(stderr, raw_exit):
             cost=_empty_cost(),
             exit_code=3,
         )
-    if _looks_like_permission_text(stderr):
+    if looks_like_permission_text(stderr):
         summary = "执行器输出无法解析，stderr 显示需要人工授权"
         if first_line:
             summary += f"：{first_line[:300]}"
@@ -308,19 +290,6 @@ def _cost(data):
 
 def _empty_cost():
     return {"usd": None, "tokens": 0}
-
-
-def _looks_like_budget(subtype, text):
-    if "budget" in subtype.lower():
-        return True
-    if "预算" in text and any(word in text for word in ("超", "中断", "用尽", "上限", "不足")):
-        return True
-    return bool(_BUDGET_TEXT_RE.search(text or ""))
-
-
-def _looks_like_permission_text(text):
-    text = text or ""
-    return bool(_PERMISSION_TEXT_RE.search(text) or _PERMISSION_TEXT_ZH_RE.search(text))
 
 
 def _error_summary(raw_exit, stderr, subtype):

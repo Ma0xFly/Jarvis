@@ -17,9 +17,12 @@ Rules may carry ``when`` (``profiles`` / ``sources`` / ``types`` /
 ``executor`` falls back to the profile default (``coder`` -> ``dsh``, every
 other profile -> ``hermes``). No rule match uses ``default.executor``.
 
-Errors are fail-closed: malformed routing/registry JSON, an unknown executor
-or an unreadable file returns exit code 1 with ``{"ok": false, ...}`` as the
-last stdout line. The executor is also required to exist in ``executors.json``.
+Errors are fail-closed: malformed routing/registry JSON, an unknown rule or
+budget key, a blank ``executor`` / ``to``, a budget that is not an object of
+finite positive ``max_minutes`` / ``max_cost``, a registry entry without a
+non-empty ``module``, an unknown executor or an unreadable file returns exit
+code 1 with ``{"ok": false, ...}`` as the last stdout line. The executor is
+also required to exist in ``executors.json``.
 """
 
 from __future__ import annotations
@@ -42,6 +45,8 @@ FALLBACK_EXECUTOR = "hermes"
 _WHEN_PLURAL_KEYS = ("profiles", "sources", "types", "keywords")
 _WHEN_SINGULAR_KEYS = ("source", "type")
 _ALLOWED_WHEN_KEYS = set(_WHEN_PLURAL_KEYS) | set(_WHEN_SINGULAR_KEYS)
+_ALLOWED_RULE_KEYS = {"name", "when", "to", "executor", "budget", "skills", "tell"}
+_ALLOWED_BUDGET_KEYS = {"max_minutes", "max_cost"}
 
 
 class RouteError(Exception):
@@ -195,7 +200,11 @@ def resolve(
         executor = _clean(matched_rule.get("executor"))
         if executor is None:
             executor = _profile_default(profile_name)
-        budget = _validate_budget(matched_rule.get("budget"), matched_index)
+        budget = (
+            _validate_budget(matched_rule["budget"], matched_index)
+            if "budget" in matched_rule
+            else {}
+        )
         skills = matched_rule.get("skills")
         if not isinstance(skills, list):
             skills = []
@@ -275,6 +284,12 @@ def _validate_rules(routing: dict) -> list:
     for index, rule in enumerate(rules):
         if not isinstance(rule, dict):
             raise RouteError("routing_invalid", f"rules[{index}] 必须是对象")
+        unknown = sorted(set(rule) - _ALLOWED_RULE_KEYS)
+        if unknown:
+            raise RouteError(
+                "routing_invalid",
+                f"rules[{index}] 含未知键：{', '.join(unknown)}",
+            )
         name = rule.get("name")
         if name is not None and (not isinstance(name, str) or not name.strip()):
             raise RouteError(
@@ -312,17 +327,21 @@ def _validate_rules(routing: dict) -> list:
                         f"rules[{index}].when.{key} 必须是非空字符串",
                     )
         executor = rule.get("executor")
-        if executor is not None and not isinstance(executor, str):
+        if executor is not None and (
+            not isinstance(executor, str) or not executor.strip()
+        ):
             raise RouteError(
                 "routing_invalid",
-                f"rules[{index}].executor 必须是字符串",
+                f"rules[{index}].executor 必须是非空字符串",
             )
         to = rule.get("to")
-        if to is not None and not isinstance(to, str):
-            raise RouteError("routing_invalid", f"rules[{index}].to 必须是字符串")
-        budget = rule.get("budget")
-        if isinstance(budget, dict):
-            _check_finite(budget, f"rules[{index}].budget")
+        if to is not None and (not isinstance(to, str) or not to.strip()):
+            raise RouteError(
+                "routing_invalid",
+                f"rules[{index}].to 必须是非空字符串",
+            )
+        if "budget" in rule:
+            _validate_budget(rule["budget"], index)
     return rules
 
 
@@ -367,9 +386,20 @@ def _rule_matches(rule, *, profile, source, task_type, title) -> bool:
 
 def _entry_mode(entry, executor: str) -> str:
     if isinstance(entry, str):
+        if not entry.strip():
+            raise RouteError(
+                "registry_invalid",
+                f"执行器 {executor} 的注册项缺少非空 module",
+            )
         return "cli"
     if not isinstance(entry, dict):
         raise RouteError("registry_invalid", f"执行器 {executor} 的注册项格式错误")
+    module = entry.get("module")
+    if not isinstance(module, str) or not module.strip():
+        raise RouteError(
+            "registry_invalid",
+            f"执行器 {executor} 的注册项缺少非空 module",
+        )
     if "mode" not in entry:
         return "cli"
     mode = entry["mode"]
@@ -382,35 +412,34 @@ def _entry_mode(entry, executor: str) -> str:
 
 
 def _validate_budget(budget, index):
+    """Validate an explicitly present rule budget; return it unchanged."""
     if not isinstance(budget, dict):
-        return {}
-    _check_finite(budget, f"rules[{index}].budget")
+        raise RouteError("routing_invalid", f"rules[{index}].budget 必须是对象")
+    unknown = sorted(set(budget) - _ALLOWED_BUDGET_KEYS)
+    if unknown:
+        raise RouteError(
+            "routing_invalid",
+            f"rules[{index}].budget 含未知键：{', '.join(unknown)}",
+        )
+    for key in ("max_minutes", "max_cost"):
+        if key not in budget:
+            continue
+        value = budget[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RouteError(
+                "routing_invalid",
+                f"rules[{index}].budget.{key} 必须是有限正数",
+            )
+        try:
+            valid = math.isfinite(value) and value > 0
+        except (OverflowError, TypeError):
+            valid = False
+        if not valid:
+            raise RouteError(
+                "routing_invalid",
+                f"rules[{index}].budget.{key} 必须是有限正数",
+            )
     return budget
-
-
-def _check_finite(value, label: str) -> None:
-    if value is None or isinstance(value, (str, bool)):
-        return
-    if isinstance(value, (int, float)):
-        if isinstance(value, float):
-            try:
-                finite = math.isfinite(value)
-            except (OverflowError, TypeError):
-                finite = False
-            if not finite:
-                raise RouteError("routing_invalid", f"{label} 含非有限数值")
-        return
-    if isinstance(value, list):
-        for item in value:
-            _check_finite(item, label)
-        return
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise RouteError("routing_invalid", f"{label} 含非字符串键")
-            _check_finite(item, label)
-        return
-    raise RouteError("routing_invalid", f"{label} 含不可序列化的值")
 
 
 def _registry_entries(registry: dict) -> dict:

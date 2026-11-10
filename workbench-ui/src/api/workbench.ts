@@ -595,6 +595,8 @@ export interface InboxTask {
   latest_summary?: string | null;
   /** 最新 run 的 metadata.self_report；缺失/畸形为 null，不阻断验收。 */
   self_report?: SelfReport | null;
+  /** 任一自述字段超长被服务端截断（文本内也带截断标记）。 */
+  self_report_truncated?: boolean;
   /** 最新 run 的 metadata.solidified；缺失/全非法为空数组，阻断 accept。 */
   solidified?: SolidifiedEntry[];
   metadata: TaskMetadata;
@@ -716,6 +718,7 @@ export async function verifyTask(
   taskId: string,
   action: VerifyAction,
   reason?: string,
+  expectedReviewAt?: number | null,
 ): Promise<VerifyResult> {
   if (!taskId || !taskId.trim()) {
     throw new WorkbenchError("verify_failed", "缺少任务 id");
@@ -732,6 +735,12 @@ export async function verifyTask(
   }
   const payload: Record<string, unknown> = { action };
   if (action === "reject") payload.reason = trimmedReason;
+  // Pin the action to the review round currently rendered. A new round that
+  // arrives inside the 5s poll window then 409s instead of being accepted on
+  // the old round's evidence.
+  if (typeof expectedReviewAt === "number" && Number.isFinite(expectedReviewAt)) {
+    payload.expected_review_at = expectedReviewAt;
+  }
   try {
     const data = (await api(WORKBENCH + "/verify/" + encodeURIComponent(taskId), {
       method: "POST",
